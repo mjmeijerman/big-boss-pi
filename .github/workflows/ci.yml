@@ -1,0 +1,123 @@
+# The only checks this repo has: syntax, lint, offline behaviour, doc budget.
+#
+# The harness is bash plus two Node ESM files that talk to a local ollama and to herdr-app,
+# and neither exists on a runner. So the checks below never need a model or the desktop app:
+# they check that the scripts *fail correctly* without them (job `offline`), which is the
+# failure a laptop hides and a runner would otherwise never see.
+#
+# Radar basis: #20 stateful guardrails (a rule nothing checks is gone), #36 agent
+# instruction bloat (the AGENTS.md budget), #29 harness quality evaluation.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  syntax:
+    name: syntax (bash -n, node --check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+
+      # Every file in bin/ is a bash script or an ESM module; no extensions are trusted.
+      - name: bash -n
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(git ls-files 'bin/*' 'scripts/*.sh' ':!bin/*.mjs')
+          printf '%s\n' "${files[@]}"
+          for f in "${files[@]}"; do bash -n "$f"; done
+
+      - name: node --check
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(git ls-files 'bin/*.mjs')
+          printf '%s\n' "${files[@]}"
+          for f in "${files[@]}"; do node --check "$f"; done
+
+  lint:
+    name: lint (shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # Installed rather than assumed: a runner image without shellcheck must say it skipped
+      # the lint, not go green with the lint never having run.
+      - name: shellcheck
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(git ls-files 'bin/*' 'scripts/*.sh' ':!bin/*.mjs')
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck || true
+          fi
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            echo "::warning::shellcheck unavailable on this runner — lint SKIPPED, not passed"
+            echo "### lint skipped: shellcheck could not be installed" >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          shellcheck --version | sed -n '2p'
+          # Errors only: style opinions do not fail a build.
+          shellcheck --severity=error "${files[@]}"
+
+  offline:
+    name: offline behaviour (no ollama, no herdr-app)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+
+      # The script owns the details: closed port, temporary HOME and PI_BOSS_ROOT, herdr-app
+      # stripped from PATH. Runs the same way locally, which is why CI and a laptop agree.
+      - name: failing loud without the model and without herdr-app
+        run: bash scripts/ci-offline.sh
+
+  docs-budget:
+    name: docs budget (AGENTS.md size)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # AGENTS.md loads on every agent start, so it is a budget, not a wiki: 8192 B is room
+      # for a few more rules, not for prose. Raising the limit is a decision, made in review.
+      - name: AGENTS.md stays under budget
+        env:
+          AGENTS_MD_LIMIT: "8192"
+        run: |
+          set -euo pipefail
+          if [ ! -f AGENTS.md ]; then
+            echo "::error::AGENTS.md is missing"
+            exit 1
+          fi
+          bytes=$(wc -c <AGENTS.md | tr -d '[:space:]')
+          echo "AGENTS.md: ${bytes} B / ${AGENTS_MD_LIMIT} B"
+          echo "| file | bytes | limit |" >>"$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- | --- |" >>"$GITHUB_STEP_SUMMARY"
+          echo "| AGENTS.md | ${bytes} | ${AGENTS_MD_LIMIT} |" >>"$GITHUB_STEP_SUMMARY"
+          if [ "$bytes" -gt "$AGENTS_MD_LIMIT" ]; then
+            echo "::error::AGENTS.md is ${bytes} B, over the ${AGENTS_MD_LIMIT} B budget — cut a rule or raise the limit in review"
+            exit 1
+          fi
