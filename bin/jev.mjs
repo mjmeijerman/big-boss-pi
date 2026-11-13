@@ -11,9 +11,14 @@
  *   jev permit "<request>"    allow a sandbox permission request, or escalate it
  *   jev mode "<worker task>"  bare | sandboxed | no-net
  *   jev count "<task>"        1..4 workers
- *   jev route "<task>"        local | remote — who does this work at all
+ *   jev thinking "<task>"     low | medium | high — how much effort the worker needs
  *
- * Exit codes: 0 yes/answered, 1 no, 3 unsure or model unreachable (ask the user).
+ * "thinking" answers an abstract effort, never a pi level name: which levels the concrete
+ * model supports is a fact about that model, not about the task, so the caller does the
+ * mapping (bin/delegate reads the model catalogue and picks the nearest supported level).
+ *
+ * Exit codes: 0 yes, or a valid mode/count/thinking answer (route: 0 local, 1 remote),
+ * 1 no, 3 unsure or model unreachable (ask the user), 2 usage.
  * --json prints {"decision":…,"reason":…} instead of one line.
  */
 import process from "node:process";
@@ -40,6 +45,11 @@ Standing policy you must apply:
   need no repo knowledge and no tools. "Remote" means code changes, debugging, design
   decisions, multi-file reasoning, and anything that needs tools, tests, or repo knowledge.
   When in doubt, remote.
+- Thinking effort for a worker: pick the lowest effort that still does the task. "low" for
+  mechanical edits, renames, formatting, single-file tweaks. "high" for hard debugging,
+  multi-file design, migrations, security-sensitive work. "medium" otherwise. The effort is
+  abstract on purpose: it says how hard the task is, not which level of which model to use.
+  A task text too thin to judge gets "unsure", not a middle-of-the-road guess.
 - If the question is ambiguous, if answering it would be a guess, or if the safe answer is
   not clear: answer "unsure". A human will take it. That is a good outcome, not a failure.`;
 
@@ -53,7 +63,8 @@ function parseArgs(argv) {
 	const rest = [];
 	for (const arg of argv) {
 		if (arg === "--json") opts.json = true;
-		else if (!opts.kind && ["ask", "permit", "mode", "count", "route"].includes(arg)) opts.kind = arg;
+		else if (!opts.kind && ["ask", "permit", "mode", "count", "route", "thinking"].includes(arg))
+		opts.kind = arg;
 		else rest.push(arg);
 	}
 	opts.text = rest.join(" ").trim();
@@ -66,6 +77,7 @@ const SHAPES = {
 	mode: '{"mode":"bare|sandboxed|no-net","confidence":0.0-1.0,"reason":"one sentence"}',
 	count: '{"count":1-4,"confidence":0.0-1.0,"reason":"one sentence"}',
 	route: '{"route":"local|remote","confidence":0.0-1.0,"reason":"one sentence"}',
+	thinking: '{"thinking":"low|medium|high","confidence":0.0-1.0,"reason":"one sentence"}',
 };
 
 const PROMPTS = {
@@ -78,6 +90,8 @@ const PROMPTS = {
 		`Task:\n${text}\n\nHow many parallel workers does this need? Answer an integer 1 to 4.`,
 	route: (text) =>
 		`Task:\n${text}\n\nShould this run local (a small local model, no repo, no tools) or remote (a coding agent with the repo and tools)? Answer local or remote.`,
+	thinking: (text) =>
+		`A worker will be started for this task:\n${text}\n\nHow much thinking effort does it need? Answer low, medium, or high — the effort the task needs, not a model's level name.`,
 };
 
 async function decide(kind, text) {
@@ -119,7 +133,7 @@ async function decide(kind, text) {
 }
 
 const opts = parseArgs(process.argv.slice(2));
-if (!opts.kind) fail("usage: jev ask|permit|mode|count|route <text> [--json]", 2);
+if (!opts.kind) fail("usage: jev ask|permit|mode|count|route|thinking <text> [--json]", 2);
 if (!opts.text) fail(`jev ${opts.kind}: needs the question text`, 2);
 
 const answer = await decide(opts.kind, opts.text);
@@ -145,6 +159,13 @@ if (opts.kind === "count") {
 	if (!Number.isInteger(count) || count < 1 || count > 4 || low)
 		emit("unsure how many workers — ask the user", { count: null, reason, confidence }, 3);
 	emit(String(count), { count, reason, confidence }, 0);
+}
+
+if (opts.kind === "thinking") {
+	const effort = String(answer.thinking || "").trim().toLowerCase();
+	if (!["low", "medium", "high"].includes(effort) || low)
+		emit("unsure how much thinking this needs — ask the user", { thinking: null, reason, confidence }, 3);
+	emit(effort, { thinking: effort, reason, confidence }, 0);
 }
 
 if (opts.kind === "route") {

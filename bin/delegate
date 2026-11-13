@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # delegate — the only way an agent in big-boss-pi starts work.
 #
-#   delegate spawn <slug> --cwd DIR [--mode bare|sandboxed|no-net] [--override-jev --reason TEXT]
-#                  [--no-restore] "<task>"
+#   delegate spawn <slug> --cwd DIR [--mode bare|sandboxed|no-net] [--thinking LEVEL]
+#                  [--override-jev --reason TEXT] [--no-restore] "<task>"
 #   delegate wait <slug> [--timeout SECONDS]
 #   delegate list
 #   delegate close <slug>
+#   delegate ask "<question>" [--json]
 #   delegate sweep
 #
 # A worker gets its own Herdr space (never the big-boss-pi space), a spec in specs/<slug>.md,
@@ -22,17 +23,27 @@
 # "DECISION NEEDED: <question>": that marker keeps the space open until the user answers.
 # `delegate sweep` applies exactly that rule to every tracked worker in one go.
 #
-# Every spawn asks Jev, unconditionally, for the mode, the worker count, and the route (local
-# or remote). Routing is advisory: a task Jev calls "local" prints a warning about the cheaper
-# bin/local-run path but never refuses the spawn. A caller's
-# --mode is accepted only when it matches Jev's answer for that exact task text; otherwise the
-# spawn aborts and prints Jev's answer. Overriding Jev needs --override-jev with a non-empty
-# --reason, and the override is recorded. If Jev is unreachable or unsure, the spawn aborts
-# instead of guessing: that decision belongs to the user.
+# Every spawn asks Jev, unconditionally, for the mode, the worker count, the route (local or
+# remote) and the thinking effort. Routing is advisory: a task Jev calls "local" prints a
+# warning about the cheaper bin/local-run path but never refuses the spawn. A caller's --mode
+# or --thinking is accepted only when it matches Jev's answer for that exact task text;
+# otherwise the spawn aborts and prints Jev's answer. Overriding Jev needs --override-jev with
+# a non-empty --reason, and the override is recorded. If Jev is unreachable or unsure, the
+# spawn aborts instead of guessing: that decision belongs to the user.
+#
+# Thinking is the one decision with two halves. Jev answers an abstract effort, low | medium |
+# high: it cannot know which thinking levels the worker's model supports. So the effort is
+# mapped here, against the model the worker will actually start with
+# (worker_thinking_level): the user's pi settings name that model, the model catalogue says
+# which levels it supports (thinkingLevelMap, where null marks an unsupported level), and the
+# effort goes to the nearest supported level, ties to the lower one. When the catalogue cannot
+# be read the effort name is passed through and pi clamps it to the model.
 #
 # Every decision lands in state/decisions.jsonl as one JSON line: timestamp, command, task
-# text, jev decision, jev reason, whether it was overridden, and the resulting slug.
-# The route is the third line for a task (command "route").
+# text, jev decision, jev reason, whether it was overridden, and the resulting slug. The route
+# is the third line for a task (command "route"), the thinking level the fourth (command
+# "thinking"). `delegate ask` writes the same line for a question put to jev before it ever
+# reaches the user.
 #
 # Radar Vol. 35: blip 1 (agent sandboxing, Adopt), blip 21 (subagents, Trial — capped at 4),
 # blip 17 (risk-tiered human oversight — the mode decides how much rope a worker gets).
@@ -67,7 +78,8 @@ report_needs_decision() {
 	head -n 20 -- "$report" | grep -qiE '^[[:space:]]*[*_>#-]*[[:space:]]*decision needed[[:space:]]*:'
 }
 
-# ask_jev <mode|count> <task text> — sets JEV_DECISION and JEV_REASON; dies if Jev will not answer.
+# ask_jev <mode|count|thinking> <task text> — sets JEV_DECISION and JEV_REASON; dies if Jev
+# will not answer.
 ask_jev() {
 	local kind=$1 text=$2 out rc decision reason
 	out=$("$BIN/jev" "$kind" "$text" --json 2>&1) && rc=0 || rc=$?
@@ -116,6 +128,74 @@ record_decision() {
 		"$DECISIONS" "$cmd" "$task" "$decision" "$reason" "$overridden" "$slug"
 }
 
+# worker_thinking_level <effort> — map Jev's abstract effort (low|medium|high) to a thinking
+# level the worker's model actually supports; prints {"level":…,"map":…,"model":…,"source":…}.
+#
+# The model is the one a fresh `pi` starts with: settings.json defaultProvider/defaultModel.
+# Its `reasoning` flag and `thinkingLevelMap` come from the user's models.json first and the
+# generated models-store.json second. Per pi's docs a level the map does not mention uses the
+# provider default up through "high", xhigh and max are unsupported unless mapped, and null
+# marks a level unsupported. A non-reasoning model runs "off". Nothing readable: the effort is
+# passed through unchanged and pi clamps it, which its docs say it does.
+worker_thinking_level() {
+	local effort=$1 out
+	out=$(node -e '
+		const fs = require("fs"), path = require("path");
+		const effort = process.argv[1];
+		const ORDER = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+		const read = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return null; } };
+		const home = process.env.HOME || "";
+		const settings = read(path.join(home, ".pi/agent/settings.json")) || {};
+		const provider = settings.defaultProvider || "";
+		const model = settings.defaultModel || "";
+		const emit = (o) => { process.stdout.write(JSON.stringify(o)); process.exit(0); };
+		if (!model) emit({ level: effort, map: "pass-through", model: "unknown", source: "fallback-clamp" });
+
+		let entry = null, from = "";
+		for (const f of [".pi/agent/models.json", ".pi/agent/models-store.json"]) {
+			const j = read(path.join(home, f)) || {};
+			// models.json wraps its providers in "providers"; the generated models-store.json is
+			// the provider map itself. Both are read the same way once the wrapper is gone.
+			const providers = j.providers || j;
+			let hit = null;
+			for (const [pid, pv] of Object.entries(providers)) {
+				if (provider && pid !== provider) continue;
+				if (!pv || !Array.isArray(pv.models)) continue;
+				hit = pv.models.find((m) => m.id === model) || null;
+				if (hit) break;
+			}
+			if (hit) { entry = hit; from = f; break; }
+		}
+		if (!entry) emit({ level: effort, map: "pass-through", model: provider + "/" + model, source: "fallback-clamp" });
+
+		const label = provider + "/" + model;
+		if (entry.reasoning !== true)
+			emit({ level: "off", map: effort + "→off", model: label, source: from, note: "non-reasoning model" });
+
+		const map = entry.thinkingLevelMap || {};
+		const supported = ORDER.filter((l) =>
+			l === "off" ? true : l === "xhigh" || l === "max" ? Boolean(map[l]) : map[l] !== null);
+		const candidates = supported.filter((l) => l !== "off");
+		let level = effort;
+		if (!supported.includes(effort)) {
+			// Nearest supported level, ties to the lower one: jev asked for the lowest effort that
+			// does the task, so rounding up spends tokens it did not ask for. "off" is the last
+			// resort, never a tie-break: it drops reasoning the task was said to need.
+			if (!candidates.length) level = "off";
+			else {
+				const target = ORDER.indexOf(effort);
+				level = candidates[0];
+				for (const l of candidates)
+					if (Math.abs(ORDER.indexOf(l) - target) < Math.abs(ORDER.indexOf(level) - target)) level = l;
+			}
+		}
+		emit({ level, map: level === effort ? effort + " (supported)" : effort + "→" + level,
+			model: label, source: from, supported });
+	' "$effort") || out=""
+	[ -n "$out" ] || out=$(printf '{"level":"%s","map":"pass-through","model":"unknown","source":"fallback-clamp"}' "$effort")
+	printf '%s' "$out"
+}
+
 # screen_state — the "space tab" the person is looking at, or empty when the window cannot be
 # read (no window, herdr-app error). Never dies: a view that cannot be read must not stop a spawn.
 screen_state() {
@@ -137,14 +217,15 @@ restore_focus() {
 }
 
 cmd_spawn() {
-	local slug="" cwd="" mode="" task="" override_jev=0 reason="" runner="" no_restore=0
-	[ "$#" -ge 1 ] || die 'usage: delegate spawn <slug> --cwd DIR [--mode M] [--override-jev --reason TEXT] [--no-restore] "<task>"'
+	local slug="" cwd="" mode="" thinking="" task="" override_jev=0 reason="" runner="" no_restore=0
+	[ "$#" -ge 1 ] || die 'usage: delegate spawn <slug> --cwd DIR [--mode M] [--thinking LEVEL] [--override-jev --reason TEXT] [--no-restore] "<task>"'
 	slug=$1; shift
 	local words=()
 	while [ "$#" -gt 0 ]; do
 		case $1 in
 		--cwd) cwd=${2:-}; shift 2 ;;
 		--mode) mode=${2:-}; shift 2 ;;
+		--thinking) thinking=${2:-}; shift 2 ;;
 		--override-jev) override_jev=1; shift ;;
 		--reason) reason=${2:-}; shift 2 ;;
 		--no-restore) no_restore=1; shift ;;
@@ -157,42 +238,61 @@ cmd_spawn() {
 	[ -n "$cwd" ] || die "spawn needs --cwd: the directory the worker works in"
 	[ -d "$cwd" ] || die "no such directory: $cwd"
 	[ -n "$task" ] || die "spawn needs a task description"
+	case $thinking in
+	"" | off | minimal | low | medium | high | xhigh | max) ;;
+	*) die "thinking must be off, minimal, low, medium, high, xhigh or max: '$thinking'" ;;
+	esac
 	cwd=$(readlink -f -- "$cwd")
 	need herdr-app; need node; need hc
 
-	# 1. Jev decides the count and the mode. Always. No caller short-circuit.
+	# 1. Jev decides the count, the mode, the route and the thinking effort. Always. No caller
+	#    short-circuit.
 	local jev_count jev_mode count_reason mode_reason overridden=false
 	ask_jev count "$task"; jev_count=$JEV_DECISION; count_reason=$JEV_REASON
 	ask_jev mode "$task"; jev_mode=$JEV_DECISION; mode_reason=$JEV_REASON
 	local jev_route route_reason
 	ask_jev_route "$task"; jev_route=$JEV_ROUTE; route_reason=$ROUTE_REASON
 	if [ "$jev_count" -gt 4 ]; then jev_count=4; fi
+	# The effort is Jev's; the level is the model's. See worker_thinking_level.
+	local jev_effort thinking_reason thinking_map jev_level
+	ask_jev thinking "$task"; jev_effort=$JEV_DECISION; thinking_reason=$JEV_REASON
+	thinking_map=$(worker_thinking_level "$jev_effort")
+	jev_level=$(printf '%s' "$thinking_map" | json_field level)
+	[ -n "$jev_level" ] || die "could not map jev's thinking effort '$jev_effort' to a level: $thinking_map"
 
-	# 2. A caller's mode must agree with Jev for this exact task text. Jev's answer is recorded
-	#    either way: a refusal is a decision too, and the audit line says why nothing spawned.
-	local refusal=""
-	if [ -n "$mode" ] && [ "$mode" != "$jev_mode" ]; then
-		if [ "$override_jev" = 1 ] && [ -n "${reason// /}" ]; then
-			overridden=true
-		elif [ "$override_jev" = 1 ]; then
-			refusal="--override-jev needs a non-empty --reason: an override without a reason is a guess"
-		else
-			refusal="--mode $mode contradicts jev, which answered '$jev_mode' for this task ($mode_reason).
+	# 2. A caller's mode and thinking level must agree with Jev for this exact task text.
+	#    Jev's answer is recorded either way: a refusal is a decision too, and the audit line
+	#    says why nothing spawned. An override without a reason is a guess, so it refuses too.
+	local refusal="" refuse_mode=0 refuse_thinking=0 reason_given=0
+	if [ -n "$mode" ] && [ "$mode" != "$jev_mode" ]; then refuse_mode=1; fi
+	if [ -n "$thinking" ] && [ "$thinking" != "$jev_level" ]; then refuse_thinking=1; fi
+	if [ -n "${reason// /}" ]; then reason_given=1; fi
+
+	if [ "$override_jev" = 1 ] && [ "$reason_given" = 0 ]; then
+		refusal="--override-jev needs a non-empty --reason: an override without a reason is a guess"
+	elif [ "$override_jev" = 1 ]; then
+		# Nothing to overrule is not an override; record it only when it actually overturned Jev.
+		if [ "$refuse_mode" = 1 ] || [ "$refuse_thinking" = 1 ]; then overridden=true; fi
+	elif [ "$refuse_mode" = 1 ]; then
+		refusal="--mode $mode contradicts jev, which answered '$jev_mode' for this task ($mode_reason).
 Re-run without --mode to use jev's answer, or re-run with --override-jev --reason '<why>' to overturn jev."
-		fi
-	else
-		if [ -z "$mode" ]; then mode=$jev_mode; fi
-		if [ "$override_jev" = 1 ] && [ -z "${reason// /}" ]; then
-			refusal="--override-jev needs a non-empty --reason: an override without a reason is a guess"
-		fi
+	elif [ "$refuse_thinking" = 1 ]; then
+		refusal="--thinking $thinking contradicts jev, which answered effort '$jev_effort' — level '$jev_level' for this task ($thinking_reason).
+Re-run without --thinking to use jev's level, or re-run with --override-jev --reason '<why>' to overturn jev."
 	fi
 
 	if [ -n "$refusal" ]; then
 		record_decision mode "$task" "$jev_mode" "$mode_reason" false "-"
 		record_decision count "$task" "$jev_count" "$count_reason" false "-"
 		record_decision route "$task" "$jev_route" "$route_reason" false "-"
+		record_decision thinking "$task" "$jev_level" "$thinking_reason (jev effort $jev_effort → $jev_level)" false "-"
 		die "$refusal"
 	fi
+
+	if [ -z "$mode" ]; then mode=$jev_mode; fi
+	# A --thinking that survives to here either agrees with jev or was overridden on purpose.
+	if [ -z "$thinking" ] || [ "$refuse_thinking" != 1 ]; then thinking=$jev_level; fi
+	jev_level=$thinking
 	case $mode in bare|sandboxed) runner=$BIN/pi-$mode ;; no-net) runner=$BIN/pi-nonet ;; *) die "mode must be bare, sandboxed or no-net: '$mode'" ;; esac
 	[ -f "$runner" ] || die "no runner for mode $mode ($runner)"
 
@@ -203,10 +303,11 @@ Re-run without --mode to use jev's answer, or re-run with --override-jev --reaso
 		printf '%s: the cheaper path is  %s "<task>"  — continuing anyway, nothing was refused.\n' "$prog" "$BIN/local-run" >&2
 	fi
 
-	# 4. Record all three decisions before doing any work.
+	# 4. Record all four decisions before doing any work.
 	record_decision mode "$task" "$mode" "$mode_reason" "$overridden" "$slug"
 	record_decision count "$task" "$jev_count" "$count_reason" "$overridden" "$slug"
 	record_decision route "$task" "$jev_route" "$route_reason" "$overridden" "$slug"
+	record_decision thinking "$task" "$jev_level" "$thinking_reason (jev effort $jev_effort → $jev_level)" "$overridden" "$slug"
 
 	# The review ceiling is 4 workers (blip 21): refuse past it instead of hiding it.
 	local live
@@ -230,7 +331,7 @@ You are a worker. Report to the agent in the big-boss-pi workspace that started 
 waiting on \`$report\`.
 
 - Work in: \`$cwd\`
-- Mode: \`$mode\` (chosen by jev$overridden_note), route: $jev_route (jev)
+- Mode: \`$mode\` (chosen by jev$overridden_note), route: $jev_route (jev), thinking: \`$jev_level\` (jev: $jev_effort)
 - Report file: \`$report\`
 
 ## Task
@@ -262,7 +363,7 @@ EOF
 
 	local argv
 	argv=$(node -e 'process.stdout.write(JSON.stringify(["sh","-lc",process.argv[1]]))' \
-		"cd $(printf '%q' "$cwd") && exec $(printf '%q' "$runner") -a")
+		"cd $(printf '%q' "$cwd") && exec $(printf '%q' "$runner") --thinking $(printf '%q' "$jev_level") -a")
 	# space.new has no hidden or background mode: the new space is shown, which takes the person
 	# off the space and tab they were reading. Note both ids now, explicitly, to put them back.
 	local before=""
@@ -293,13 +394,13 @@ EOF
 	[ -n "$space" ] || die "could not read the new space id from: $out"
 
 	node -e '
-		const fs=require("fs");const [state,slug,space,tab,pane,terminal,cwd,mode,spec,report,jevCount,overridden,reason]=process.argv.slice(1);
+		const fs=require("fs");const [state,slug,space,tab,pane,terminal,cwd,mode,thinking,spec,report,jevCount,jevEffort,overridden,reason]=process.argv.slice(1);
 		let j={};try{j=JSON.parse(fs.readFileSync(state,"utf8"))}catch{}
-		j[slug]={slug,space,tab,pane,terminal,cwd,mode,spec,report,jevCount:Number(jevCount),
+		j[slug]={slug,space,tab,pane,terminal,cwd,mode,thinking,thinkingEffort:jevEffort,spec,report,jevCount:Number(jevCount),
 			overridden:overridden==="true",overrideReason:reason||null,started:new Date().toISOString()};
 		fs.writeFileSync(state,JSON.stringify(j,null,2)+"\n");' \
-		"$DELEGATIONS" "$slug" "$space" "$tab" "$pane" "$terminal" "$cwd" "$mode" "$spec" "$report" \
-		"$jev_count" "$overridden" "$reason"
+		"$DELEGATIONS" "$slug" "$space" "$tab" "$pane" "$terminal" "$cwd" "$mode" "$thinking" "$spec" "$report" \
+		"$jev_count" "$jev_effort" "$overridden" "$reason"
 
 	# space.new's --task can arrive before pi is listening, so send it again once the banner is up.
 	local i
@@ -310,8 +411,8 @@ EOF
 	hc send "$terminal" "Read $spec and do it. Report to $report." >/dev/null 2>&1 \
 		|| printf '%s: warning: could not send the task to %s\n' "$prog" "$terminal" >&2
 
-	printf '{"slug":"%s","space":"%s","mode":"%s","route":"%s","jev_count":%s,"overridden":%s,"cwd":"%s","report":"%s"}\n' \
-		"$slug" "$space" "$mode" "$jev_route" "$jev_count" "$overridden" "$cwd" "$report"
+	printf '{"slug":"%s","space":"%s","mode":"%s","thinking":"%s","thinking_effort":"%s","route":"%s","jev_count":%s,"overridden":%s,"cwd":"%s","report":"%s"}\n' \
+		"$slug" "$space" "$mode" "$jev_level" "$jev_effort" "$jev_route" "$jev_count" "$overridden" "$cwd" "$report"
 }
 
 cmd_wait() {
@@ -352,27 +453,81 @@ cmd_list() {
 		let j={};try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"))}catch{}
 		let decisions=[];
 		try{decisions=fs.readFileSync(process.argv[2],"utf8").trim().split("\n").filter(Boolean).map(l=>{try{return JSON.parse(l)}catch{return null}}).filter(Boolean)}catch{}
-		const last=new Map(),routes=new Map();
+		// One map per worker, keyed by command: mode, route and thinking are separate lines, and
+		// the last command to land is not the only one worth showing.
+		const by=new Map();
 		for(const d of decisions)if(d.slug){
-			if(d.command==="route")routes.set(d.slug,d);else last.set(d.slug,d);
+			if(!by.has(d.slug))by.set(d.slug,new Map());
+			by.get(d.slug).set(d.command,d);
 		}
+		const pick=(slug,cmd)=>{const m=by.get(slug);return m?m.get(cmd):undefined};
 		const rows=Object.values(j);
 		if(!rows.length){console.log("no workers");process.exit(0)}
 		for(const r of rows){
-			let size=0,head="";
-			try{size=fs.statSync(r.report).size}catch{}
-			try{
-				const fd=fs.openSync(r.report,"r");const buf=Buffer.alloc(Math.min(size,2000));
-				fs.readSync(fd,buf,0,buf.length,0);fs.closeSync(fd);head=buf.toString("utf8");
-			}catch{}
-			const needsDecision=/^[ \t]*[*_>#-]*[ \t]*decision needed[ \t]*:/im.test(head);
-			const status=!size?"working":needsDecision?"DECISION":"reported";
-			const d=last.get(r.slug);
-			const route=routes.get(r.slug);
-			const jev=(d?`jev ${d.command}=${d.decision}${d.overridden?" (overridden)":""}`:`jev ${r.mode}${r.overridden?" (overridden)":""}`)
-				+(route?` route=${route.decision}`:"");
-			console.log([r.slug.padEnd(22),r.mode.padEnd(10),status.padEnd(9),jev.padEnd(38),r.space,"cwd="+r.cwd].join(" "));
+			let size=0;try{size=fs.statSync(r.report).size}catch{}
+			const mode=pick(r.slug,"mode"),route=pick(r.slug,"route"),think=pick(r.slug,"thinking");
+			const level=(think?think.decision:r.thinking)||"?";
+			const overridden=(mode&&mode.overridden)||(think&&think.overridden)||r.overridden;
+			const jev=`mode=${r.mode} route=${route?route.decision:"?"} thinking=${level}${overridden?" (overridden)":""}`;
+			console.log([r.slug.padEnd(22),r.mode.padEnd(10),level.padEnd(8),(size?"reported":"working").padEnd(9),jev.padEnd(44),r.space,"cwd="+r.cwd].join(" "));
 		}' "$DELEGATIONS" "$DECISIONS"
+}
+
+# ask — put a question to Jev before it reaches the user. The question is not the person's to
+# answer until Jev says it is.
+#
+# "Ask jev before you ask the user" is a rule; this makes it checkable instead of remembered.
+# Every question that goes through here leaves the same audit line in state/decisions.jsonl
+# (command "ask"), and the exit code says what to do next: 0 yes, 1 no — act on it, do not
+# interrupt the user — and 3 unsure or model unreachable, the only case that reaches the user,
+# carrying Jev's answer and reason in one line. The user is the tie-breaker, not the first
+# responder.
+cmd_ask() {
+	local question="" json=0 out rc decision reason
+	[ "$#" -ge 1 ] || die 'usage: delegate ask "<question for jev>" [--json]'
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--json) json=1; shift ;;
+		--*) die "unknown option $1" ;;
+		*) question="${question:+$question }$1"; shift ;;
+		esac
+	done
+	[ -n "${question// /}" ] || die 'usage: delegate ask "<question for jev>" [--json]'
+	need node
+	out=$("$BIN/jev" ask "$question" --json 2>&1) && rc=0 || rc=$?
+	decision=$(printf '%s' "$out" | json_field decision)
+	reason=$(printf '%s' "$out" | json_field reason)
+	case $rc in
+	0) decision=yes ;;
+	1) decision=no ;;
+	*) decision=unsure ;;
+	esac
+	# An unreachable model leaves no reason behind, only jev's own complaint. Keep that line:
+	# the one sentence the user sees has to explain itself.
+	if [ -z "$reason" ]; then
+		reason=$(printf '%s' "$out" | head -n 1 | sed 's/^[^:]*: //')
+	fi
+	record_decision ask "$question" "$decision" "$reason" false "-"
+	if [ "$json" = 1 ]; then
+		node -e 'const [q,d,r]=process.argv.slice(1);process.stdout.write(JSON.stringify({question:q,decision:d,reason:r||null,ask_user:d==="unsure"})+"\n")' \
+			"$question" "$decision" "$reason"
+		return "$rc"
+	fi
+	case $decision in
+	yes)
+		say "jev: yes${reason:+ — $reason}"
+		say "Act on that answer. Do not ask the user."
+		;;
+	no)
+		say "jev: no${reason:+ — $reason}"
+		say "Act on that answer. Do not ask the user. Overturning jev is the user's call, not yours."
+		;;
+	*)
+		say "jev: unsure${reason:+ — $reason}"
+		say "Now ask the user, and carry that line: \"jev is unsure — $reason\"."
+		;;
+	esac
+	return "$rc"
 }
 
 cmd_close() {
@@ -435,7 +590,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 	wait) shift; cmd_wait "$@" ;;
 	list | ls) cmd_list ;;
 	close) shift; cmd_close "$@" ;;
+	ask) shift; cmd_ask "$@" ;;
 	sweep) cmd_sweep ;;
-	*) die 'usage: delegate spawn|wait|list|close|sweep ...' ;;
+	*) die 'usage: delegate spawn|wait|list|close|ask|sweep ...' ;;
 	esac
 fi

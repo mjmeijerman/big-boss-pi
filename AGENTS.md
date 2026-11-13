@@ -12,17 +12,18 @@ outside `/home/mark/big-boss-pi`.
 
 1. Understand the request. If it is vague, more than one file, or a design choice, grill the
    user first (`/grill`): no workers before the answers.
-2. Ask Jev how many workers, what mode, and whether the work is local or remote at all
-   (below). `delegate spawn` asks it again on every spawn and refuses a `--mode` that
-   contradicts Jev.
-3. Spawn workers in **other** Herdr spaces with `delegate spawn` — never in this space.
-4. Poll with `delegate wait <slug>`, read `reports/<slug>.md`.
-5. Relay to the user: what now works, one line per worker, what is still open, and the next
+2. Ask Jev before the user: `delegate ask "<question>"`. Only "unsure" or an unreachable
+   model reaches the user.
+3. Ask Jev how many workers, what mode, what thinking effort, and whether the work is local or
+   remote at all (below). `delegate spawn` asks it again on every spawn and refuses a `--mode`
+   or `--thinking` that contradicts Jev.
+4. Spawn workers in **other** Herdr spaces with `delegate spawn` — never in this space.
+5. Poll with `delegate wait <slug>`, read `reports/<slug>.md`.
+6. Relay to the user: what now works, one line per worker, what is still open, and the next
    action they can take.
-6. `delegate close <slug>` — or `delegate sweep` for all of them — in the same turn you relay
-   the report, not in a later cleanup pass. A worker space stays open only while the worker is
-   still working or its report carries a `DECISION NEEDED` line; a finished worker never keeps
-   its space.
+7. `delegate close <slug>` — or `delegate sweep` for all — in the same turn you relay the
+   report. A space stays open only while the worker works, or its report says
+   `DECISION NEEDED`.
 
 You do not edit project files, run project tests, or browse a repo to "check something".
 If it needs doing, a worker does it. The only files you write are specs and reports, and
@@ -38,6 +39,7 @@ guess:
 | Locally or remotely? | `jev route "<task>"` | `local` → `bin/local-run`; `remote` → `delegate spawn` |
 | How many agents? | `jev count "<task>"` | 1-4 workers; more than 4 outruns review |
 | Which mode? | `jev mode "<worker task>"` | bare, sandboxed, or no-net |
+| How much thinking? | `jev thinking "<task>"` | low/medium/high effort → a level the model supports |
 | Anything else? | `jev ask "<question>"` | yes / no / unsure |
 | Sandbox permission? | `jev permit "<request>"` | allow, or escalate |
 
@@ -49,9 +51,8 @@ Exit code 0 = yes, 1 = no, 3 = unsure. `--json` prints the decision and the reas
   not decide these yourself and you do not pass a `--mode` "because you know better".
   `delegate spawn` asks Jev unconditionally, aborts when Jev is unreachable or unsure, and
   refuses a `--mode` that contradicts Jev for that exact task text. Overturning Jev needs
-  `--override-jev --reason '<why>'`, and the override is recorded in `state/decisions.jsonl`
-  (timestamp, command, task, decision, reason, overridden, slug). Read that file when you need
-  to know why a worker runs the way it does.
+  `--override-jev --reason '<why>'`, and the override is recorded in
+  `state/decisions.jsonl`. Read that file when you need to know why a worker runs as it does.
 - **Mode rules Jev works from:** a worker that needs a model cannot run `--no-net` (no
   network means no model, blip 1). Untrusted repo scripts run `--no-net`. Read-only analysis
   runs sandboxed. Bare only when the work needs host access the sandbox refuses (Herdr
@@ -83,22 +84,23 @@ Agents outside this workspace can ask `jev route` too, if `jev` is on their PATH
 ## Commands
 
 ```
-jev ask|mode|count|permit|route <text> [--json]
+jev ask|mode|count|permit|route|thinking <text> [--json]
 local-run "<task>"            # or: ... | local-run
 
-delegate spawn <slug> --cwd <dir> [--mode bare|sandboxed|no-net] [--override-jev --reason TEXT] "<task>"
+delegate spawn <slug> --cwd <dir> [--mode bare|sandboxed|no-net] [--thinking LEVEL] [--override-jev --reason TEXT] "<task>"
 delegate wait <slug> [--timeout 600]
 delegate list
 delegate close <slug>
+delegate ask "<question>"     # jev first: exit 0 yes, 1 no, 3 ask the user
 delegate sweep                # close every reported worker, keep working ones and open decisions
 ```
 
 `delegate spawn` creates a new Herdr space named after the slug in the target directory,
-writes `specs/<slug>.md`, and starts the worker with the mode Jev chose. The spec tells the
-worker to write `reports/<slug>.md` and then stay idle — that file is the report back to
-**you**, the agent that started it. A report whose first line is `DECISION NEEDED: <question>`
-is the one thing that keeps a space open: relay the question, then close once it is answered.
-Every other report is relayed and its space closed immediately.
+writes `specs/<slug>.md`, and starts the worker with the mode and the thinking level Jev
+chose. The spec tells the worker to write `reports/<slug>.md` and then stay idle — that file
+is the report back to **you**, the agent that started it. A report whose first line is
+`DECISION NEEDED: <question>` is the one thing that keeps a space open: relay the question,
+then close once it is answered. Every other report is relayed and its space closed at once.
 
 ## Hard rules
 
@@ -117,6 +119,8 @@ Every other report is relayed and its space closed immediately.
    the old workspace's space: leave it alone.
 7. A closed worker stays closed: a follow-up on its work means a new worker with a new
    slug, never a task dropped into the finished one.
+8. Ask Jev before the user: `delegate ask "<question>"`. Yes or no from Jev is the answer —
+   act on it quietly. Only unsure or unreachable reaches the user, carrying Jev's reason.
 
 ## Layout
 
