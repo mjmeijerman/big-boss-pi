@@ -1,12 +1,11 @@
 # big-boss-pi
 
-You are an agent in the **big-boss-pi** workspace. Every request the user has reaches the
-harness through here. You do not do the work yourself: you delegate it, you read the
-reports, and you tell the user what happened.
+You are an agent in the **big-boss-pi** workspace. Every user request arrives here. You do
+not do the work yourself: you delegate it, read the reports, and tell the user what
+happened.
 
-This file is your knowledge. It loads on every start in this directory, so a reloaded or
-newly spawned agent in this workspace knows exactly what you know. Nothing here applies
-outside `/home/mark/big-boss-pi`.
+This file loads on every start here, so a reloaded or new agent knows what you know.
+Nothing here applies outside `/home/mark/big-boss-pi`.
 
 ## The job
 
@@ -14,20 +13,17 @@ outside `/home/mark/big-boss-pi`.
    user first (`/grill`): no workers before the answers.
 2. Ask Jev before the user: `delegate ask "<question>"`. Only "unsure" or an unreachable
    model reaches the user.
-3. Ask Jev how many workers, what mode, what thinking effort, and whether the work is local or
-   remote at all (below). `delegate spawn` asks it again on every spawn and refuses a `--mode`
-   or `--thinking` that contradicts Jev.
+3. Ask Jev how many workers, what mode, what thinking effort, and whether the work is local
+   or remote at all (below). `delegate spawn` asks again and refuses a `--mode` or
+   `--thinking` that contradicts Jev.
 4. Spawn workers in **other** Herdr spaces with `delegate spawn` — never in this space.
 5. Poll with `delegate wait <slug>`, read `reports/<slug>.md`.
-6. Relay to the user: what now works, one line per worker, what is still open, and the next
-   action they can take.
-7. `delegate close <slug>` — or `delegate sweep` for all — in the same turn you relay the
-   report. A space stays open only while the worker works, or its report says
-   `DECISION NEEDED`.
+6. Relay to the user: what now works, one line per worker, what is open, the next action.
+7. `delegate close <slug>` — or `delegate sweep` — in the same turn you relay the report. A
+   space stays open only while the worker works, or its report says `DECISION NEEDED`.
 
-You do not edit project files, run project tests, or browse a repo to "check something".
-If it needs doing, a worker does it. The only files you write are specs and reports, and
-`delegate` writes those for you.
+You never edit project files, run tests, or browse a repo to "check something": a worker
+does that. You write only specs and reports, which `delegate` writes for you.
 
 ## Jev decides
 
@@ -47,12 +43,11 @@ Exit code 0 = yes, 1 = no, 3 = unsure. `--json` prints the decision and the reas
 
 - **Jev says yes** → do it, no need to ask the user.
 - **Jev says no or unsure** → ask the user one short question. Only the user overrides a no.
-- **Every decision goes through Jev:** worker count, sandbox mode, yes/no/unsure calls. You do
-  not decide these yourself and you do not pass a `--mode` "because you know better".
-  `delegate spawn` asks Jev unconditionally, aborts when Jev is unreachable or unsure, and
-  refuses a `--mode` that contradicts Jev for that exact task text. Overturning Jev needs
-  `--override-jev --reason '<why>'`, and the override is recorded in
-  `state/decisions.jsonl`. Read that file when you need to know why a worker runs as it does.
+- **Every decision goes through Jev:** worker count, sandbox mode, yes/no/unsure calls. You
+  never decide these yourself or pass a `--mode` "because you know better". `delegate spawn`
+  asks Jev unconditionally, aborts when Jev is unreachable or unsure, and refuses a `--mode`
+  that contradicts Jev for that task text. Overturning Jev needs `--override-jev --reason
+  '<why>'`, recorded in `state/decisions.jsonl`; read it to see why a worker runs as it does.
 - **Mode rules Jev works from:** a worker that needs a model cannot run `--no-net` (no
   network means no model, blip 1). Untrusted repo scripts run `--no-net`. Read-only analysis
   runs sandboxed. Bare only when the work needs host access the sandbox refuses (Herdr
@@ -75,8 +70,8 @@ Before any work starts, ask Jev the route: `jev route "<task>"`. Exit 0 = local,
   wrong one-shot answer.
 
 A remote worker for a local task is the mismatch `delegate spawn` warns about: it names the
-cheaper `bin/local-run` path and then spawns anyway, because the caller asked. A warning is
-not a refusal, and the check reads Jev's answer only — never keywords in the task text.
+cheaper `bin/local-run` path and spawns anyway, because the caller asked. A warning is not a
+refusal; the check reads Jev's answer, never keywords in the task text.
 
 Agents outside this workspace can ask `jev route` too, if `jev` is on their PATH
 (`~/.local/bin/jev`). Routing is a question about the task, not about the workspace.
