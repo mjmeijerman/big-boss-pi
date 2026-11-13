@@ -48,6 +48,11 @@
 #
 # Radar Vol. 35: blip 1 (agent sandboxing, Adopt), blip 21 (subagents, Trial — capped at 4),
 # blip 17 (risk-tiered human oversight — the mode decides how much rope a worker gets).
+#
+# The base a worker cuts from is fetched and brought up to date here, before the space exists:
+# a sandboxed worker cannot fetch, so a stale trunk would put a PR on an old base. Trunk is
+# fast-forwarded only when it is a clean, strictly-behind ancestor; dirty, ahead or diverged
+# trunk refuses the spawn with the state named, and nothing is ever reset, rebased or forced.
 set -euo pipefail
 
 # ROOT: PI_BOSS_ROOT wins, PI_MASTER_ROOT is the deprecated fallback, then this script's tree.
@@ -217,6 +222,94 @@ restore_focus() {
 	return 0
 }
 
+# fresh_trunk_branch <cwd> — the branch origin's HEAD points at, else the first of
+# trunk/main/master the remote actually has; empty when the remote has none of them.
+#
+# origin/HEAD is only written by a clone or `git remote set-head --auto`, so plenty of local
+# checkouts have none: the fallback list is a normal path, not the exception.
+fresh_trunk_branch() {
+	local cwd=$1 ref b
+	ref=$(git -C "$cwd" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) || ref=""
+	if [ -n "$ref" ]; then printf '%s' "${ref#origin/}"; return 0; fi
+	for b in trunk main master; do
+		if git -C "$cwd" show-ref --verify --quiet "refs/remotes/origin/$b"; then
+			printf '%s' "$b"
+			return 0
+		fi
+	done
+	return 0
+}
+
+# ensure_fresh_trunk <cwd> — a worker cuts its branch from a base the boss just fetched, never
+# from a stale local trunk. Called in the spawn path, before the space exists.
+#
+# Why here: a sandboxed worker cannot git fetch (the sandbox refuses the ownership of the ssh
+# config), so its origin/<trunk> is whatever was last fetched on the host, and a worker cut
+# from that stale base ships a PR against an old trunk. The boss can fetch, so the boss
+# guarantees the base before the worker starts.
+#
+# Fetching is always safe; moving trunk is not, so the update is limited to one case: the local
+# trunk is a clean, strictly-behind ancestor of origin/<trunk>. A dirty working tree, an ahead
+# trunk, or a diverged trunk all refuse the spawn, naming the exact state and the command that
+# fixes it. Nothing here resets, rebases, stashes, checks out or forces: that is the owner's
+# work to move.
+#
+# A --cwd that is not a git repo, or has no origin, is skipped with one line: delegation has no
+# business demanding git of every worker.
+ensure_fresh_trunk() {
+	local cwd=$1 branch current ahead behind counts url
+	if ! git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
+		say "trunk: $cwd is not a git repo, skipping the freshness check" >&2
+		return 0
+	fi
+	url=$(git -C "$cwd" remote get-url origin 2>/dev/null) || url=""
+	if [ -z "$url" ]; then
+		say "trunk: $cwd has no origin, skipping the freshness check" >&2
+		return 0
+	fi
+	branch=$(fresh_trunk_branch "$cwd")
+	if [ -z "$branch" ]; then
+		say "trunk: $cwd has no origin/trunk, origin/main or origin/master, skipping the freshness check" >&2
+		return 0
+	fi
+	git -C "$cwd" fetch --prune --quiet origin || die "refusing to spawn: git fetch origin failed in $cwd, so the base cannot be trusted.
+Fix remote access there first (ssh -T $url), then spawn again."
+
+	# Trunk is not checked out: move the ref, never the working tree. A fetch into a local branch
+	# refuses a non-fast-forward update by itself, so this cannot rewind anyone's trunk.
+	current=$(git -C "$cwd" symbolic-ref --quiet --short HEAD 2>/dev/null) || current=""
+	if [ "$current" != "$branch" ]; then
+		git -C "$cwd" fetch --quiet origin "$branch:$branch" || die "refusing to spawn: local $branch in $cwd is not a fast-forward of origin/$branch, and it is not checked out, so the base cannot be updated safely.
+Look before moving it:  git -C $cwd log --oneline --left-right $branch...origin/$branch"
+		say "trunk: $branch in $cwd updated to origin/$branch (not checked out; no working tree touched)" >&2
+		return 0
+	fi
+
+	# On trunk. Dirty first: a fast-forward is a checkout, so it would either fail halfway or
+	# carry somebody's uncommitted work onto the new base.
+	if [ -n "$(git -C "$cwd" status --porcelain 2>/dev/null)" ]; then
+		die "refusing to spawn: $cwd is on $branch with a dirty working tree, so trunk cannot be fast-forwarded to origin/$branch.
+Commit, stash or discard it first:  git -C $cwd stash -u"
+	fi
+	counts=$(git -C "$cwd" rev-list --left-right --count "HEAD...origin/$branch" 2>/dev/null | tr '\t' ' ') || counts="0 0"
+	ahead=${counts%% *}
+	behind=${counts##* }
+	if [ "$ahead" = 0 ] && [ "$behind" = 0 ]; then
+		say "trunk: $branch in $cwd is up to date with origin/$branch" >&2
+		return 0
+	fi
+	if [ "$ahead" != 0 ] && [ "$behind" != 0 ]; then
+		die "refusing to spawn: $branch in $cwd has diverged from origin/$branch ($ahead ahead, $behind behind).
+Move it yourself — rebase or merge origin/$branch, or move the work onto a branch — then spawn again:  git -C $cwd pull --rebase origin $branch"
+	fi
+	if [ "$ahead" != 0 ]; then
+		die "refusing to spawn: $branch in $cwd is $ahead commit(s) ahead of origin/$branch and nothing behind. Unpushed trunk is not a base to cut a worker's branch from.
+Push it, or move it onto a branch, then spawn again:  git -C $cwd log --oneline origin/$branch..$branch"
+	fi
+	git -C "$cwd" merge --ff-only --quiet "origin/$branch" || die "refusing to spawn: could not fast-forward $branch in $cwd to origin/$branch; the git merge --ff-only error above says why."
+	say "trunk: fast-forwarded $branch in $cwd by $behind commit(s) to origin/$branch" >&2
+}
+
 cmd_spawn() {
 	local slug="" cwd="" mode="" thinking="" task="" override_jev=0 reason="" runner="" no_restore=0
 	[ "$#" -ge 1 ] || die 'usage: delegate spawn <slug> --cwd DIR [--mode M] [--thinking LEVEL] [--override-jev --reason TEXT] [--no-restore] "<task>"'
@@ -323,6 +416,10 @@ Forcing a remote worker needs --override-jev --reason '<why this cannot run loca
 	if [ "$jev_count" -gt 1 ]; then
 		say "jev: this task wants $jev_count workers ($count_reason); spawning one now" >&2
 	fi
+
+	# 5. Guarantee the base before anything is created. The fetch works here and not inside a
+	#    sandboxed worker, so the worker's trunk is fresh by construction, not by hope.
+	ensure_fresh_trunk "$cwd"
 
 	mkdir -p "$SPECS" "$REPORTS" "$STATE"
 	local spec=$SPECS/$slug.md report=$REPORTS/$slug.md
