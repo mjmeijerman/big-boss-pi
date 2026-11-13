@@ -20,9 +20,34 @@
  * Exit codes: 0 yes, or a valid mode/count/thinking answer (route: 0 local, 1 remote),
  * 1 no, 3 unsure or model unreachable (ask the user), 2 usage.
  * --json prints {"decision":…,"reason":…} instead of one line.
+ *
+ * Every call is recorded in state/usage.jsonl (see bin/usage.mjs): kind "jev", the
+ * subcommand, the model that answered, the latency and whether it answered at all. A caller
+ * that has one sets PI_BOSS_CONTEXT (delegate sets the slug), which lands on the line too.
  */
 import process from "node:process";
 import { MODEL, ENDPOINT, TIMEOUT } from "./jev-model.mjs";
+import { logUsage, context } from "./usage.mjs";
+
+// Wall clock for the usage line: a decision model that takes 40s is a fact worth having.
+const started = Date.now();
+let command = "";
+
+// record — one usage line for this call, ok or not. Callers exit straight after.
+function record(ok, errorMsg) {
+	if (!command) return;
+	logUsage({
+		kind: "jev",
+		command,
+		model: MODEL,
+		started,
+		latency_ms: Date.now() - started,
+		ok,
+		error: errorMsg,
+		context: context(),
+		task: opts.text,
+	});
+}
 
 const POLICY = `You are Jev, a decision model inside a coding-agent harness. You answer one
 narrow question at a time and you answer it in JSON. You are not a chatbot: no prose outside
@@ -53,7 +78,8 @@ Standing policy you must apply:
 - If the question is ambiguous, if answering it would be a guess, or if the safe answer is
   not clear: answer "unsure". A human will take it. That is a good outcome, not a failure.`;
 
-function fail(message, code = 3) {
+function fail(message, code = 3, errorClass = "unreachable") {
+	record(false, message.startsWith("decision model") ? errorClass : "usage");
 	process.stdout.write(`jev: ${message}\n`);
 	process.exit(code);
 }
@@ -115,24 +141,25 @@ async function decide(kind, text) {
 			signal: AbortSignal.timeout(TIMEOUT),
 		});
 	} catch (error) {
-		fail(`decision model unreachable (${ENDPOINT}): ${error.message} — ask the user`);
+		fail(`decision model unreachable (${ENDPOINT}): ${error.message} — ask the user`, 3, "unreachable");
 	}
-	if (!response.ok) fail(`decision model returned HTTP ${response.status} — ask the user`);
+	if (!response.ok) fail(`decision model returned HTTP ${response.status} — ask the user`, 3, "http");
 
 	const payload = await response.json().catch(() => null);
 	const content = payload?.message?.content;
-	if (!content) fail("decision model returned nothing — ask the user");
+	if (!content) fail("decision model returned nothing — ask the user", 3, "empty");
 
 	let answer;
 	try {
 		answer = JSON.parse(content);
 	} catch {
-		fail(`decision model answered outside JSON (${String(content).slice(0, 120)}) — ask the user`);
+		fail(`decision model answered outside JSON (${String(content).slice(0, 120)}) — ask the user`, 3, "non-json");
 	}
 	return answer;
 }
 
 const opts = parseArgs(process.argv.slice(2));
+command = opts.kind;
 if (!opts.kind) fail("usage: jev ask|permit|mode|count|route|thinking <text> [--json]", 2);
 if (!opts.text) fail(`jev ${opts.kind}: needs the question text`, 2);
 
@@ -142,6 +169,9 @@ const reason = typeof answer.reason === "string" ? answer.reason : "";
 const low = confidence !== null && confidence < 0.5;
 
 function emit(line, payload, code) {
+	// The model answered, whatever the harness makes of the answer: exit 3 for "unsure" is a
+	// decision, not a failure of the local path.
+	record(true);
 	if (opts.json) process.stdout.write(`${JSON.stringify(payload)}\n`);
 	else process.stdout.write(`jev: ${line}${reason ? ` — ${reason}` : ""}\n`);
 	process.exit(code);

@@ -13,7 +13,7 @@ copy: read-only during the transition, deleted only when the user says so.
 |---|---|---|
 | The rules every agent here loads | `/home/mark/big-boss-pi/AGENTS.md` | Pi loads `AGENTS.md` from the working directory and every parent, on every start, with no project trust needed. New or reloaded agents therefore start with the same knowledge |
 | Decision model | `bin/jev` → `~/.local/bin/jev` | local qwen3.8:27b on ollama; decides worker count, mode, route, thinking effort, and permissions |
-| Local worker | `bin/local-run` | runs a local task on the same model, headless: prompt in, answer on stdout, no space and no state |
+| Local worker | `bin/local-run` | runs a local task on the same model, headless: prompt in, answer on stdout, no space and no spec; records one line in `state/usage.jsonl` |
 | Delegation | `bin/delegate` → `~/.local/bin/delegate` | asks Jev for mode, count, route and thinking effort, creates a Herdr space per worker, writes the spec, records where the report lands, appends every decision to `state/decisions.jsonl`; `delegate sweep` closes the workers that finished |
 | Worker modes | `bin/pi-bare`, `bin/pi-sandboxed`, `bin/pi-nonet` | `delegate` picks one from Jev's answer |
 | Never-closable space | `bin/guard` → `~/.local/bin/big-boss-pi-guard` + `~/.config/systemd/user/big-boss-pi-guard.service` | polls `herdr-app ls`; recreates the `big-boss-pi` space if it disappears, selects it once when Herdr starts. It never recreates a space named `pi-master` |
@@ -33,7 +33,7 @@ answers `local` or `remote`:
 
 - `local` — summarise, classify, extract, tidy, translate, format, short mechanical rewrites
   with no repo knowledge and no tools. Run `bin/local-run "<task>"`; it prints the answer and
-  writes nothing. Exit 0 = local, 1 = remote, 3 = unsure, so it drops straight into `if`.
+  records one line in `state/usage.jsonl`. Exit 0 = local, 1 = remote, 3 = unsure, so it drops straight into `if`.
 - `remote` — code changes, debugging, design decisions, multi-file reasoning, anything that
   needs tools, tests or a repo. Go through `delegate spawn`.
 
@@ -48,6 +48,38 @@ jev route "summarise reports/foo.md in three bullets"   # → local  (exit 0)
 markdown notes.txt | bin/local-run                       # the answer on stdout
 jev route "add retries to the fetch client"              # → remote (exit 1)
 ```
+
+## Is the local model actually used?
+
+`delegate stats` answers that in one line instead of by inference:
+
+```
+delegate stats                    # last 7 days, one screen
+delegate stats --since 24h        # 24h, 90m, 2w — <number><s|m|h|d|w>
+delegate stats --json | jq .      # the same numbers, machine-readable
+```
+
+It prints jev calls per command (`ask`, `route`, `mode`, `count`, `thinking`), the route,
+mode and thinking splits, how often a caller overruled jev and at what rate, the local-run
+invocation count with total and median latency, and the line everything else is there for:
+
+```
+local work path: 4 invocations (last: 2026-11-13T20:41:02.115Z)
+local work path: never used
+```
+
+Two append-only files under `state/` feed it, and neither is committed (`state/` is ignored).
+`state/decisions.jsonl` is what jev decided, one line per decision, carrying jev's own answer
+in `jev` so `overridden` can be checked rather than trusted: it is true only on the line whose
+decision `--override-jev` actually overturned. Older rows put that flag on all four lines of
+an overridden spawn, so `delegate stats` counts them as legacy instead of re-reading them.
+
+`state/usage.jsonl` is what the local model did, one line per call from `bin/jev` or
+`bin/local-run`: timestamp, kind, subcommand, model id, latency, whether it answered, the
+error class when it did not, and the caller's slug or context. **Not** logged: environment
+variables, credentials, endpoints, and the whole task text — only the first 200 characters,
+with key-shaped tokens redacted. The answer itself is never logged. Recording cannot break a
+call: a failed write is swallowed.
 
 ## Jev gates every delegation
 
@@ -154,9 +186,11 @@ the boss and stays guarded exactly as before.
 herdr-app ls                                    # is the space there?
 systemctl --user status big-boss-pi-guard       # is the guard alive?
 delegate list                                   # workers, their spaces, the last jev decision
+delegate stats                                  # is the local model used, and how often
 delegate sweep                                  # close the ones that reported, keep the rest
 tail -f ~/big-boss-pi/reports/*.md              # what workers reported
 tail -2 ~/big-boss-pi/state/decisions.jsonl     # what jev decided
+tail -2 ~/big-boss-pi/state/usage.jsonl         # what the local model answered
 ```
 
 ## Changing the rules

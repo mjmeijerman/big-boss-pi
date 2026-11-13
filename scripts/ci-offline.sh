@@ -154,5 +154,92 @@ else
 	fail "no route line with decision local and overridden true in state/decisions.jsonl"
 fi
 
+# 7. delegate stats: the aggregation over both files, with fixtures written into the
+#    temporary root. The numbers below are the assertion: counts per command, the route split,
+#    the override count (including one legacy row whose flag predates the per-line fix), and the
+#    local work path line, which is the whole reason the usage file exists.
+# The earlier cases really did call bin/jev and bin/local-run, and both write usage lines
+# under PI_BOSS_ROOT. Start this section from nothing so the counts below are the fixtures.
+rm -f "$PI_BOSS_ROOT/state/usage.jsonl"
+now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+cat >"$PI_BOSS_ROOT/state/decisions.jsonl" <<EOF
+{"timestamp":"$now","command":"route","task":"t","decision":"remote","reason":"r","overridden":false,"slug":"a","jev":"remote"}
+{"timestamp":"$now","command":"route","task":"t","decision":"remote","reason":"r","overridden":false,"slug":"b","jev":"remote"}
+{"timestamp":"$now","command":"route","task":"t","decision":"local","reason":"r","overridden":true,"slug":"c","jev":"local"}
+{"timestamp":"$now","command":"mode","task":"t","decision":"bare","reason":"r","overridden":true,"slug":"c","jev":"sandboxed"}
+{"timestamp":"$now","command":"count","task":"t","decision":"1","reason":"r","overridden":false,"slug":"c","jev":"1"}
+{"timestamp":"$now","command":"thinking","task":"t","decision":"low","reason":"r","overridden":false,"slug":"c","jev":"low"}
+{"timestamp":"$now","command":"ask","task":"q","decision":"yes","reason":"r","overridden":false,"slug":"","jev":"yes"}
+{"timestamp":"$now","command":"route","task":"t","decision":"remote","reason":"r","overridden":true,"slug":"old"}
+{"timestamp":"2020-01-01T00:00:00.000Z","command":"route","task":"old","decision":"local","reason":"r","overridden":false,"slug":"x","jev":"local"}
+this line is not json
+EOF
+
+# No usage file yet: the local worker side is honest about never having run.
+expect "stats, no local-run yet" 0 "local work path: never used" -- \
+	"$bin/delegate" stats
+
+cat >"$PI_BOSS_ROOT/state/usage.jsonl" <<EOF
+{"ts":"$now","kind":"jev","command":"route","model":"qwen3.8:27b","latency_ms":1000,"ok":true,"error":null,"context":"spawn:c","task":"t"}
+{"ts":"$now","kind":"jev","command":"mode","model":"qwen3.8:27b","latency_ms":3000,"ok":true,"error":null,"context":"spawn:c","task":"t"}
+{"ts":"$now","kind":"local-run","command":"run","model":"qwen3.8:27b","latency_ms":4000,"ok":true,"error":null,"context":null,"task":"summarise"}
+{"ts":"$now","kind":"local-run","command":"run","model":"qwen3.8:27b","latency_ms":2000,"ok":true,"error":null,"context":null,"task":"tidy"}
+{"ts":"$now","kind":"local-run","command":"run","model":"qwen3.8:27b","latency_ms":500,"ok":false,"error":"unreachable","context":null,"task":"x"}
+{"ts":"2020-01-01T00:00:00.000Z","kind":"local-run","command":"run","model":"qwen3.8:27b","latency_ms":9999,"ok":true,"error":null,"context":null,"task":"old"}
+EOF
+
+expect "stats, local-run counted" 0 "local work path: 3 invocations" -- \
+	"$bin/delegate" stats
+expect "stats, legacy override named" 0 "1 legacy rows" -- \
+	"$bin/delegate" stats
+expect "stats, bad duration refused" 2 "--since takes a duration" -- \
+	"$bin/delegate" stats --since 7
+
+# assert_stats '<json>' -- compare dotted paths in the stats JSON against the wanted values,
+# read from stdin. Prints the mismatches and exits 1 when any disagree.
+assert_stats() {
+	node -e '
+		const fs=require("fs");
+		let s={};let raw="";
+		try{s=JSON.parse(fs.readFileSync(0,"utf8"))}catch(e){console.log("not JSON: "+e.message);process.exit(1)}
+		const want=JSON.parse(process.argv[1]);
+		const bad=[];
+		for(const [k,exp] of Object.entries(want)){
+			const got=k.split(".").reduce((a,p)=>a?.[p],s);
+			if(JSON.stringify(got)!==JSON.stringify(exp))bad.push(k+"="+JSON.stringify(got)+" wanted "+JSON.stringify(exp));
+		}
+		if(bad.length){console.log(bad.join(", "));process.exit(1)}
+	' "$1"
+}
+
+stats_json=$("$bin/delegate" stats --json 2>&1) || true
+if msg=$(printf '%s' "$stats_json" | assert_stats '{
+	"decisions.total":8,
+	"decisions.unreadable":1,
+	"decisions.outside_window":1,
+	"decisions.by_command.route":4,
+	"decisions.by_command.mode":1,
+	"decisions.route.remote":3,
+	"decisions.route.local":1,
+	"decisions.mode.bare":1,
+	"decisions.thinking.low":1,
+	"decisions.override.count":3,
+	"decisions.override.legacy_rows":1,
+	"decisions.override.legacy_route_remote":1,
+	"local_model.jev_calls":2,
+	"local_model.jev_median_latency_ms":2000,
+	"local_run.invocations":3,
+	"local_run.ok":2,
+	"local_run.failed":1,
+	"local_run.total_latency_ms":6000,
+	"local_run.median_latency_ms":3000,
+	"local_work_path.used":true,
+	"local_work_path.invocations":3
+}'); then
+	pass "stats --json aggregation matches the fixtures"
+else
+	fail "stats --json aggregation: $msg"
+fi
+
 printf '\n%s\n' "$([ "$fails" = 0 ] && echo "offline behaviour: ok" || echo "offline behaviour: $fails failure(s)")"
 [ "$fails" = 0 ]
