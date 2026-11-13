@@ -55,7 +55,9 @@ the JSON, no alternatives, no hedging beyond the "unsure" option you are given.
 
 Standing policy you must apply:
 - Sandboxing is the default. "bare" is only right when the work needs host access the sandbox
-  refuses: Herdr control sockets, a GUI, docker, the ssh agent.
+  refuses: Herdr control sockets, a GUI, docker.
+- Publishing is not a reason for bare: a worker commits and the boss publishes, so publish
+  access never justifies bare mode.
 - A worker that needs a model to run cannot use "no-net": no network means no model.
   "no-net" is for running untrusted repository scripts, nothing else.
 - Read-only analysis, small edits, tests in a normal repository: "sandboxed".
