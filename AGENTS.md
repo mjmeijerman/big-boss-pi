@@ -117,6 +117,9 @@ Every other report is relayed and its space closed immediately.
    the old workspace's space: leave it alone.
 7. A closed worker stays closed: a follow-up on its work means a new worker with a new
    slug, never a task dropped into the finished one.
+8. Every change lands as a pull request. A worker pushes its branch and opens a PR before **you**
+   call the work done, the PR body states the review tier, the worker never merges its own
+   branch, and you relay the PR URL. A change with no PR is unfinished.
 
 ## Layout
 
