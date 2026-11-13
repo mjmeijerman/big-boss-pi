@@ -46,6 +46,11 @@
 # "thinking"). `delegate ask` writes the same line for a question put to jev before it ever
 # reaches the user.
 #
+# The base a worker cuts from is fetched and brought up to date here, before the space exists:
+# a sandboxed worker cannot fetch, so a stale trunk would put a PR on an old base. Trunk is
+# fast-forwarded only when it is a clean, strictly-behind ancestor; dirty, ahead or diverged
+# trunk refuses the spawn with the state named, and nothing is ever reset, rebased or forced.
+#
 # Radar Vol. 35: blip 1 (agent sandboxing, Adopt), blip 21 (subagents, Trial — capped at 4),
 # blip 17 (risk-tiered human oversight — the mode decides how much rope a worker gets).
 #
@@ -461,15 +466,16 @@ $task
    Remote is what you are for; local work in a worker space is the mismatch this rule catches.
 4. Do not spawn other agents or Herdr spaces, and do not rename, move or close any space.
    If the task needs more hands, say so in the report.
-5. Every change lands as a pull request, so the work is finished only once the branch is
-   pushed and the PR is open: \`git push -u origin <branch>\`, then \`gh pr create --base main\`.
-   The PR body states the review tier (low: docs, comments, formatting; medium: application code,
-   tests, migrations; high: extensions, AGENTS.md, .github/, git-hooks/, sandbox/, auth, secrets,
-   money, deletion). Leave merging to the human: do not merge your own branch, and never push to
-   trunk or commit on trunk.
+5. Every change lands as a pull request. Commit on a branch, then publish it:
+   \`git push -u origin <branch>\`, then \`gh pr create --base main\` with the review tier in the
+   body (low: docs, comments, formatting; medium: application code, tests, migrations; high:
+   extensions, AGENTS.md, .github/, git-hooks/, sandbox/, auth, secrets, money, deletion). A
+   sandboxed worker usually has no ssh agent and no gh auth, so either step may fail: do not
+   fight it. Put the branch name and the commit sha in the report, and one line saying the boss
+   has to publish it. Never merge your own branch, and never push to trunk or commit on trunk.
 6. When you are done — or blocked and unable to continue — write \`$report\` with:
    - what now works, in concrete terms (a command to run, a path, a test that passes)
-   - what you changed (branch, files), and the PR URL so the boss can relay it
+   - what you changed (branch, commit sha, files), and the PR URL, or the branch to publish
    - what is still open, and the one next action for the person
    Keep it short. That file is the whole message back; nobody reads your scrollback.
 7. Then write the report and stay idle. Do not close, rename or move the space. The

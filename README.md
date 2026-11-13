@@ -98,10 +98,13 @@ behind. A dirty tree, an ahead trunk or a diverged one refuses the spawn and pri
 state and the command that fixes it; nothing is reset, rebased or forced. A `--cwd` that is not a
 git repo, or has no origin, is skipped with one line.
 
-Every worker branch ends in a pull request: the worker pushes its branch and runs
-`gh pr create --base main` with the review tier in the body, and never merges it. The report
-carries the PR URL so the boss can relay it. A change with no PR is unfinished, however green it
-looks locally — merging stays the human's call.
+Every worker branch ends in a pull request: the worker commits on its branch and tries
+`git push -u origin <branch>` and `gh pr create --base main` with the review tier in the body,
+and never merges it. A sandboxed worker usually has no ssh agent and no gh auth: when either
+step fails it stops fighting and says so in the report, with the branch name and the commit sha,
+and the boss publishes the branch and opens the PR. The report carries the PR URL so the boss
+can relay it. A change with no PR is unfinished, however green it looks locally — merging stays
+the human's call.
 
 A worker cuts its own worktree (`git worktree add ../<slug>-worktree -b <branch>`) and never
 switches the boss's live checkout: `delegate spawn` records that checkout's branch, and
