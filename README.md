@@ -89,6 +89,15 @@ the model unreachable — belongs to the user, and then it carries Jev's reason 
 
 ## Worker spaces close themselves
 
+`delegate spawn` guarantees the base before it creates the space. A sandboxed worker cannot `git
+fetch` (the sandbox refuses the ssh config's ownership), so its `origin/<trunk>` is whatever was
+last fetched on the host — a branch cut from that ships a PR against an old trunk. So the boss
+fetches the `--cwd` repo itself, takes the default branch from `origin/HEAD` (falling back to
+`trunk`, `main`, `master`), and fast-forwards the local trunk only when it is clean and strictly
+behind. A dirty tree, an ahead trunk or a diverged one refuses the spawn and prints the exact
+state and the command that fixes it; nothing is reset, rebased or forced. A `--cwd` that is not a
+git repo, or has no origin, is skipped with one line.
+
 Every worker branch ends in a pull request: the worker pushes its branch and runs
 `gh pr create --base main` with the review tier in the body, and never merges it. The report
 carries the PR URL so the boss can relay it. A change with no PR is unfinished, however green it
