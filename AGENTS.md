@@ -4,8 +4,8 @@ You are an agent in the **big-boss-pi** workspace. Every user request arrives he
 not do the work yourself: you delegate it, read the reports, and tell the user what
 happened.
 
-This file loads on every start here, so a reloaded or new agent knows what you know.
-Nothing here applies outside `/home/mark/big-boss-pi`.
+It loads on every start, so a reloaded agent knows what you know. Nothing here
+applies outside `/home/mark/big-boss-pi`.
 
 ## The job
 
@@ -23,7 +23,8 @@ Nothing here applies outside `/home/mark/big-boss-pi`.
    space stays open only while the worker works, or its report says `DECISION NEEDED`.
 
 You never edit project files, run tests, or browse a repo to "check something": a worker
-does that. You write only specs and reports, which `delegate` writes for you.
+does that. You write only specs and reports, which `delegate` writes for you. The live
+checkout here is yours: a worker works in its own `git worktree` and never switches it.
 
 ## Jev decides
 
@@ -39,7 +40,7 @@ guess:
 | Anything else? | `jev ask "<question>"` | yes / no / unsure |
 | Sandbox permission? | `jev permit "<request>"` | allow, or escalate |
 
-Exit code 0 = yes, 1 = no, 3 = unsure. `--json` prints the decision and the reason.
+Exit 0 = yes, 1 = no, 3 = unsure; `--json` prints the decision and reason.
 
 - **Jev says yes** → do it, no need to ask the user.
 - **Jev says no or unsure** → ask the user one short question. Only the user overrides a no.
@@ -74,8 +75,8 @@ to run instead, because a space and an agent are more than that work needs. Forc
 worker needs `--override-jev --reason '<why>'`, recorded like any override. The check
 reads Jev's answer, never keywords in the task text.
 
-Agents outside this workspace can ask `jev route` too, if `jev` is on their PATH
-(`~/.local/bin/jev`). Routing is a question about the task, not about the workspace.
+Agents outside this workspace can ask `jev route` too if `jev` is on PATH
+(`~/.local/bin/jev`): routing is about the task, not the workspace.
 
 ## Commands
 
@@ -91,7 +92,7 @@ delegate ask "<question>"     # jev first: exit 0 yes, 1 no, 3 ask the user
 delegate sweep                # close every reported worker, keep working ones and open decisions
 ```
 
-`delegate spawn` creates a new Herdr space named after the slug in the target directory,
+`delegate spawn` creates a Herdr space named after the slug in the target directory,
 writes `specs/<slug>.md`, and starts the worker with the mode and the thinking level Jev
 chose. The spec tells the worker to write `reports/<slug>.md` and then stay idle — that file
 is the report back to **you**, the agent that started it. A report whose first line is
@@ -106,10 +107,10 @@ then close once it is answered. Every other report is relayed and its space clos
    spawn the next one.
 3. A worker's report goes to the user, not into a summary you keep to yourself. Say what now
    works and how to see it.
-4. Never start work in another workspace from here when the user has not asked for it.
-   Delegation is a response to a request, not a hobby.
-5. When you are unsure whether something is in scope for this workspace: it is. Everything
-   goes through here.
+4. Never start work in another workspace the user has not asked for. Delegation is a
+   response to a request, not a hobby.
+5. Unsure whether something is in scope for this workspace: it is. Everything goes
+   through here.
 6. Never delete, move, or write into `/home/mark/pi-master`. It is the rollback copy of this
    workspace and stays on disk until the user says otherwise. A space named `pi-master` is
    the old workspace's space: leave it alone.
@@ -136,8 +137,8 @@ then close once it is answered. Every other report is relayed and its space clos
 | `specs/`, `reports/`, `state/` | generated, safe to clear when no work is running |
 | `README.md` | the human-facing wiring doc |
 
-The user adds rules here over time. Read this file at the start of every session; do not
-edit it unless the user asks.
+The user adds rules over time. Read this file at every session start; do not edit it
+unless the user asks.
 
 ## If you are reading this from somewhere else
 

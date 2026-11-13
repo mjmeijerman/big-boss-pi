@@ -421,6 +421,14 @@ Forcing a remote worker needs --override-jev --reason '<why this cannot run loca
 	#    sandboxed worker, so the worker's trunk is fresh by construction, not by hope.
 	ensure_fresh_trunk "$cwd"
 
+	# The branch the boss's tree is on right now. A worker must cut its own worktree from it, and
+	# cmd_close compares against this: a worker that switches the live checkout gets caught and
+	# the tree put back, even when the rule in the spec was ignored. Empty outside a git repo.
+	local base_branch=""
+	if command -v git >/dev/null 2>&1; then
+		base_branch=$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+	fi
+
 	mkdir -p "$SPECS" "$REPORTS" "$STATE"
 	local spec=$SPECS/$slug.md report=$REPORTS/$slug.md
 	# overridden is the word "false" when nothing was overridden: test it, do not test for a value.
@@ -443,27 +451,31 @@ $task
 ## Rules
 
 1. Do the task in \`$cwd\`. Do not touch \`$ROOT\` (write a report, nothing else).
-2. Before doing any work, ask Jev the route: \`$BIN/jev route "<the task, one line>"\`. If it
+2. Never switch the checkout you were given: \`$cwd\` is the boss's tree, which keeps reading it,
+   and a checkout in place breaks its commands mid-run. Cut your own worktree first — from
+   \`$cwd\`: \`git worktree add ../SLUG-worktree -b BRANCH\` — and do all work there. Never run
+   \`git checkout\`, \`git switch\`, \`git stash\` or \`git reset\` in \`$cwd\`.
+3. Before doing any work, ask Jev the route: \`$BIN/jev route "<the task, one line>"\`. If it
    says \`local\`, do not grind it out as a coding job: run it as
    \`$BIN/local-run "<the task>"\` (or pipe the text in) and put the answer in the report.
    Remote is what you are for; local work in a worker space is the mismatch this rule catches.
-3. Do not spawn other agents or Herdr spaces, and do not rename, move or close any space.
+4. Do not spawn other agents or Herdr spaces, and do not rename, move or close any space.
    If the task needs more hands, say so in the report.
-4. Every change lands as a pull request, so the work is finished only once the branch is
+5. Every change lands as a pull request, so the work is finished only once the branch is
    pushed and the PR is open: \`git push -u origin <branch>\`, then \`gh pr create --base main\`.
    The PR body states the review tier (low: docs, comments, formatting; medium: application code,
    tests, migrations; high: extensions, AGENTS.md, .github/, git-hooks/, sandbox/, auth, secrets,
    money, deletion). Leave merging to the human: do not merge your own branch, and never push to
    trunk or commit on trunk.
-5. When you are done — or blocked and unable to continue — write \`$report\` with:
+6. When you are done — or blocked and unable to continue — write \`$report\` with:
    - what now works, in concrete terms (a command to run, a path, a test that passes)
    - what you changed (branch, files), and the PR URL so the boss can relay it
    - what is still open, and the one next action for the person
    Keep it short. That file is the whole message back; nobody reads your scrollback.
-6. Then write the report and stay idle. Do not close, rename or move the space. The
+7. Then write the report and stay idle. Do not close, rename or move the space. The
    big-boss-pi agent relays the report and closes the space right away, so a space never stays
    open just because the worker finished.
-7. The one exception, when the user must decide something before work can continue: make the
+8. The one exception, when the user must decide something before work can continue: make the
    first line of the report read "DECISION NEEDED: the question in one line". That marker is
    the only thing that keeps the space open, and only until the user answers.
 EOF
@@ -501,13 +513,13 @@ EOF
 	[ -n "$space" ] || die "could not read the new space id from: $out"
 
 	node -e '
-		const fs=require("fs");const [state,slug,space,tab,pane,terminal,cwd,mode,thinking,spec,report,jevCount,jevEffort,overridden,reason]=process.argv.slice(1);
+		const fs=require("fs");const [state,slug,space,tab,pane,terminal,cwd,mode,thinking,spec,report,jevCount,jevEffort,overridden,reason,branch]=process.argv.slice(1);
 		let j={};try{j=JSON.parse(fs.readFileSync(state,"utf8"))}catch{}
 		j[slug]={slug,space,tab,pane,terminal,cwd,mode,thinking,thinkingEffort:jevEffort,spec,report,jevCount:Number(jevCount),
-			overridden:overridden==="true",overrideReason:reason||null,started:new Date().toISOString()};
+			overridden:overridden==="true",overrideReason:reason||null,branch:branch||null,started:new Date().toISOString()};
 		fs.writeFileSync(state,JSON.stringify(j,null,2)+"\n");' \
 		"$DELEGATIONS" "$slug" "$space" "$tab" "$pane" "$terminal" "$cwd" "$mode" "$thinking" "$spec" "$report" \
-		"$jev_count" "$jev_effort" "$overridden" "$reason"
+		"$jev_count" "$jev_effort" "$overridden" "$reason" "$base_branch"
 
 	# space.new's --task can arrive before pi is listening, so send it again once the banner is up.
 	local i
@@ -518,8 +530,8 @@ EOF
 	hc send "$terminal" "Read $spec and do it. Report to $report." >/dev/null 2>&1 \
 		|| printf '%s: warning: could not send the task to %s\n' "$prog" "$terminal" >&2
 
-	printf '{"slug":"%s","space":"%s","mode":"%s","thinking":"%s","thinking_effort":"%s","route":"%s","jev_count":%s,"overridden":%s,"cwd":"%s","report":"%s"}\n' \
-		"$slug" "$space" "$mode" "$jev_level" "$jev_effort" "$jev_route" "$jev_count" "$overridden" "$cwd" "$report"
+	printf '{"slug":"%s","space":"%s","mode":"%s","thinking":"%s","thinking_effort":"%s","route":"%s","jev_count":%s,"overridden":%s,"cwd":"%s","report":"%s","branch":"%s"}\n' \
+		"$slug" "$space" "$mode" "$jev_level" "$jev_effort" "$jev_route" "$jev_count" "$overridden" "$cwd" "$report" "$base_branch"
 }
 
 cmd_wait() {
@@ -641,17 +653,36 @@ cmd_close() {
 	local slug=${1:-}
 	[ -n "$slug" ] || die 'usage: delegate close <slug>'
 	[ -f "$DELEGATIONS" ] || die "no such worker: $slug"
-	local space
-	space=$(node -e '
+	local space cwd branch meta
+	meta=$(node -e '
 		const fs=require("fs");let j={};try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"))}catch{}
-		process.stdout.write(j[process.argv[2]]?.space||"")' "$DELEGATIONS" "$slug")
+		const e=j[process.argv[2]]||{};
+		process.stdout.write(JSON.stringify({space:e.space||"",cwd:e.cwd||"",branch:e.branch||""}))' "$DELEGATIONS" "$slug")
+	space=$(printf '%s' "$meta" | json_field space)
 	[ -n "$space" ] || die "no such worker: $slug"
+	cwd=$(printf '%s' "$meta" | json_field cwd)
+	branch=$(printf '%s' "$meta" | json_field branch)
 	herdr-app do space.close --id "$space" --confirmed true >/dev/null 2>&1 \
 		|| printf '%s: warning: space.close failed for %s\n' "$prog" "$space" >&2
 	node -e '
 		const fs=require("fs");let j={};try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"))}catch{}
 		delete j[process.argv[2]];
 		fs.writeFileSync(process.argv[1],JSON.stringify(j,null,2)+"\n");' "$DELEGATIONS" "$slug"
+
+	# Catch a worker that switched the boss's live checkout anyway. Non-fatal in both halves: a
+	# warning plus a best-effort checkout, never a refused close and never a reset or a force.
+	if [ -n "$branch" ] && [ -n "$cwd" ] && [ -d "$cwd" ]; then
+		local live=""
+		live=$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+		if [ -n "$live" ] && [ "$live" != "$branch" ]; then
+			printf '%s: warning: %s left %s on %s; it started on %s — putting it back\n' \
+				"$prog" "$slug" "$cwd" "$live" "$branch" >&2
+			git -C "$cwd" checkout "$branch" >/dev/null 2>&1 \
+				|| printf '%s: warning: could not check %s out of %s (dirty tree?); it is still on %s\n' \
+					"$prog" "$branch" "$cwd" "$live" >&2
+		fi
+	fi
+
 	printf '{"closed":"%s","space":"%s"}\n' "$slug" "$space"
 }
 
@@ -679,7 +710,7 @@ cmd_sweep() {
 			kept=$((kept + 1))
 			continue
 		fi
-		if cmd_close "$slug" >/dev/null 2>&1; then
+		if cmd_close "$slug" >/dev/null; then
 			say "closed $slug"
 			closed=$((closed + 1))
 		else
