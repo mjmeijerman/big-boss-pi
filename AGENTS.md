@@ -52,7 +52,8 @@ Exit 0 = yes, 1 = no, 3 = unsure; `--json` prints the decision and reason.
 - **Mode rules Jev works from:** a worker that needs a model cannot run `--no-net` (no
   network means no model, blip 1). Untrusted repo scripts run `--no-net`. Read-only analysis
   runs sandboxed. Bare only when the work needs host access the sandbox refuses (Herdr
-  sockets, GUI, docker, ssh agent).
+  sockets, GUI, docker). Publishing is never a reason for bare: the worker commits, the boss
+  publishes, so workers stay sandboxed.
 - This workspace's own agent runs bare: it must reach the Herdr sockets to start spaces.
   It does no project work, so it has nothing to sandbox.
 
@@ -118,10 +119,10 @@ then close once it is answered. Every other report is relayed and its space clos
    slug, never a task dropped into the finished one.
 8. Ask Jev before the user: `delegate ask "<question>"`. Yes or no from Jev is the answer —
    act on it quietly. Only unsure or unreachable reaches the user, carrying Jev's reason.
-9. Every change lands as a pull request: the worker commits, pushes its branch and opens the
-   PR with the review tier in the body. A sandboxed worker usually cannot (no ssh agent, no
-   `gh` auth) — then **you** push its branch, open the PR and relay the URL. Only the human
-   merges; with no PR, unfinished.
+9. Every change lands as a pull request: the worker commits on its branch and stops — it does
+   not publish, never attempts it — and **you** upload that branch, open the PR with the review
+   tier in the body, and relay the URL. Workers therefore stay sandboxed: publishing needs no
+   ssh agent and no `gh` auth from them. Only the human merges; with no PR, unfinished.
 
 ## Layout
 

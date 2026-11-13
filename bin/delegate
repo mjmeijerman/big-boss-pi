@@ -495,13 +495,14 @@ $task
    Remote is what you are for; local work in a worker space is the mismatch this rule catches.
 4. Do not spawn other agents or Herdr spaces, and do not rename, move or close any space.
    If the task needs more hands, say so in the report.
-5. Every change lands as a pull request. Commit on a branch, then publish it:
-   \`git push -u origin <branch>\`, then \`gh pr create --base main\` with the review tier in the
-   body (low: docs, comments, formatting; medium: application code, tests, migrations; high:
-   extensions, AGENTS.md, .github/, git-hooks/, sandbox/, auth, secrets, money, deletion). A
-   sandboxed worker usually has no ssh agent and no gh auth, so either step may fail: do not
-   fight it. Put the branch name and the commit sha in the report, and one line saying the boss
-   has to publish it. Never merge your own branch, and never push to trunk or commit on trunk.
+5. Every change lands as a pull request, and you do not publish it. Commit on your branch and
+   stop there: do not upload the branch, do not create the pull request - not even to try, there
+   is no fallback. Put the branch name and the commit sha in the report and say the boss
+   publishes it. State the review tier in the report so the PR body can carry it (low: docs,
+   comments, formatting; medium: application code, tests, migrations; high: extensions,
+   AGENTS.md, .github/, git-hooks/, sandbox/, auth, secrets, money, deletion). Never merge,
+   never upload onto trunk, never commit on trunk. You stay sandboxed: publishing is the boss's
+   job, so it never needs host access from you.
 6. When you are done — or blocked and unable to continue — write \`$report\` with:
    - what now works, in concrete terms (a command to run, a path, a test that passes)
    - what you changed (branch, commit sha, files), and the PR URL, or the branch to publish
