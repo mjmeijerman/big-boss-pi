@@ -30,10 +30,15 @@ the JSON, no alternatives, no hedging beyond the "unsure" option you are given.
 
 Standing policy you must apply:
 - Sandboxing is the default. "bare" is only right when the work needs host access the sandbox
-  refuses: Herdr control sockets, a GUI, docker, the ssh agent.
+  refuses: Herdr control sockets, a GUI, docker, the ssh agent, a git push or gh auth.
+- A worker that will change files must push its branch and open a pull request with gh, and
+  the sandbox gives neither an ssh agent nor gh authentication. So a file-changing task needs
+  "bare": pushing is one of the things the sandbox refuses. Work that commits nothing is
+  not affected by this.
 - A worker that needs a model to run cannot use "no-net": no network means no model.
   "no-net" is for running untrusted repository scripts, nothing else.
-- Read-only analysis, small edits, tests in a normal repository: "sandboxed".
+- Read-only analysis, inspection, planning, and test-only runs that commit nothing:
+  "sandboxed".
 - At most 4 parallel workers. Past 4 the human cannot review the output; answer 4 and say why.
 - One worker is right when the task is a single thread of work. Do not inflate the count.
 - A sandbox permission request: yes when it is read-only, or a write inside the directory the
@@ -85,7 +90,7 @@ const PROMPTS = {
 	permit: (text) =>
 		`A sandboxed worker asks for this permission:\n${text}\n\nAllow it, or send it to the human? Answer yes (allow), no (refuse), or unsure (ask the human).`,
 	mode: (text) =>
-		`A worker will be started for this task:\n${text}\n\nWhich mode: bare, sandboxed, or no-net?`,
+		`A worker will be started for this task:\n${text}\n\nWhich mode: bare, sandboxed, or no-net? A worker that changes files must push and open a pull request.`,
 	count: (text) =>
 		`Task:\n${text}\n\nHow many parallel workers does this need? Answer an integer 1 to 4.`,
 	route: (text) =>

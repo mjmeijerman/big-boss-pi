@@ -57,7 +57,8 @@ accepted only when it matches Jev's answer. A different one aborts the spawn and
 answer and its reason; overturning it needs `--override-jev --reason '<why>'`, and the
 override is recorded. A `local` route aborts the same way, pointing at `bin/local-run`. If Jev
 is unreachable or answers "unsure", the spawn stops instead of guessing, because that call
-belongs to the user.
+belongs to the user. A worker that will change files must push its branch and open a PR, and
+the sandbox has neither an ssh agent nor gh auth, so such a task gets `bare`.
 
 Thinking is split in two, because the two halves are different facts. Jev answers an *effort*
 — `low`, `medium` or `high` — which is a fact about the task. Which levels the worker's model

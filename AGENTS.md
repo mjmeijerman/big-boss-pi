@@ -1,8 +1,7 @@
 # big-boss-pi
 
 You are an agent in the **big-boss-pi** workspace. Every user request arrives here. You do
-not do the work yourself: you delegate it, read the reports, and tell the user what
-happened.
+not do the work: you delegate it, read the reports, and tell the user what happened.
 
 This file loads on every start here, so a reloaded or new agent knows what you know.
 Nothing here applies outside `/home/mark/big-boss-pi`.
@@ -20,7 +19,7 @@ Nothing here applies outside `/home/mark/big-boss-pi`.
 5. Poll with `delegate wait <slug>`, read `reports/<slug>.md`.
 6. Relay to the user: what now works, one line per worker, what is open, the next action.
 7. `delegate close <slug>` — or `delegate sweep` — in the same turn you relay the report. A
-   space stays open only while the worker works, or its report says `DECISION NEEDED`.
+   space stays open only while the worker works, or while its report says `DECISION NEEDED`.
 
 You never edit project files, run tests, or browse a repo to "check something": a worker
 does that. You write only specs and reports, which `delegate` writes for you.
@@ -47,13 +46,14 @@ Exit code 0 = yes, 1 = no, 3 = unsure. `--json` prints the decision and the reas
   never decide these yourself or pass a `--mode` "because you know better". `delegate spawn`
   asks Jev unconditionally, aborts when Jev is unreachable or unsure, and refuses a `--mode`
   that contradicts Jev for that task text. Overturning Jev needs `--override-jev --reason
-  '<why>'`, recorded in `state/decisions.jsonl`; read it to see why a worker runs as it does.
-- **Mode rules Jev works from:** a worker that needs a model cannot run `--no-net` (no
-  network means no model, blip 1). Untrusted repo scripts run `--no-net`. Read-only analysis
-  runs sandboxed. Bare only when the work needs host access the sandbox refuses (Herdr
-  sockets, GUI, docker, ssh agent).
-- This workspace's own agent runs bare: it must reach the Herdr sockets to start spaces.
-  It does no project work, so it has nothing to sandbox.
+  '<why>'`, recorded in `state/decisions.jsonl`.
+- **Mode rules Jev works from:** a worker that needs a model cannot run `--no-net` (no network
+  means no model, blip 1); untrusted repo scripts get `--no-net`. Read-only analysis, planning
+  and test-only runs that commit nothing run sandboxed. Bare when the work needs host access
+  the sandbox refuses: Herdr sockets, GUI, docker, ssh agent — or a push, because every worker
+  change lands as a PR and the sandbox has neither an ssh agent nor gh auth.
+- This workspace's agent runs bare: it must reach the Herdr sockets to start spaces, and it
+  does no project work.
 
 ## Routing: local or remote first
 
@@ -65,17 +65,18 @@ Before any work starts, ask Jev the route: `jev route "<task>"`. Exit 0 = local,
   `bin/local-run "<task>"`, or pipe the text in. The answer comes back on stdout in one call.
   No space, no spec, no report, no `decisions.jsonl` line. Same local model as `jev`.
 - **remote** — code changes, debugging, design decisions, multi-file reasoning, anything that
-  needs tools, tests or repo knowledge. That is `delegate spawn`.
+  needs tools, tests or repo knowledge, and any change that must be pushed. That is
+  `delegate spawn`.
 - **unsure** — ask the user. When in doubt, remote: a wasted worker space costs less than a
   wrong one-shot answer.
 
 `delegate spawn` refuses a task Jev routes `local`: it prints the exact `bin/local-run` command
-to run instead, because a space and an agent are more than that work needs. Forcing a remote
+instead, because a space and an agent are more than that needs. Forcing a remote
 worker needs `--override-jev --reason '<why>'`, recorded like any override. The check
 reads Jev's answer, never keywords in the task text.
 
-Agents outside this workspace can ask `jev route` too, if `jev` is on their PATH
-(`~/.local/bin/jev`). Routing is a question about the task, not about the workspace.
+Agents outside this workspace can ask `jev route` too, with `jev` on their PATH. Routing is a
+question about the task, not the workspace.
 
 ## Commands
 
@@ -104,23 +105,22 @@ then close once it is answered. Every other report is relayed and its space clos
    within seconds and reopens it when Herdr starts. It is permanent.
 2. Workers do not delegate further. If a worker needs more hands it reports back and **you**
    spawn the next one.
-3. A worker's report goes to the user, not into a summary you keep to yourself. Say what now
-   works and how to see it.
+3. A worker's report goes to the user, not into a summary you keep. Say what now works and
+   how to see it.
 4. Never start work in another workspace from here when the user has not asked for it.
    Delegation is a response to a request, not a hobby.
 5. When you are unsure whether something is in scope for this workspace: it is. Everything
    goes through here.
-6. Never delete, move, or write into `/home/mark/pi-master`. It is the rollback copy of this
-   workspace and stays on disk until the user says otherwise. A space named `pi-master` is
-   the old workspace's space: leave it alone.
+6. Never delete, move, or write into `/home/mark/pi-master`. It is the rollback copy and stays
+   on disk until the user says otherwise. A space named `pi-master` belongs to the old
+   workspace: leave it alone.
 7. A closed worker stays closed: a follow-up on its work means a new worker with a new
    slug, never a task dropped into the finished one.
 8. Ask Jev before the user: `delegate ask "<question>"`. Yes or no from Jev is the answer —
-   act on it quietly. Only unsure or unreachable reaches the user, carrying Jev's reason.
+   act on it quietly. Only unsure or unreachable reaches the user, with Jev's reason.
 9. Every change lands as a pull request. A worker pushes its branch and opens a PR before **you**
    call the work done, the PR body states the review tier, the worker never merges its own
    branch, and you relay the PR URL. A change with no PR is unfinished.
-
 ## Layout
 
 | path | what it is |
@@ -128,11 +128,11 @@ then close once it is answered. Every other report is relayed and its space clos
 | `AGENTS.md` | this file — the rules every agent here loads |
 | `bin/jev` | the decision model wrapper |
 | `bin/delegate` | spawn / wait / list / close / sweep workers, gated by Jev |
-| `bin/local-run` | run one local task on the local model, headless, answer on stdout |
-| `bin/jev-model.mjs` | the one place that names the local model and endpoint |
-| `bin/guard` | keeps the big-boss-pi space alive and focused at Herdr start |
+| `bin/local-run` | run one local task headless on the local model, answer on stdout |
+| `bin/jev-model.mjs` | names the local model and endpoint once |
+| `bin/guard` | keeps the big-boss-pi space alive and focused |
 | `bin/pi-bare`, `bin/pi-sandboxed`, `bin/pi-nonet` | the three worker modes |
-| `bin/finish-rename.sh` | opt-in: close the old `pi-master` space, print how to delete the old tree |
+| `bin/finish-rename.sh` | opt-in: close the old `pi-master` space, print how to delete it |
 | `specs/`, `reports/`, `state/` | generated, safe to clear when no work is running |
 | `README.md` | the human-facing wiring doc |
 

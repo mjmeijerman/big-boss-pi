@@ -24,7 +24,10 @@
 # `delegate sweep` applies exactly that rule to every tracked worker in one go.
 #
 # Every spawn asks Jev, unconditionally, for the mode, the worker count, the route (local or
-# remote) and the thinking effort. Routing is a refusal, not a warning: a task Jev calls
+# remote) and the thinking effort. A worker that will change files must push its branch and
+# open a pull request, and the sandbox has neither an ssh agent nor gh auth, so Jev gives such a
+# task bare; sandboxed stays for read-only work that commits nothing. Routing is a refusal, not
+# a warning: a task Jev calls
 # "local" stops the spawn and prints the cheaper bin/local-run command to run instead. A
 # caller's --mode or --thinking is accepted only when it matches Jev's answer for that exact
 # task text; otherwise the spawn aborts and prints Jev's answer. Overriding Jev — a mode, a
