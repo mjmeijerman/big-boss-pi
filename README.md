@@ -89,10 +89,13 @@ the model unreachable — belongs to the user, and then it carries Jev's reason 
 
 ## Worker spaces close themselves
 
-Every worker branch ends in a pull request: the worker pushes its branch and runs
-`gh pr create --base main` with the review tier in the body, and never merges it. The report
-carries the PR URL so the boss can relay it. A change with no PR is unfinished, however green it
-looks locally — merging stays the human's call.
+Every worker branch ends in a pull request: the worker commits on its branch and tries
+`git push -u origin <branch>` and `gh pr create --base main` with the review tier in the body,
+and never merges it. A sandboxed worker usually has no ssh agent and no gh auth: when either
+step fails it stops fighting and says so in the report, with the branch name and the commit sha,
+and the boss publishes the branch and opens the PR. The report carries the PR URL so the boss
+can relay it. A change with no PR is unfinished, however green it looks locally — merging stays
+the human's call.
 
 A worker space is not kept around for browsing. The flow is: the worker writes
 `reports/<slug>.md` and stays idle, the agent relays the report to the user, and the space is

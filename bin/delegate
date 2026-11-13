@@ -46,6 +46,11 @@
 # "thinking"). `delegate ask` writes the same line for a question put to jev before it ever
 # reaches the user.
 #
+# The base a worker cuts from is fetched and brought up to date here, before the space exists:
+# a sandboxed worker cannot fetch, so a stale trunk would put a PR on an old base. Trunk is
+# fast-forwarded only when it is a clean, strictly-behind ancestor; dirty, ahead or diverged
+# trunk refuses the spawn with the state named, and nothing is ever reset, rebased or forced.
+#
 # Radar Vol. 35: blip 1 (agent sandboxing, Adopt), blip 21 (subagents, Trial — capped at 4),
 # blip 17 (risk-tiered human oversight — the mode decides how much rope a worker gets).
 set -euo pipefail
@@ -217,6 +222,93 @@ restore_focus() {
 	return 0
 }
 
+# fresh_trunk_branch <cwd> — the branch origin's HEAD points at, else the first of
+# trunk/main/master the remote actually has; empty when the remote has none of them.
+#
+# origin/HEAD is only written by a clone or `git remote set-head --auto`, so most local
+# checkouts have none: the fallback list is the normal path, not the exception.
+fresh_trunk_branch() {
+	local cwd=$1 ref b
+	ref=$(git -C "$cwd" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) || ref=""
+	if [ -n "$ref" ]; then printf '%s' "${ref#origin/}"; return 0; fi
+	for b in trunk main master; do
+		if git -C "$cwd" show-ref --verify --quiet "refs/remotes/origin/$b"; then
+			printf '%s' "$b"
+			return 0
+		fi
+	done
+	return 0
+}
+
+# ensure_fresh_trunk <cwd> — a worker cuts its branch from a base the boss just fetched, never
+# from a stale local trunk. Called in the spawn path before the space exists.
+#
+# Why here: a sandboxed worker cannot git fetch (the sandbox refuses the ownership of the ssh
+# config), so its origin/<trunk> is whatever was last fetched on the host. A worker cut from
+# that stale base ships a PR against an old trunk. The boss can fetch, so the boss guarantees
+# the base before the worker starts.
+#
+# Fetching is always safe; moving trunk is not, so the update is limited to one case: the local
+# trunk is a clean, strictly-behind ancestor of origin/<trunk>. Dirty working tree, ahead, or
+# diverged all refuse the spawn, naming the exact state and the command that fixes it. Nothing
+# here resets, rebases, stashes, checks out or forces: that is the owner's work to move.
+#
+# A --cwd that is not a git repo, or has no origin, is skipped with one line: delegation has no
+# business demanding git of every worker.
+ensure_fresh_trunk() {
+	local cwd=$1 branch current ahead behind counts url
+	if ! git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
+		say "trunk: $cwd is not a git repo, skipping the freshness check" >&2
+		return 0
+	fi
+	url=$(git -C "$cwd" remote get-url origin 2>/dev/null) || url=""
+	if [ -z "$url" ]; then
+		say "trunk: $cwd has no origin, skipping the freshness check" >&2
+		return 0
+	fi
+	branch=$(fresh_trunk_branch "$cwd")
+	if [ -z "$branch" ]; then
+		say "trunk: $cwd has no origin/trunk, origin/main or origin/master, skipping the freshness check" >&2
+		return 0
+	fi
+	git -C "$cwd" fetch --prune --quiet origin || die "refusing to spawn: git fetch origin failed in $cwd, so the base cannot be trusted.
+Fix remote access there first (ssh -T $url), then spawn again."
+
+	# Trunk is not checked out: move the ref, never the working tree. A fetch into a local branch
+	# refuses a non-fast-forward update by itself, so this cannot rewind anyone's trunk.
+	current=$(git -C "$cwd" symbolic-ref --quiet --short HEAD 2>/dev/null) || current=""
+	if [ "$current" != "$branch" ]; then
+		git -C "$cwd" fetch --quiet origin "$branch:$branch" || die "refusing to spawn: local $branch in $cwd is not a fast-forward of origin/$branch, and it is not checked out, so the base cannot be updated safely.
+Look before moving it:  git -C $cwd log --oneline --left-right $branch...origin/$branch"
+		say "trunk: $branch in $cwd updated to origin/$branch (it is not checked out; no working tree touched)" >&2
+		return 0
+	fi
+
+	# On trunk. Dirty first: a fast-forward is a checkout, so it would either fail halfway or
+	# carry somebody's uncommitted work onto the new base.
+	if [ -n "$(git -C "$cwd" status --porcelain 2>/dev/null)" ]; then
+		die "refusing to spawn: $cwd is on $branch with a dirty working tree, so trunk cannot be fast-forwarded to origin/$branch.
+Commit, stash or discard it first:  git -C $cwd stash -u"
+	fi
+	counts=$(git -C "$cwd" rev-list --left-right --count "HEAD...origin/$branch" 2>/dev/null | tr '\t' ' ') || counts="0 0"
+	ahead=${counts%% *}
+	behind=${counts##* }
+	if [ "$ahead" = 0 ] && [ "$behind" = 0 ]; then
+		say "trunk: $branch in $cwd is up to date with origin/$branch" >&2
+		return 0
+	fi
+	if [ "$ahead" != 0 ] && [ "$behind" != 0 ]; then
+		die "refusing to spawn: $branch in $cwd has diverged from origin/$branch ($ahead ahead, $behind behind).
+Move it yourself — rebase or merge origin/$branch, or move the work onto a branch — then spawn again:  git -C $cwd pull --rebase origin $branch"
+	fi
+	if [ "$ahead" != 0 ]; then
+		die "refusing to spawn: $branch in $cwd is $ahead commit(s) ahead of origin/$branch and nothing behind. Unpushed trunk is not a base to cut a worker's branch from.
+Push it, or move it onto a branch, then spawn again:  git -C $cwd log --oneline origin/$branch..$branch"
+	fi
+	git -C "$cwd" merge --ff-only --quiet "origin/$branch" || die "refusing to spawn: could not fast-forward $branch in $cwd to origin/$branch; git merge --ff-only above says why."
+	say "trunk: fast-forwarded $branch in $cwd by $behind commit(s) to origin/$branch" >&2
+}
+
 cmd_spawn() {
 	local slug="" cwd="" mode="" thinking="" task="" override_jev=0 reason="" runner="" no_restore=0
 	[ "$#" -ge 1 ] || die 'usage: delegate spawn <slug> --cwd DIR [--mode M] [--thinking LEVEL] [--override-jev --reason TEXT] [--no-restore] "<task>"'
@@ -324,6 +416,10 @@ Forcing a remote worker needs --override-jev --reason '<why this cannot run loca
 		say "jev: this task wants $jev_count workers ($count_reason); spawning one now" >&2
 	fi
 
+	# 5. Guarantee the base before anything is created. The fetch works here and not inside a
+	#    sandboxed worker, so the worker's trunk is fresh by construction, not by hope.
+	ensure_fresh_trunk "$cwd"
+
 	mkdir -p "$SPECS" "$REPORTS" "$STATE"
 	local spec=$SPECS/$slug.md report=$REPORTS/$slug.md
 	# overridden is the word "false" when nothing was overridden: test it, do not test for a value.
@@ -352,15 +448,16 @@ $task
    Remote is what you are for; local work in a worker space is the mismatch this rule catches.
 3. Do not spawn other agents or Herdr spaces, and do not rename, move or close any space.
    If the task needs more hands, say so in the report.
-4. Every change lands as a pull request, so the work is finished only once the branch is
-   pushed and the PR is open: \`git push -u origin <branch>\`, then \`gh pr create --base main\`.
-   The PR body states the review tier (low: docs, comments, formatting; medium: application code,
-   tests, migrations; high: extensions, AGENTS.md, .github/, git-hooks/, sandbox/, auth, secrets,
-   money, deletion). Leave merging to the human: do not merge your own branch, and never push to
-   trunk or commit on trunk.
+4. Commit your work on a branch, then try to publish it: \`git push -u origin <branch>\`, then
+   \`gh pr create --base main\` with the review tier in the body (low: docs, comments,
+   formatting; medium: application code, tests, migrations; high: extensions, AGENTS.md,
+   .github/, git-hooks/, sandbox/, auth, secrets, money, deletion). A sandboxed worker usually
+   has no ssh agent and no gh auth, so either step may fail: do not fight it. Put the branch
+   name and the commit sha in the report, and one line saying the boss has to publish it.
+   Never merge your own branch, and never push to trunk or commit on trunk.
 5. When you are done — or blocked and unable to continue — write \`$report\` with:
    - what now works, in concrete terms (a command to run, a path, a test that passes)
-   - what you changed (branch, files), and the PR URL so the boss can relay it
+   - what you changed (branch, commit sha, files), and the PR URL, or the branch to publish
    - what is still open, and the one next action for the person
    Keep it short. That file is the whole message back; nobody reads your scrollback.
 6. Then write the report and stay idle. Do not close, rename or move the space. The

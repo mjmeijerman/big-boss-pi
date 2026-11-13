@@ -66,16 +66,16 @@ Before any work starts, ask Jev the route: `jev route "<task>"`. Exit 0 = local,
   No space, no spec, no report, no `decisions.jsonl` line. Same local model as `jev`.
 - **remote** — code changes, debugging, design decisions, multi-file reasoning, anything that
   needs tools, tests or repo knowledge. That is `delegate spawn`.
-- **unsure** — ask the user. When in doubt, remote: a wasted worker space costs less than a
-  wrong one-shot answer.
+- **unsure** — ask the user. When in doubt, remote: a wasted space costs less than a wrong
+  one-shot answer.
 
 `delegate spawn` refuses a task Jev routes `local`: it prints the exact `bin/local-run` command
-to run instead, because a space and an agent are more than that work needs. Forcing a remote
-worker needs `--override-jev --reason '<why>'`, recorded like any override. The check
-reads Jev's answer, never keywords in the task text.
+to run instead, because a space and an agent cost more than that work needs. Forcing a remote
+worker needs `--override-jev --reason '<why>'`, recorded like any override; the check reads
+Jev's answer, not keywords.
 
 Agents outside this workspace can ask `jev route` too, if `jev` is on their PATH
-(`~/.local/bin/jev`). Routing is a question about the task, not about the workspace.
+(`~/.local/bin/jev`). Routing is about the task, not the workspace.
 
 ## Commands
 
@@ -91,12 +91,12 @@ delegate ask "<question>"     # jev first: exit 0 yes, 1 no, 3 ask the user
 delegate sweep                # close every reported worker, keep working ones and open decisions
 ```
 
-`delegate spawn` creates a new Herdr space named after the slug in the target directory,
-writes `specs/<slug>.md`, and starts the worker with the mode and the thinking level Jev
-chose. The spec tells the worker to write `reports/<slug>.md` and then stay idle — that file
-is the report back to **you**, the agent that started it. A report whose first line is
+`delegate spawn` creates a Herdr space named after the slug in the target directory, writes
+`specs/<slug>.md`, and starts the worker at the mode and thinking level Jev chose. The spec
+tells the worker to write `reports/<slug>.md` and then stay idle — that file is the report back
+to **you**. A report whose first line is
 `DECISION NEEDED: <question>` is the one thing that keeps a space open: relay the question,
-then close once it is answered. Every other report is relayed and its space closed at once.
+then close once it is answered. Every other report is relayed and its space closed.
 
 ## Hard rules
 
@@ -117,9 +117,10 @@ then close once it is answered. Every other report is relayed and its space clos
    slug, never a task dropped into the finished one.
 8. Ask Jev before the user: `delegate ask "<question>"`. Yes or no from Jev is the answer —
    act on it quietly. Only unsure or unreachable reaches the user, carrying Jev's reason.
-9. Every change lands as a pull request. A worker pushes its branch and opens a PR before **you**
-   call the work done, the PR body states the review tier, the worker never merges its own
-   branch, and you relay the PR URL. A change with no PR is unfinished.
+9. Every change lands as a pull request: the worker commits on a branch, then pushes it and
+   opens the PR with the review tier in the body. A sandboxed worker usually cannot (no ssh
+   agent, no `gh` auth) — then **you** publish: push its branch and open the PR. Relay the URL;
+   only the human merges. A change with no PR is unfinished.
 
 ## Layout
 
