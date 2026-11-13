@@ -9,7 +9,9 @@
 # A worker gets its own Herdr space (never the big-boss-pi space), a spec in specs/<slug>.md,
 # and one place to report back: reports/<slug>.md.
 #
-# Every spawn asks Jev, unconditionally, for the mode and for the worker count. A caller's
+# Every spawn asks Jev, unconditionally, for the mode, the worker count, and the route (local
+# or remote). Routing is advisory: a task Jev calls "local" prints a warning about the cheaper
+# bin/local-run path but never refuses the spawn. A caller's
 # --mode is accepted only when it matches Jev's answer for that exact task text; otherwise the
 # spawn aborts and prints Jev's answer. Overriding Jev needs --override-jev with a non-empty
 # --reason, and the override is recorded. If Jev is unreachable or unsure, the spawn aborts
@@ -17,6 +19,7 @@
 #
 # Every decision lands in state/decisions.jsonl as one JSON line: timestamp, command, task
 # text, jev decision, jev reason, whether it was overridden, and the resulting slug.
+# The route is the third line for a task (command "route").
 #
 # Radar Vol. 35: blip 1 (agent sandboxing, Adopt), blip 21 (subagents, Trial — capped at 4),
 # blip 17 (risk-tiered human oversight — the mode decides how much rope a worker gets).
@@ -62,6 +65,22 @@ Ask the user which $kind to use. Only then re-run with --override-jev --reason '
 	JEV_REASON=$reason
 }
 
+# ask_jev_route <task text> — sets JEV_ROUTE (local|remote|unsure) and ROUTE_REASON.
+# Never dies and never refuses: routing says what the work is worth, not whether it may run.
+# The mismatch check below reads Jev's answer only, never keywords in the task text: "quick"
+# and "small" show up in plenty of remote work.
+ask_jev_route() {
+	local text=$1 out rc
+	JEV_ROUTE=unsure ROUTE_REASON=""
+	out=$("$BIN/jev" route "$text" --json 2>&1) && rc=0 || rc=$?
+	case $rc in
+	0) JEV_ROUTE=local ;;
+	1) JEV_ROUTE=remote ;;
+	*) JEV_ROUTE=unsure ;;
+	esac
+	ROUTE_REASON=$(printf '%s' "$out" | json_field reason || true)
+}
+
 # record_decision <command> <task> <decision> <reason> <overridden true|false> <slug|->
 record_decision() {
 	local cmd=$1 task=$2 decision=$3 reason=$4 overridden=$5 slug=$6
@@ -102,6 +121,8 @@ cmd_spawn() {
 	local jev_count jev_mode count_reason mode_reason overridden=false
 	ask_jev count "$task"; jev_count=$JEV_DECISION; count_reason=$JEV_REASON
 	ask_jev mode "$task"; jev_mode=$JEV_DECISION; mode_reason=$JEV_REASON
+	local jev_route route_reason
+	ask_jev_route "$task"; jev_route=$JEV_ROUTE; route_reason=$ROUTE_REASON
 	if [ "$jev_count" -gt 4 ]; then jev_count=4; fi
 
 	# 2. A caller's mode must agree with Jev for this exact task text. Jev's answer is recorded
@@ -126,16 +147,25 @@ Re-run without --mode to use jev's answer, or re-run with --override-jev --reaso
 	if [ -n "$refusal" ]; then
 		record_decision mode "$task" "$jev_mode" "$mode_reason" false "-"
 		record_decision count "$task" "$jev_count" "$count_reason" false "-"
+		record_decision route "$task" "$jev_route" "$route_reason" false "-"
 		die "$refusal"
 	fi
 	case $mode in bare|sandboxed) runner=$BIN/pi-$mode ;; no-net) runner=$BIN/pi-nonet ;; *) die "mode must be bare, sandboxed or no-net: '$mode'" ;; esac
 	[ -f "$runner" ] || die "no runner for mode $mode ($runner)"
 
-	# 3. Record both decisions before doing any work.
+	# 3. Routing is advisory. A remote worker for a task Jev calls local is exactly the mismatch
+	#    this check names: it points at the cheaper bin/local-run path, then carries on.
+	if [ "$jev_route" = local ]; then
+		printf '%s: warning: jev routes this task local, so a space and an agent are more than it needs.\n' "$prog" >&2
+		printf '%s: the cheaper path is  %s "<task>"  — continuing anyway, nothing was refused.\n' "$prog" "$BIN/local-run" >&2
+	fi
+
+	# 4. Record all three decisions before doing any work.
 	record_decision mode "$task" "$mode" "$mode_reason" "$overridden" "$slug"
 	record_decision count "$task" "$jev_count" "$count_reason" "$overridden" "$slug"
+	record_decision route "$task" "$jev_route" "$route_reason" "$overridden" "$slug"
 
-	# 4 workers is the review ceiling (blip 21): refuse past it instead of hiding it.
+	# The review ceiling is 4 workers (blip 21): refuse past it instead of hiding it.
 	local live
 	live=$(node -e '
 		const fs=require("fs");let j={};try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"))}catch{}
@@ -147,6 +177,9 @@ Re-run without --mode to use jev's answer, or re-run with --override-jev --reaso
 
 	mkdir -p "$SPECS" "$REPORTS" "$STATE"
 	local spec=$SPECS/$slug.md report=$REPORTS/$slug.md
+	# overridden is the word "false" when nothing was overridden: test it, do not test for a value.
+	local overridden_note=""
+	if [ "$overridden" = true ]; then overridden_note=", overridden: $reason"; fi
 	cat >"$spec" <<EOF
 # Worker \`$slug\`
 
@@ -154,7 +187,7 @@ You are a worker. Report to the agent in the big-boss-pi workspace that started 
 waiting on \`$report\`.
 
 - Work in: \`$cwd\`
-- Mode: \`$mode\` (chosen by jev${overridden:+, overridden: $reason})
+- Mode: \`$mode\` (chosen by jev$overridden_note), route: $jev_route (jev)
 - Report file: \`$report\`
 
 ## Task
@@ -164,15 +197,19 @@ $task
 ## Rules
 
 1. Do the task in \`$cwd\`. Do not touch \`$ROOT\` (write a report, nothing else).
-2. Do not spawn other agents or Herdr spaces, and do not rename, move or close any space.
+2. Before doing any work, ask Jev the route: \`$BIN/jev route "<the task, one line>"\`. If it
+   says \`local\`, do not grind it out as a coding job: run it as
+   \`$BIN/local-run "<the task>"\` (or pipe the text in) and put the answer in the report.
+   Remote is what you are for; local work in a worker space is the mismatch this rule catches.
+3. Do not spawn other agents or Herdr spaces, and do not rename, move or close any space.
    If the task needs more hands, say so in the report.
-3. Do not merge, push to trunk, or commit on trunk.
-4. When you are done — or blocked and unable to continue — write \`$report\` with:
+4. Do not merge, push to trunk, or commit on trunk.
+5. When you are done — or blocked and unable to continue — write \`$report\` with:
    - what now works, in concrete terms (a command to run, a path, a test that passes)
    - what you changed (branch, files)
    - what is still open, and the one next action for the person
    Keep it short. That file is the whole message back; nobody reads your scrollback.
-5. Then stay idle. The big-boss-pi agent closes your space when the report is read.
+6. Then stay idle. The big-boss-pi agent closes your space when the report is read.
 EOF
 
 	local argv
@@ -209,8 +246,8 @@ EOF
 	hc send "$terminal" "Read $spec and do it. Report to $report." >/dev/null 2>&1 \
 		|| printf '%s: warning: could not send the task to %s\n' "$prog" "$terminal" >&2
 
-	printf '{"slug":"%s","space":"%s","mode":"%s","jev_count":%s,"overridden":%s,"cwd":"%s","report":"%s"}\n' \
-		"$slug" "$space" "$mode" "$jev_count" "$overridden" "$cwd" "$report"
+	printf '{"slug":"%s","space":"%s","mode":"%s","route":"%s","jev_count":%s,"overridden":%s,"cwd":"%s","report":"%s"}\n' \
+		"$slug" "$space" "$mode" "$jev_route" "$jev_count" "$overridden" "$cwd" "$report"
 }
 
 cmd_wait() {
@@ -244,15 +281,19 @@ cmd_list() {
 		let j={};try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"))}catch{}
 		let decisions=[];
 		try{decisions=fs.readFileSync(process.argv[2],"utf8").trim().split("\n").filter(Boolean).map(l=>{try{return JSON.parse(l)}catch{return null}}).filter(Boolean)}catch{}
-		const last=new Map();
-		for(const d of decisions)if(d.slug)last.set(d.slug,d);
+		const last=new Map(),routes=new Map();
+		for(const d of decisions)if(d.slug){
+			if(d.command==="route")routes.set(d.slug,d);else last.set(d.slug,d);
+		}
 		const rows=Object.values(j);
 		if(!rows.length){console.log("no workers");process.exit(0)}
 		for(const r of rows){
 			let size=0;try{size=fs.statSync(r.report).size}catch{}
 			const d=last.get(r.slug);
-			const jev=d?`jev ${d.command}=${d.decision}${d.overridden?" (overridden)":""}`:`jev ${r.mode}${r.overridden?" (overridden)":""}`;
-			console.log([r.slug.padEnd(22),r.mode.padEnd(10),(size?"reported":"working").padEnd(9),jev.padEnd(28),r.space,"cwd="+r.cwd].join(" "));
+			const route=routes.get(r.slug);
+			const jev=(d?`jev ${d.command}=${d.decision}${d.overridden?" (overridden)":""}`:`jev ${r.mode}${r.overridden?" (overridden)":""}`)
+				+(route?` route=${route.decision}`:"");
+			console.log([r.slug.padEnd(22),r.mode.padEnd(10),(size?"reported":"working").padEnd(9),jev.padEnd(38),r.space,"cwd="+r.cwd].join(" "));
 		}' "$DELEGATIONS" "$DECISIONS"
 }
 
