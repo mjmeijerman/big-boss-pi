@@ -24,12 +24,13 @@
 # `delegate sweep` applies exactly that rule to every tracked worker in one go.
 #
 # Every spawn asks Jev, unconditionally, for the mode, the worker count, the route (local or
-# remote) and the thinking effort. Routing is advisory: a task Jev calls "local" prints a
-# warning about the cheaper bin/local-run path but never refuses the spawn. A caller's --mode
-# or --thinking is accepted only when it matches Jev's answer for that exact task text;
-# otherwise the spawn aborts and prints Jev's answer. Overriding Jev needs --override-jev with
-# a non-empty --reason, and the override is recorded. If Jev is unreachable or unsure, the
-# spawn aborts instead of guessing: that decision belongs to the user.
+# remote) and the thinking effort. Routing is a refusal, not a warning: a task Jev calls
+# "local" stops the spawn and prints the cheaper bin/local-run command to run instead. A
+# caller's --mode or --thinking is accepted only when it matches Jev's answer for that exact
+# task text; otherwise the spawn aborts and prints Jev's answer. Overriding Jev — a mode, a
+# thinking level or a local route — needs --override-jev with a non-empty --reason, and the
+# override is recorded. If Jev is unreachable or unsure, the spawn aborts instead of guessing:
+# that decision belongs to the user. An "unsure" route is recorded and the spawn continues.
 #
 # Thinking is the one decision with two halves. Jev answers an abstract effort, low | medium |
 # high: it cannot know which thinking levels the worker's model supports. So the effort is
@@ -100,8 +101,8 @@ Ask the user which $kind to use. Only then re-run with --override-jev --reason '
 }
 
 # ask_jev_route <task text> — sets JEV_ROUTE (local|remote|unsure) and ROUTE_REASON.
-# Never dies and never refuses: routing says what the work is worth, not whether it may run.
-# The mismatch check below reads Jev's answer only, never keywords in the task text: "quick"
+# Never dies here: the refusal lives in cmd_spawn beside the mode check, so one run records
+# every decision. That check reads Jev's answer only, never keywords in the task text: "quick"
 # and "small" show up in plenty of remote work.
 ask_jev_route() {
 	local text=$1 out rc
@@ -260,25 +261,31 @@ cmd_spawn() {
 	jev_level=$(printf '%s' "$thinking_map" | json_field level)
 	[ -n "$jev_level" ] || die "could not map jev's thinking effort '$jev_effort' to a level: $thinking_map"
 
-	# 2. A caller's mode and thinking level must agree with Jev for this exact task text.
+	# 2. A caller's mode and thinking level must agree with Jev for this exact task text, and a
+	#    task Jev calls local refuses: local work needs no space, no spec and no agent.
 	#    Jev's answer is recorded either way: a refusal is a decision too, and the audit line
 	#    says why nothing spawned. An override without a reason is a guess, so it refuses too.
-	local refusal="" refuse_mode=0 refuse_thinking=0 reason_given=0
+	local refusal="" refuse_mode=0 refuse_thinking=0 refuse_route=0 reason_given=0
 	if [ -n "$mode" ] && [ "$mode" != "$jev_mode" ]; then refuse_mode=1; fi
 	if [ -n "$thinking" ] && [ "$thinking" != "$jev_level" ]; then refuse_thinking=1; fi
+	if [ "$jev_route" = local ]; then refuse_route=1; fi
 	if [ -n "${reason// /}" ]; then reason_given=1; fi
 
 	if [ "$override_jev" = 1 ] && [ "$reason_given" = 0 ]; then
 		refusal="--override-jev needs a non-empty --reason: an override without a reason is a guess"
 	elif [ "$override_jev" = 1 ]; then
 		# Nothing to overrule is not an override; record it only when it actually overturned Jev.
-		if [ "$refuse_mode" = 1 ] || [ "$refuse_thinking" = 1 ]; then overridden=true; fi
+		if [ "$refuse_mode" = 1 ] || [ "$refuse_thinking" = 1 ] || [ "$refuse_route" = 1 ]; then overridden=true; fi
 	elif [ "$refuse_mode" = 1 ]; then
 		refusal="--mode $mode contradicts jev, which answered '$jev_mode' for this task ($mode_reason).
 Re-run without --mode to use jev's answer, or re-run with --override-jev --reason '<why>' to overturn jev."
 	elif [ "$refuse_thinking" = 1 ]; then
 		refusal="--thinking $thinking contradicts jev, which answered effort '$jev_effort' — level '$jev_level' for this task ($thinking_reason).
 Re-run without --thinking to use jev's level, or re-run with --override-jev --reason '<why>' to overturn jev."
+	elif [ "$refuse_route" = 1 ]; then
+		refusal="jev routes this task local, so a space and an agent are more than it needs ($route_reason).
+Run it here instead:  $BIN/local-run \"<task>\"
+Forcing a remote worker needs --override-jev --reason '<why this cannot run locally>'."
 	fi
 
 	if [ -n "$refusal" ]; then
@@ -296,11 +303,9 @@ Re-run without --thinking to use jev's level, or re-run with --override-jev --re
 	case $mode in bare|sandboxed) runner=$BIN/pi-$mode ;; no-net) runner=$BIN/pi-nonet ;; *) die "mode must be bare, sandboxed or no-net: '$mode'" ;; esac
 	[ -f "$runner" ] || die "no runner for mode $mode ($runner)"
 
-	# 3. Routing is advisory. A remote worker for a task Jev calls local is exactly the mismatch
-	#    this check names: it points at the cheaper bin/local-run path, then carries on.
+	# 3. A local route survives only as an override, and the note says so out loud.
 	if [ "$jev_route" = local ]; then
-		printf '%s: warning: jev routes this task local, so a space and an agent are more than it needs.\n' "$prog" >&2
-		printf '%s: the cheaper path is  %s "<task>"  — continuing anyway, nothing was refused.\n' "$prog" "$BIN/local-run" >&2
+		printf '%s: note: jev routes this task local (%s); spawning because --override-jev --reason was given.\n' "$prog" "$route_reason" >&2
 	fi
 
 	# 4. Record all four decisions before doing any work.

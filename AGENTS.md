@@ -69,9 +69,10 @@ Before any work starts, ask Jev the route: `jev route "<task>"`. Exit 0 = local,
 - **unsure** — ask the user. When in doubt, remote: a wasted worker space costs less than a
   wrong one-shot answer.
 
-A remote worker for a local task is the mismatch `delegate spawn` warns about: it names the
-cheaper `bin/local-run` path and spawns anyway, because the caller asked. A warning is not a
-refusal; the check reads Jev's answer, never keywords in the task text.
+`delegate spawn` refuses a task Jev routes `local`: it prints the exact `bin/local-run` command
+to run instead, because a space and an agent are more than that work needs. Forcing a remote
+worker needs `--override-jev --reason '<why>'`, recorded like any override. The check
+reads Jev's answer, never keywords in the task text.
 
 Agents outside this workspace can ask `jev route` too, if `jev` is on their PATH
 (`~/.local/bin/jev`). Routing is a question about the task, not about the workspace.

@@ -111,5 +111,48 @@ fi
 expect "delegate list, empty temp root" 0 "no workers" -- \
 	env PATH=$safe_path "$bin/delegate" list
 
+# 6. Routing is a refusal, not a warning. delegate reads jev from $PI_BOSS_ROOT/bin, so a
+#    fake jev there answers route=local without a model and without touching the real tree.
+#    herdr-app, hc and the runner are stubs, so a spawn that gets past the refusal cannot
+#    create a space. The runner exists because delegate checks for it before it logs anything.
+stub=$work/stub
+mkdir -p "$stub" "$PI_BOSS_ROOT/bin"
+cat >"$stub/herdr-app" <<'STUB'
+#!/usr/bin/env bash
+printf 'stub herdr-app: %s\n' "$*"
+exit 0
+STUB
+cat >"$stub/hc" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+cat >"$PI_BOSS_ROOT/bin/jev" <<'STUB'
+#!/usr/bin/env bash
+case $1 in
+route) printf '{"route":"local","reason":"one sentence to translate"}\n' ;;
+mode) printf '{"mode":"sandboxed","reason":"read-only work"}\n' ;;
+count) printf '{"count":1,"reason":"one sentence"}\n' ;;
+thinking) printf '{"thinking":"low","reason":"mechanical"}\n' ;;
+*) printf '{"reason":"stub"}\n' ;;
+esac
+exit 0
+STUB
+printf '#!/usr/bin/env bash\nexit 0\n' >"$PI_BOSS_ROOT/bin/pi-sandboxed"
+chmod +x "$stub/herdr-app" "$stub/hc" "$PI_BOSS_ROOT/bin/jev" "$PI_BOSS_ROOT/bin/pi-sandboxed"
+
+expect "delegate spawn, jev route local refuses" 1 "bin/local-run" -- \
+	env PATH=$stub:$safe_path "$bin/delegate" spawn "local-work" --cwd "$work" "translate one sentence to Dutch"
+
+# The same task, forced through with a reason: the spawn proceeds and the route line in the
+# decisions log records the override. It may fail later on the herdr-app stub; the log is the
+# assertion, because that line is written before any space is asked for.
+env PATH=$stub:$safe_path "$bin/delegate" spawn "local-override" --cwd "$work" --override-jev \
+	--reason "needs a repo and tools" "translate one sentence to Dutch" >/dev/null 2>&1 || true
+if grep '"command":"route"' "$PI_BOSS_ROOT/state/decisions.jsonl" 2>/dev/null | grep -q '"decision":"local".*"overridden":true'; then
+	pass "route override recorded in state/decisions.jsonl"
+else
+	fail "no route line with decision local and overridden true in state/decisions.jsonl"
+fi
+
 printf '\n%s\n' "$([ "$fails" = 0 ] && echo "offline behaviour: ok" || echo "offline behaviour: $fails failure(s)")"
 [ "$fails" = 0 ]

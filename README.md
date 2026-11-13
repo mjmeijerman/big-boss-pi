@@ -37,10 +37,11 @@ answers `local` or `remote`:
 - `remote` — code changes, debugging, design decisions, multi-file reasoning, anything that
   needs tools, tests or a repo. Go through `delegate spawn`.
 
-`delegate spawn` asks the route itself and records it, but only warns when it contradicts the
-request: a remote worker for a local task prints the `bin/local-run` alternative and spawns
-anyway. The route also lands on the spec header, next to the mode: "Mode: sandboxed (chosen
-by jev), route: remote (jev)", so a worker can tell what it was supposed to be.
+`delegate spawn` asks the route itself and records it. A `local` answer refuses the spawn: it
+prints the exact `bin/local-run` command to run instead, and forcing a remote worker needs
+`--override-jev --reason '<why this cannot run locally>'`, recorded like any override. The
+route also lands on the spec header, next to the mode: "Mode: sandboxed (chosen by jev),
+route: remote (jev)", so a worker can tell what it was supposed to be.
 
 ```
 jev route "summarise reports/foo.md in three bullets"   # → local  (exit 0)
@@ -54,8 +55,9 @@ jev route "add retries to the fetch client"              # → remote (exit 1)
 `jev thinking` — for the exact task text. A `--mode` or `--thinking` from the caller is
 accepted only when it matches Jev's answer. A different one aborts the spawn and prints Jev's
 answer and its reason; overturning it needs `--override-jev --reason '<why>'`, and the
-override is recorded. If Jev is unreachable or answers "unsure", the spawn stops instead of
-guessing, because that call belongs to the user.
+override is recorded. A `local` route aborts the same way, pointing at `bin/local-run`. If Jev
+is unreachable or answers "unsure", the spawn stops instead of guessing, because that call
+belongs to the user.
 
 Thinking is split in two, because the two halves are different facts. Jev answers an *effort*
 — `low`, `medium` or `high` — which is a fact about the task. Which levels the worker's model
