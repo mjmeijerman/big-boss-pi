@@ -12,8 +12,9 @@ outside `/home/mark/big-boss-pi`.
 
 1. Understand the request. If it is vague, more than one file, or a design choice, grill the
    user first (`/grill`): no workers before the answers.
-2. Ask Jev how many workers and what mode (below). `delegate spawn` asks it again on every
-   spawn and refuses a `--mode` that contradicts Jev.
+2. Ask Jev how many workers, what mode, and whether the work is local or remote at all
+   (below). `delegate spawn` asks it again on every spawn and refuses a `--mode` that
+   contradicts Jev.
 3. Spawn workers in **other** Herdr spaces with `delegate spawn` — never in this space.
 4. Poll with `delegate wait <slug>`, read `reports/<slug>.md`.
 5. Relay to the user: what now works, one line per worker, what is still open, and the next
@@ -31,6 +32,7 @@ guess:
 
 | question | command | use the answer for |
 |---|---|---|
+| Locally or remotely? | `jev route "<task>"` | `local` → `bin/local-run`; `remote` → `delegate spawn` |
 | How many agents? | `jev count "<task>"` | 1-4 workers; more than 4 outruns review |
 | Which mode? | `jev mode "<worker task>"` | bare, sandboxed, or no-net |
 | Anything else? | `jev ask "<question>"` | yes / no / unsure |
@@ -54,10 +56,33 @@ Exit code 0 = yes, 1 = no, 3 = unsure. `--json` prints the decision and the reas
 - This workspace's own agent runs bare: it must reach the Herdr sockets to start spaces.
   It does no project work, so it has nothing to sandbox.
 
+## Routing: local or remote first
+
+Before any work starts, ask Jev the route: `jev route "<task>"`. Exit 0 = local, 1 = remote,
+3 = unsure (ask the user).
+
+- **local** — summarise, classify, extract, tidy, translate, format, short mechanical rewrites
+  that need no repo knowledge and no tools. Run it as a subprocess:
+  `bin/local-run "<task>"`, or pipe the text in. The answer comes back on stdout in one call.
+  No space, no spec, no report, no `decisions.jsonl` line. Same local model as `jev`.
+- **remote** — code changes, debugging, design decisions, multi-file reasoning, anything that
+  needs tools, tests or repo knowledge. That is `delegate spawn`.
+- **unsure** — ask the user. When in doubt, remote: a wasted worker space costs less than a
+  wrong one-shot answer.
+
+A remote worker for a local task is the mismatch `delegate spawn` warns about: it names the
+cheaper `bin/local-run` path and then spawns anyway, because the caller asked. A warning is
+not a refusal, and the check reads Jev's answer only — never keywords in the task text.
+
+Agents outside this workspace can ask `jev route` too, if `jev` is on their PATH
+(`~/.local/bin/jev`). Routing is a question about the task, not about the workspace.
+
 ## Commands
 
 ```
-jev ask|mode|count|permit <text> [--json]
+jev ask|mode|count|permit|route <text> [--json]
+local-run "<task>"            # or: ... | local-run
+
 delegate spawn <slug> --cwd <dir> [--mode bare|sandboxed|no-net] [--override-jev --reason TEXT] "<task>"
 delegate wait <slug> [--timeout 600]
 delegate list
@@ -92,6 +117,8 @@ worker to write `reports/<slug>.md` and then stay idle — that file is the repo
 | `AGENTS.md` | this file — the rules every agent here loads |
 | `bin/jev` | the decision model wrapper |
 | `bin/delegate` | spawn / wait / list / close workers, gated by Jev |
+| `bin/local-run` | run one local task on the local model, headless, answer on stdout |
+| `bin/jev-model.mjs` | the one place that names the local model and endpoint |
 | `bin/guard` | keeps the big-boss-pi space alive and focused at Herdr start |
 | `bin/pi-bare`, `bin/pi-sandboxed`, `bin/pi-nonet` | the three worker modes |
 | `bin/finish-rename.sh` | opt-in: close the old `pi-master` space, print how to delete the old tree |
