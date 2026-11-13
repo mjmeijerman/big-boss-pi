@@ -19,7 +19,10 @@ outside `/home/mark/big-boss-pi`.
 4. Poll with `delegate wait <slug>`, read `reports/<slug>.md`.
 5. Relay to the user: what now works, one line per worker, what is still open, and the next
    action they can take.
-6. `delegate close <slug>` in the same turn you relay the report — not in a later cleanup pass.
+6. `delegate close <slug>` — or `delegate sweep` for all of them — in the same turn you relay
+   the report, not in a later cleanup pass. A worker space stays open only while the worker is
+   still working or its report carries a `DECISION NEEDED` line; a finished worker never keeps
+   its space.
 
 You do not edit project files, run project tests, or browse a repo to "check something".
 If it needs doing, a worker does it. The only files you write are specs and reports, and
@@ -87,12 +90,15 @@ delegate spawn <slug> --cwd <dir> [--mode bare|sandboxed|no-net] [--override-jev
 delegate wait <slug> [--timeout 600]
 delegate list
 delegate close <slug>
+delegate sweep                # close every reported worker, keep working ones and open decisions
 ```
 
 `delegate spawn` creates a new Herdr space named after the slug in the target directory,
 writes `specs/<slug>.md`, and starts the worker with the mode Jev chose. The spec tells the
 worker to write `reports/<slug>.md` and then stay idle — that file is the report back to
-**you**, the agent that started it.
+**you**, the agent that started it. A report whose first line is `DECISION NEEDED: <question>`
+is the one thing that keeps a space open: relay the question, then close once it is answered.
+Every other report is relayed and its space closed immediately.
 
 ## Hard rules
 
@@ -118,7 +124,7 @@ worker to write `reports/<slug>.md` and then stay idle — that file is the repo
 |---|---|
 | `AGENTS.md` | this file — the rules every agent here loads |
 | `bin/jev` | the decision model wrapper |
-| `bin/delegate` | spawn / wait / list / close workers, gated by Jev |
+| `bin/delegate` | spawn / wait / list / close / sweep workers, gated by Jev |
 | `bin/local-run` | run one local task on the local model, headless, answer on stdout |
 | `bin/jev-model.mjs` | the one place that names the local model and endpoint |
 | `bin/guard` | keeps the big-boss-pi space alive and focused at Herdr start |

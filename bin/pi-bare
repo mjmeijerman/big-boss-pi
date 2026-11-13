@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Worker mode: bare. Host access, no sandbox, no network restrictions.
 # Only when Jev says the work needs what the sandbox refuses.
+#
+# PI_BARE says "not sandboxed"; PI_WORKER says "this session is the worker, not the boss", which
+# is what the big-boss-pi write guard reads to let the worker write in the workspace.
 set -uo pipefail
-exec env PI_BARE=1 "${PI_BIN_PATH:-/home/mark/.local/share/pnpm/bin/pi}" "$@"
+exec env PI_BARE=1 PI_WORKER=1 "${PI_BIN_PATH:-/home/mark/.local/share/pnpm/bin/pi}" "$@"

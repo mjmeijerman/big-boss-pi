@@ -7,6 +7,9 @@ set -uo pipefail
 root=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)
 root=${PI_BOSS_ROOT:-${PI_MASTER_ROOT:-$root}}
 export PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}:/home/mark/.local/share/pnpm/bin"
+# This session is the worker, not the boss: the big-boss-pi write guard returns early for it.
+# The sandbox inherits the environment, so the marker survives into it.
+export PI_WORKER=1
 seeds=()
 for d in "$root/specs" "$root/reports"; do
 	[ -d "$d" ] && seeds+=(--rw "$d")

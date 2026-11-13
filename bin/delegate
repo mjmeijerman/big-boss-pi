@@ -6,6 +6,7 @@
 #   delegate wait <slug> [--timeout SECONDS]
 #   delegate list
 #   delegate close <slug>
+#   delegate sweep
 #
 # A worker gets its own Herdr space (never the big-boss-pi space), a spec in specs/<slug>.md,
 # and one place to report back: reports/<slug>.md.
@@ -15,6 +16,11 @@
 # stay where you were, and the worker's space is there when you want it. If the view cannot be
 # read or put back, spawn prints one warning and carries on: a started worker is never thrown
 # away over a view. --no-restore keeps the old behaviour, for watching the worker appear.
+#
+# A worker space never outlives its report: once reports/<slug>.md exists, the space is closed
+# as soon as the report has been relayed. The one exception is a report whose first line reads
+# "DECISION NEEDED: <question>": that marker keeps the space open until the user answers.
+# `delegate sweep` applies exactly that rule to every tracked worker in one go.
 #
 # Every spawn asks Jev, unconditionally, for the mode, the worker count, and the route (local
 # or remote). Routing is advisory: a task Jev calls "local" prints a warning about the cheaper
@@ -51,6 +57,15 @@ need() { command -v "$1" >/dev/null 2>&1 || die "$1 is not on PATH"; }
 json_field() { node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{let j={};try{j=JSON.parse(d)}catch{}const v=process.argv[1].split(".").reduce((a,k)=>a?.[k],j);if(v!==undefined&&v!==null)process.stdout.write(String(v))})' "$1"; }
 
 valid_slug() { case $1 in [a-z0-9]*) ;; *) return 1 ;; esac; printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9-]{0,30}$'; }
+
+# report_needs_decision <report> -- true when the report opens with a DECISION NEEDED line.
+# That marker is the only thing that keeps a worker space open once the report exists. A report
+# that is absent or empty means the worker is still working: a keep for the sweep, never a close.
+report_needs_decision() {
+	local report=${1:-}
+	[ -f "$report" ] || return 1
+	head -n 20 -- "$report" | grep -qiE '^[[:space:]]*[*_>#-]*[[:space:]]*decision needed[[:space:]]*:'
+}
 
 # ask_jev <mode|count> <task text> — sets JEV_DECISION and JEV_REASON; dies if Jev will not answer.
 ask_jev() {
@@ -237,7 +252,12 @@ $task
    - what you changed (branch, files)
    - what is still open, and the one next action for the person
    Keep it short. That file is the whole message back; nobody reads your scrollback.
-6. Then stay idle. The big-boss-pi agent closes your space when the report is read.
+6. Then write the report and stay idle. Do not close, rename or move the space. The
+   big-boss-pi agent relays the report and closes the space right away, so a space never stays
+   open just because the worker finished.
+7. The one exception, when the user must decide something before work can continue: make the
+   first line of the report read "DECISION NEEDED: the question in one line". That marker is
+   the only thing that keeps the space open, and only until the user answers.
 EOF
 
 	local argv
@@ -311,6 +331,13 @@ cmd_wait() {
 		if [ -s "$report" ]; then
 			say "== $slug reported =="
 			cat "$report"
+			say ""
+			if report_needs_decision "$report"; then
+				say "$slug asks the user for a decision. Relay the question, and close the space once it is answered:"
+			else
+				say "$slug is done. Relay the report, then close the space now:"
+			fi
+			say "  $BIN/delegate close $slug"
 			return 0
 		fi
 		sleep 2; waited=$((waited + 2))
@@ -332,12 +359,19 @@ cmd_list() {
 		const rows=Object.values(j);
 		if(!rows.length){console.log("no workers");process.exit(0)}
 		for(const r of rows){
-			let size=0;try{size=fs.statSync(r.report).size}catch{}
+			let size=0,head="";
+			try{size=fs.statSync(r.report).size}catch{}
+			try{
+				const fd=fs.openSync(r.report,"r");const buf=Buffer.alloc(Math.min(size,2000));
+				fs.readSync(fd,buf,0,buf.length,0);fs.closeSync(fd);head=buf.toString("utf8");
+			}catch{}
+			const needsDecision=/^[ \t]*[*_>#-]*[ \t]*decision needed[ \t]*:/im.test(head);
+			const status=!size?"working":needsDecision?"DECISION":"reported";
 			const d=last.get(r.slug);
 			const route=routes.get(r.slug);
 			const jev=(d?`jev ${d.command}=${d.decision}${d.overridden?" (overridden)":""}`:`jev ${r.mode}${r.overridden?" (overridden)":""}`)
 				+(route?` route=${route.decision}`:"");
-			console.log([r.slug.padEnd(22),r.mode.padEnd(10),(size?"reported":"working").padEnd(9),jev.padEnd(38),r.space,"cwd="+r.cwd].join(" "));
+			console.log([r.slug.padEnd(22),r.mode.padEnd(10),status.padEnd(9),jev.padEnd(38),r.space,"cwd="+r.cwd].join(" "));
 		}' "$DELEGATIONS" "$DECISIONS"
 }
 
@@ -359,6 +393,41 @@ cmd_close() {
 	printf '{"closed":"%s","space":"%s"}\n' "$slug" "$space"
 }
 
+# cmd_sweep -- close every worker whose report exists and does not need a user decision.
+# Kept: no report yet (still working), and a report carrying the DECISION NEEDED marker.
+cmd_sweep() {
+	local closed=0 kept=0 slug report
+	local slugs=""
+	if [ -f "$DELEGATIONS" ]; then
+		slugs=$(node -e '
+			const fs=require("fs");let j={};try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"))}catch{}
+			Object.keys(j).forEach(k=>process.stdout.write(k+"\n"))' "$DELEGATIONS")
+	fi
+	# set -euo pipefail: a here-string keeps the read out of a pipeline's exit status.
+	while IFS= read -r slug; do
+		[ -n "$slug" ] || continue
+		report=$REPORTS/$slug.md
+		if [ ! -s "$report" ]; then
+			say "keep   $slug (still working)"
+			kept=$((kept + 1))
+			continue
+		fi
+		if report_needs_decision "$report"; then
+			say "keep   $slug (decision needed, ask the user)"
+			kept=$((kept + 1))
+			continue
+		fi
+		if cmd_close "$slug" >/dev/null 2>&1; then
+			say "closed $slug"
+			closed=$((closed + 1))
+		else
+			say "keep   $slug (close failed, close it by hand)"
+			kept=$((kept + 1))
+		fi
+	done <<<"$slugs"
+	say "$closed closed, $kept kept"
+}
+
 # Dispatch only when executed: sourcing this file just gives you the functions.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 	case ${1:-} in
@@ -366,6 +435,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 	wait) shift; cmd_wait "$@" ;;
 	list | ls) cmd_list ;;
 	close) shift; cmd_close "$@" ;;
-	*) die 'usage: delegate spawn|wait|list|close ...' ;;
+	sweep) cmd_sweep ;;
+	*) die 'usage: delegate spawn|wait|list|close|sweep ...' ;;
 	esac
 fi
