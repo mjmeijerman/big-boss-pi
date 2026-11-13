@@ -12,7 +12,8 @@ copy: read-only during the transition, deleted only when the user says so.
 | piece | path | why there |
 |---|---|---|
 | The rules every agent here loads | `/home/mark/big-boss-pi/AGENTS.md` | Pi loads `AGENTS.md` from the working directory and every parent, on every start, with no project trust needed. New or reloaded agents therefore start with the same knowledge |
-| Decision model | `bin/jev` → `~/.local/bin/jev` | local qwen3.8:27b on ollama; decides worker count, mode, and permissions |
+| Decision model | `bin/jev` → `~/.local/bin/jev` | local qwen3.8:27b on ollama; decides worker count, mode, route, and permissions |
+| Local worker | `bin/local-run` | runs a local task on the same model, headless: prompt in, answer on stdout, no space and no state |
 | Delegation | `bin/delegate` → `~/.local/bin/delegate` | asks Jev for mode and count, creates a Herdr space per worker, writes the spec, records where the report lands, appends every decision to `state/decisions.jsonl` |
 | Worker modes | `bin/pi-bare`, `bin/pi-sandboxed`, `bin/pi-nonet` | `delegate` picks one from Jev's answer |
 | Never-closable space | `bin/guard` → `~/.local/bin/big-boss-pi-guard` + `~/.config/systemd/user/big-boss-pi-guard.service` | polls `herdr-app ls`; recreates the `big-boss-pi` space if it disappears, selects it once when Herdr starts. It never recreates a space named `pi-master` |
@@ -25,17 +26,39 @@ Every script lives on its own tree: it resolves the workspace root from its own 
 works from any cwd and when sourced. `PI_BOSS_ROOT` overrides the root; `PI_MASTER_ROOT` is
 still accepted as a deprecated fallback.
 
+## Routing: decide before you work
+
+The first question is not "how many workers" but "is this work at all". `jev route "<task>"`
+answers `local` or `remote`:
+
+- `local` — summarise, classify, extract, tidy, translate, format, short mechanical rewrites
+  with no repo knowledge and no tools. Run `bin/local-run "<task>"`; it prints the answer and
+  writes nothing. Exit 0 = local, 1 = remote, 3 = unsure, so it drops straight into `if`.
+- `remote` — code changes, debugging, design decisions, multi-file reasoning, anything that
+  needs tools, tests or a repo. Go through `delegate spawn`.
+
+`delegate spawn` asks the route itself and records it, but only warns when it contradicts the
+request: a remote worker for a local task prints the `bin/local-run` alternative and spawns
+anyway. The route also lands on the spec header, next to the mode: "Mode: sandboxed (chosen
+by jev), route: remote (jev)", so a worker can tell what it was supposed to be.
+
+```
+jev route "summarise reports/foo.md in three bullets"   # → local  (exit 0)
+markdown notes.txt | bin/local-run                       # the answer on stdout
+jev route "add retries to the fetch client"              # → remote (exit 1)
+```
+
 ## Jev gates every delegation
 
-`delegate spawn` asks Jev twice on every run — `jev count` and `jev mode` — for the exact task
-text. A `--mode` from the caller is accepted only when it matches Jev's answer. A different one
+`delegate spawn` asks Jev three times on every run — `jev count`, `jev mode` and `jev route` —
+for the exact task text. A `--mode` from the caller is accepted only when it matches Jev's answer. A different one
 aborts the spawn and prints Jev's answer and its reason; overturning it needs
 `--override-jev --reason '<why>'`, and the override is recorded. If Jev is unreachable or
 answers "unsure", the spawn stops instead of guessing, because that call belongs to the user.
 
 Each decision is one line in `state/decisions.jsonl`:
-`{"timestamp":…,"command":"mode"|"count","task":…,"decision":…,"reason":…,"overridden":true|false,"slug":…}`.
-`delegate list` shows the last Jev decision for each worker.
+`{"timestamp":…,"command":"mode"|"count"|"route","task":…,"decision":…,"reason":…,"overridden":true|false,"slug":…}`.
+`delegate list` shows the last Jev decision for each worker plus its route.
 
 ## Why the space cannot be closed
 

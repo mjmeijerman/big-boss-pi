@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# local-run — thin launcher for local-run.mjs, same shape as bin/jev.
+set -uo pipefail
+here=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+exec node "$here/local-run.mjs" "$@"

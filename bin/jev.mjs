@@ -11,15 +11,13 @@
  *   jev permit "<request>"    allow a sandbox permission request, or escalate it
  *   jev mode "<worker task>"  bare | sandboxed | no-net
  *   jev count "<task>"        1..4 workers
+ *   jev route "<task>"        local | remote — who does this work at all
  *
  * Exit codes: 0 yes/answered, 1 no, 3 unsure or model unreachable (ask the user).
  * --json prints {"decision":…,"reason":…} instead of one line.
  */
 import process from "node:process";
-
-const MODEL = process.env.JEV_MODEL || "qwen3.8:27b";
-const ENDPOINT = process.env.JEV_ENDPOINT || "http://localhost:11434/api/chat";
-const TIMEOUT = Number(process.env.JEV_TIMEOUT || 180000);
+import { MODEL, ENDPOINT, TIMEOUT } from "./jev-model.mjs";
 
 const POLICY = `You are Jev, a decision model inside a coding-agent harness. You answer one
 narrow question at a time and you answer it in JSON. You are not a chatbot: no prose outside
@@ -37,6 +35,11 @@ Standing policy you must apply:
   worker was given, or a path the sandbox simply did not mount and the task needs. No for
   credentials, ssh keys, cloud configs, writes outside the worker's directory, destructive
   commands, or network access to hosts the task does not need.
+- Routing: decide whether the work runs local or remote before it starts. "Local" means
+  summarise, classify, extract, tidy, translate, format, and short mechanical rewrites that
+  need no repo knowledge and no tools. "Remote" means code changes, debugging, design
+  decisions, multi-file reasoning, and anything that needs tools, tests, or repo knowledge.
+  When in doubt, remote.
 - If the question is ambiguous, if answering it would be a guess, or if the safe answer is
   not clear: answer "unsure". A human will take it. That is a good outcome, not a failure.`;
 
@@ -50,7 +53,7 @@ function parseArgs(argv) {
 	const rest = [];
 	for (const arg of argv) {
 		if (arg === "--json") opts.json = true;
-		else if (!opts.kind && ["ask", "permit", "mode", "count"].includes(arg)) opts.kind = arg;
+		else if (!opts.kind && ["ask", "permit", "mode", "count", "route"].includes(arg)) opts.kind = arg;
 		else rest.push(arg);
 	}
 	opts.text = rest.join(" ").trim();
@@ -62,6 +65,7 @@ const SHAPES = {
 	permit: '{"decision":"yes|no|unsure","confidence":0.0-1.0,"reason":"one sentence"}',
 	mode: '{"mode":"bare|sandboxed|no-net","confidence":0.0-1.0,"reason":"one sentence"}',
 	count: '{"count":1-4,"confidence":0.0-1.0,"reason":"one sentence"}',
+	route: '{"route":"local|remote","confidence":0.0-1.0,"reason":"one sentence"}',
 };
 
 const PROMPTS = {
@@ -72,6 +76,8 @@ const PROMPTS = {
 		`A worker will be started for this task:\n${text}\n\nWhich mode: bare, sandboxed, or no-net?`,
 	count: (text) =>
 		`Task:\n${text}\n\nHow many parallel workers does this need? Answer an integer 1 to 4.`,
+	route: (text) =>
+		`Task:\n${text}\n\nShould this run local (a small local model, no repo, no tools) or remote (a coding agent with the repo and tools)? Answer local or remote.`,
 };
 
 async function decide(kind, text) {
@@ -113,7 +119,7 @@ async function decide(kind, text) {
 }
 
 const opts = parseArgs(process.argv.slice(2));
-if (!opts.kind) fail("usage: jev ask|permit|mode|count <text> [--json]", 2);
+if (!opts.kind) fail("usage: jev ask|permit|mode|count|route <text> [--json]", 2);
 if (!opts.text) fail(`jev ${opts.kind}: needs the question text`, 2);
 
 const answer = await decide(opts.kind, opts.text);
@@ -139,6 +145,14 @@ if (opts.kind === "count") {
 	if (!Number.isInteger(count) || count < 1 || count > 4 || low)
 		emit("unsure how many workers — ask the user", { count: null, reason, confidence }, 3);
 	emit(String(count), { count, reason, confidence }, 0);
+}
+
+if (opts.kind === "route") {
+	const route = String(answer.route || "").trim().toLowerCase();
+	if (!["local", "remote"].includes(route) || low)
+		emit("unsure which route — ask the user", { route: null, reason, confidence }, 3);
+	if (route === "local") emit("local", { route, reason, confidence }, 0);
+	emit("remote", { route, reason, confidence }, 1);
 }
 
 const decision = String(answer.decision || "").trim().toLowerCase();
