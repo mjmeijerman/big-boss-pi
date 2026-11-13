@@ -7,6 +7,7 @@
 #   delegate list
 #   delegate close <slug>
 #   delegate ask "<question>" [--json]
+#   delegate stats [--since DURATION] [--json]
 #   delegate sweep
 #
 # A worker gets its own Herdr space (never the big-boss-pi space), a spec in specs/<slug>.md,
@@ -46,6 +47,17 @@
 # "thinking"). `delegate ask` writes the same line for a question put to jev before it ever
 # reaches the user.
 #
+# `overridden` is per line and means one thing: this decision was overturned by
+# --override-jev. Each line also carries `jev`, the answer jev actually gave, so a reader can
+# check the flag instead of trusting it. Rows written before that fix are spawn-wide (the flag
+# sat on all four lines of an overridden spawn, so a route jev answered "remote" could read as
+# overridden); `delegate stats` counts them as legacy instead of re-interpreting them.
+#
+# `delegate stats` reads this file and state/usage.jsonl and prints one screen: jev calls per
+# command, the route/mode/thinking splits, how often jev was overruled, and whether the local
+# work path (bin/local-run) ever ran. It exists because "is the local model used" used to be
+# answerable only by inference.
+#
 # The base a worker cuts from is fetched and brought up to date here, before the space exists:
 # a sandboxed worker cannot fetch, so a stale trunk would put a PR on an old base. Trunk is
 # fast-forwarded only when it is a clean, strictly-behind ancestor; dirty, ahead or diverged
@@ -62,6 +74,9 @@ set -euo pipefail
 
 # ROOT: PI_BOSS_ROOT wins, PI_MASTER_ROOT is the deprecated fallback, then this script's tree.
 self_root=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)
+# The tree this script lives in, as opposed to ROOT (which a caller may point elsewhere).
+# Programs are found here; state and the jev stub are found under ROOT.
+self_bin=$self_root/bin
 ROOT=${PI_BOSS_ROOT:-${PI_MASTER_ROOT:-$self_root}}
 BIN=$ROOT/bin
 STATE=$ROOT/state
@@ -89,11 +104,12 @@ report_needs_decision() {
 	head -n 20 -- "$report" | grep -qiE '^[[:space:]]*[*_>#-]*[[:space:]]*decision needed[[:space:]]*:'
 }
 
-# ask_jev <mode|count|thinking> <task text> — sets JEV_DECISION and JEV_REASON; dies if Jev
-# will not answer.
+# ask_jev <mode|count|thinking> <task text> [context] — sets JEV_DECISION and JEV_REASON; dies
+# if Jev will not answer. The context lands on Jev's own usage line in state/usage.jsonl, so a
+# local call can be tied to the worker or question that caused it.
 ask_jev() {
-	local kind=$1 text=$2 out rc decision reason
-	out=$("$BIN/jev" "$kind" "$text" --json 2>&1) && rc=0 || rc=$?
+	local kind=$1 text=$2 ctx=${3:-} out rc decision reason
+	out=$(PI_BOSS_CONTEXT="$ctx" "$BIN/jev" "$kind" "$text" --json 2>&1) && rc=0 || rc=$?
 	if [ "$rc" -ne 0 ]; then
 		case $out in
 		*unreachable* | *"returned nothing"* | *"HTTP "* | *"outside JSON"*)
@@ -115,9 +131,9 @@ Ask the user which $kind to use. Only then re-run with --override-jev --reason '
 # every decision. That check reads Jev's answer only, never keywords in the task text: "quick"
 # and "small" show up in plenty of remote work.
 ask_jev_route() {
-	local text=$1 out rc
+	local text=$1 ctx=${2:-} out rc
 	JEV_ROUTE=unsure ROUTE_REASON=""
-	out=$("$BIN/jev" route "$text" --json 2>&1) && rc=0 || rc=$?
+	out=$(PI_BOSS_CONTEXT="$ctx" "$BIN/jev" route "$text" --json 2>&1) && rc=0 || rc=$?
 	case $rc in
 	0) JEV_ROUTE=local ;;
 	1) JEV_ROUTE=remote ;;
@@ -126,17 +142,20 @@ ask_jev_route() {
 	ROUTE_REASON=$(printf '%s' "$out" | json_field reason || true)
 }
 
-# record_decision <command> <task> <decision> <reason> <overridden true|false> <slug|->
+# record_decision <command> <task> <decision> <reason> <overridden true|false> <slug|-> [jev]
+# `jev` is jev's own answer for that command; `overridden` is true only when <decision>
+# differs from it. See the header: the flag is per line, never per spawn.
 record_decision() {
-	local cmd=$1 task=$2 decision=$3 reason=$4 overridden=$5 slug=$6
+	local cmd=$1 task=$2 decision=$3 reason=$4 overridden=$5 slug=$6 jev=${7:-}
 	mkdir -p "$STATE"
 	node -e '
 		const fs=require("fs");
-		const [file,command,task,decision,reason,overridden,slug]=process.argv.slice(1);
+		const [file,command,task,decision,reason,overridden,slug,jev]=process.argv.slice(1);
 		const line={timestamp:new Date().toISOString(),command,task,decision,reason:reason||null,
 			overridden:overridden==="true",slug:slug==="-"?"":slug};
+		if(jev!==undefined&&jev!=="")line.jev=jev;
 		fs.appendFileSync(file,JSON.stringify(line)+"\n");' \
-		"$DECISIONS" "$cmd" "$task" "$decision" "$reason" "$overridden" "$slug"
+		"$DECISIONS" "$cmd" "$task" "$decision" "$reason" "$overridden" "$slug" "$jev"
 }
 
 # worker_thinking_level <effort> — map Jev's abstract effort (low|medium|high) to a thinking
@@ -347,17 +366,20 @@ cmd_spawn() {
 	# 1. Jev decides the count, the mode, the route and the thinking effort. Always. No caller
 	#    short-circuit.
 	local jev_count jev_mode count_reason mode_reason overridden=false
-	ask_jev count "$task"; jev_count=$JEV_DECISION; count_reason=$JEV_REASON
-	ask_jev mode "$task"; jev_mode=$JEV_DECISION; mode_reason=$JEV_REASON
+	local mode_overridden=false thinking_overridden=false route_overridden=false
+	local task_ctx="spawn:$slug"
+	ask_jev count "$task" "$task_ctx"; jev_count=$JEV_DECISION; count_reason=$JEV_REASON
+	ask_jev mode "$task" "$task_ctx"; jev_mode=$JEV_DECISION; mode_reason=$JEV_REASON
 	local jev_route route_reason
-	ask_jev_route "$task"; jev_route=$JEV_ROUTE; route_reason=$ROUTE_REASON
+	ask_jev_route "$task" "$task_ctx"; jev_route=$JEV_ROUTE; route_reason=$ROUTE_REASON
 	if [ "$jev_count" -gt 4 ]; then jev_count=4; fi
 	# The effort is Jev's; the level is the model's. See worker_thinking_level.
-	local jev_effort thinking_reason thinking_map jev_level
-	ask_jev thinking "$task"; jev_effort=$JEV_DECISION; thinking_reason=$JEV_REASON
+	local jev_effort thinking_reason thinking_map jev_level jev_effort_level
+	ask_jev thinking "$task" "$task_ctx"; jev_effort=$JEV_DECISION; thinking_reason=$JEV_REASON
 	thinking_map=$(worker_thinking_level "$jev_effort")
 	jev_level=$(printf '%s' "$thinking_map" | json_field level)
 	[ -n "$jev_level" ] || die "could not map jev's thinking effort '$jev_effort' to a level: $thinking_map"
+	jev_effort_level=$jev_level
 
 	# 2. A caller's mode and thinking level must agree with Jev for this exact task text, and a
 	#    task Jev calls local refuses: local work needs no space, no spec and no agent.
@@ -372,8 +394,14 @@ cmd_spawn() {
 	if [ "$override_jev" = 1 ] && [ "$reason_given" = 0 ]; then
 		refusal="--override-jev needs a non-empty --reason: an override without a reason is a guess"
 	elif [ "$override_jev" = 1 ]; then
-		# Nothing to overrule is not an override; record it only when it actually overturned Jev.
-		if [ "$refuse_mode" = 1 ] || [ "$refuse_thinking" = 1 ] || [ "$refuse_route" = 1 ]; then overridden=true; fi
+		# An override is per decision: only the line whose answer the caller contradicted is
+		# marked. Nothing to overrule is not an override.
+		if [ "$refuse_mode" = 1 ]; then mode_overridden=true; fi
+		if [ "$refuse_thinking" = 1 ]; then thinking_overridden=true; fi
+		if [ "$refuse_route" = 1 ]; then route_overridden=true; fi
+		if [ "$mode_overridden" = true ] || [ "$thinking_overridden" = true ] || [ "$route_overridden" = true ]; then
+			overridden=true
+		fi
 	elif [ "$refuse_mode" = 1 ]; then
 		refusal="--mode $mode contradicts jev, which answered '$jev_mode' for this task ($mode_reason).
 Re-run without --mode to use jev's answer, or re-run with --override-jev --reason '<why>' to overturn jev."
@@ -387,10 +415,10 @@ Forcing a remote worker needs --override-jev --reason '<why this cannot run loca
 	fi
 
 	if [ -n "$refusal" ]; then
-		record_decision mode "$task" "$jev_mode" "$mode_reason" false "-"
-		record_decision count "$task" "$jev_count" "$count_reason" false "-"
-		record_decision route "$task" "$jev_route" "$route_reason" false "-"
-		record_decision thinking "$task" "$jev_level" "$thinking_reason (jev effort $jev_effort → $jev_level)" false "-"
+		record_decision mode "$task" "$jev_mode" "$mode_reason" false "-" "$jev_mode"
+		record_decision count "$task" "$jev_count" "$count_reason" false "-" "$jev_count"
+		record_decision route "$task" "$jev_route" "$route_reason" false "-" "$jev_route"
+		record_decision thinking "$task" "$jev_level" "$thinking_reason (jev effort $jev_effort → $jev_level)" false "-" "$jev_level"
 		die "$refusal"
 	fi
 
@@ -406,11 +434,12 @@ Forcing a remote worker needs --override-jev --reason '<why this cannot run loca
 		printf '%s: note: jev routes this task local (%s); spawning because --override-jev --reason was given.\n' "$prog" "$route_reason" >&2
 	fi
 
-	# 4. Record all four decisions before doing any work.
-	record_decision mode "$task" "$mode" "$mode_reason" "$overridden" "$slug"
-	record_decision count "$task" "$jev_count" "$count_reason" "$overridden" "$slug"
-	record_decision route "$task" "$jev_route" "$route_reason" "$overridden" "$slug"
-	record_decision thinking "$task" "$jev_level" "$thinking_reason (jev effort $jev_effort → $jev_level)" "$overridden" "$slug"
+	# 4. Record all four decisions before doing any work. `overridden` sits on the line whose
+	#    decision was actually overturned, and `jev` carries jev's own answer on every line.
+	record_decision mode "$task" "$mode" "$mode_reason" "$mode_overridden" "$slug" "$jev_mode"
+	record_decision count "$task" "$jev_count" "$count_reason" false "$slug" "$jev_count"
+	record_decision route "$task" "$jev_route" "$route_reason" "$route_overridden" "$slug" "$jev_route"
+	record_decision thinking "$task" "$jev_level" "$thinking_reason (jev effort $jev_effort → $jev_level)" "$thinking_overridden" "$slug" "$jev_effort_level"
 
 	# The review ceiling is 4 workers (blip 21): refuse past it instead of hiding it.
 	local live
@@ -619,7 +648,7 @@ cmd_ask() {
 	done
 	[ -n "${question// /}" ] || die 'usage: delegate ask "<question for jev>" [--json]'
 	need node
-	out=$("$BIN/jev" ask "$question" --json 2>&1) && rc=0 || rc=$?
+	out=$(PI_BOSS_CONTEXT="ask" "$BIN/jev" ask "$question" --json 2>&1) && rc=0 || rc=$?
 	decision=$(printf '%s' "$out" | json_field decision)
 	reason=$(printf '%s' "$out" | json_field reason)
 	case $rc in
@@ -632,7 +661,7 @@ cmd_ask() {
 	if [ -z "$reason" ]; then
 		reason=$(printf '%s' "$out" | head -n 1 | sed 's/^[^:]*: //')
 	fi
-	record_decision ask "$question" "$decision" "$reason" false "-"
+	record_decision ask "$question" "$decision" "$reason" false "-" "$decision"
 	if [ "$json" = 1 ]; then
 		node -e 'const [q,d,r]=process.argv.slice(1);process.stdout.write(JSON.stringify({question:q,decision:d,reason:r||null,ask_user:d==="unsure"})+"\n")' \
 			"$question" "$decision" "$reason"
@@ -735,7 +764,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 	list | ls) cmd_list ;;
 	close) shift; cmd_close "$@" ;;
 	ask) shift; cmd_ask "$@" ;;
+	stats) shift; PI_BOSS_ROOT=$ROOT exec node "$self_bin/stats.mjs" "$@" ;;
 	sweep) cmd_sweep ;;
-	*) die 'usage: delegate spawn|wait|list|close|ask|sweep ...' ;;
+	*) die 'usage: delegate spawn|wait|list|close|ask|stats|sweep ...' ;;
 	esac
 fi
