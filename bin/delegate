@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 # delegate — the only way an agent in big-boss-pi starts work.
 #
-#   delegate spawn <slug> --cwd DIR [--mode bare|sandboxed|no-net] [--override-jev --reason TEXT] "<task>"
+#   delegate spawn <slug> --cwd DIR [--mode bare|sandboxed|no-net] [--override-jev --reason TEXT]
+#                  [--no-restore] "<task>"
 #   delegate wait <slug> [--timeout SECONDS]
 #   delegate list
 #   delegate close <slug>
 #
 # A worker gets its own Herdr space (never the big-boss-pi space), a spec in specs/<slug>.md,
 # and one place to report back: reports/<slug>.md.
+#
+# Spawning does not move the person's view. space.new always shows the new space, so spawn
+# records the selected space and tab first and selects them again afterwards; on screen you
+# stay where you were, and the worker's space is there when you want it. If the view cannot be
+# read or put back, spawn prints one warning and carries on: a started worker is never thrown
+# away over a view. --no-restore keeps the old behaviour, for watching the worker appear.
 #
 # Every spawn asks Jev, unconditionally, for the mode, the worker count, and the route (local
 # or remote). Routing is advisory: a task Jev calls "local" prints a warning about the cheaper
@@ -94,9 +101,29 @@ record_decision() {
 		"$DECISIONS" "$cmd" "$task" "$decision" "$reason" "$overridden" "$slug"
 }
 
+# screen_state — the "space tab" the person is looking at, or empty when the window cannot be
+# read (no window, herdr-app error). Never dies: a view that cannot be read must not stop a spawn.
+screen_state() {
+	local out space tab
+	out=$(herdr-app status 2>/dev/null) || return 0
+	space=$(printf '%s' "$out" | json_field space)
+	tab=$(printf '%s' "$out" | json_field tab)
+	[ -n "$space" ] && [ -n "$tab" ] || return 0
+	printf '%s %s' "$space" "$tab"
+}
+
+# restore_focus <space> <tab> — select that space, then that tab, explicitly by id. Returns
+# non-zero instead of dying: the caller warns and the spawn stands.
+restore_focus() {
+	local space=$1 tab=$2
+	herdr-app do space.select --id "$space" >/dev/null 2>&1 || return 1
+	herdr-app do tab.select --id "$tab" >/dev/null 2>&1 || return 1
+	return 0
+}
+
 cmd_spawn() {
-	local slug="" cwd="" mode="" task="" override_jev=0 reason="" runner=""
-	[ "$#" -ge 1 ] || die 'usage: delegate spawn <slug> --cwd DIR [--mode M] [--override-jev --reason TEXT] "<task>"'
+	local slug="" cwd="" mode="" task="" override_jev=0 reason="" runner="" no_restore=0
+	[ "$#" -ge 1 ] || die 'usage: delegate spawn <slug> --cwd DIR [--mode M] [--override-jev --reason TEXT] [--no-restore] "<task>"'
 	slug=$1; shift
 	local words=()
 	while [ "$#" -gt 0 ]; do
@@ -105,6 +132,7 @@ cmd_spawn() {
 		--mode) mode=${2:-}; shift 2 ;;
 		--override-jev) override_jev=1; shift ;;
 		--reason) reason=${2:-}; shift 2 ;;
+		--no-restore) no_restore=1; shift ;;
 		--*) die "unknown option $1" ;;
 		*) words+=("$1"); shift ;;
 		esac
@@ -215,6 +243,11 @@ EOF
 	local argv
 	argv=$(node -e 'process.stdout.write(JSON.stringify(["sh","-lc",process.argv[1]]))' \
 		"cd $(printf '%q' "$cwd") && exec $(printf '%q' "$runner") -a")
+	# space.new has no hidden or background mode: the new space is shown, which takes the person
+	# off the space and tab they were reading. Note both ids now, explicitly, to put them back.
+	local before=""
+	if [ "$no_restore" = 0 ]; then before=$(screen_state); fi
+
 	local out
 	out=$(herdr-app do space.new --name "$slug" --folder "$cwd" --tab "$slug" \
 		--argv "$argv" --task "Read $spec and do it. Report to $report." 2>&1) \
@@ -226,6 +259,17 @@ EOF
 	tab=$(printf '%s' "$out" | json_field tab)
 	pane=$(printf '%s' "$out" | json_field pane)
 	terminal=$(printf '%s' "$out" | json_field terminal)
+
+	# Put the view back before anything slow happens: state, the task send, the banner wait.
+	# Each failure is one warning line, never a refusal, and --no-restore skips it entirely.
+	if [ "$no_restore" = 0 ]; then
+		if [ -z "$before" ]; then
+			printf '%s: warning: could not read the space on screen before the spawn, so focus stayed on space %s\n' "$prog" "${space:-?}" >&2
+		elif ! restore_focus "${before%% *}" "${before##* }"; then
+			printf '%s: warning: could not restore focus to space %s, so focus stayed on space %s\n' "$prog" "${before%% *}" "${space:-?}" >&2
+		fi
+	fi
+
 	[ -n "$space" ] || die "could not read the new space id from: $out"
 
 	node -e '
