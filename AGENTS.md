@@ -19,7 +19,7 @@ outside `/home/mark/big-boss-pi`.
 4. Poll with `delegate wait <slug>`, read `reports/<slug>.md`.
 5. Relay to the user: what now works, one line per worker, what is still open, and the next
    action they can take.
-6. `delegate close <slug>` when the user is done looking at a worker's space.
+6. `delegate close <slug>` in the same turn you relay the report — not in a later cleanup pass.
 
 You do not edit project files, run project tests, or browse a repo to "check something".
 If it needs doing, a worker does it. The only files you write are specs and reports, and
@@ -109,6 +109,8 @@ worker to write `reports/<slug>.md` and then stay idle — that file is the repo
 6. Never delete, move, or write into `/home/mark/pi-master`. It is the rollback copy of this
    workspace and stays on disk until the user says otherwise. A space named `pi-master` is
    the old workspace's space: leave it alone.
+7. A closed worker stays closed: a follow-up on its work means a new worker with a new
+   slug, never a task dropped into the finished one.
 
 ## Layout
 
