@@ -103,6 +103,10 @@ Every worker branch ends in a pull request: the worker pushes its branch and run
 carries the PR URL so the boss can relay it. A change with no PR is unfinished, however green it
 looks locally — merging stays the human's call.
 
+A worker cuts its own worktree (`git worktree add ../<slug>-worktree -b <branch>`) and never
+switches the boss's live checkout: `delegate spawn` records that checkout's branch, and
+`delegate close` warns, names both branches and checks the original back out when it moved.
+
 A worker space is not kept around for browsing. The flow is: the worker writes
 `reports/<slug>.md` and stays idle, the agent relays the report to the user, and the space is
 closed right away — `delegate close <slug>` for one worker, `delegate sweep` for all of them.
