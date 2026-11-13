@@ -1,0 +1,17 @@
+# generated / local only
+state/
+specs/
+reports/
+.memory/
+
+# dependencies
+node_modules/
+
+# editors and OS junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

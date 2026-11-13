@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# jev — thin launcher so ~/.local/bin/jev can be a symlink to a file without a .mjs suffix.
+set -uo pipefail
+here=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+exec node "$here/jev.mjs" "$@"

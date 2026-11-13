@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# guard — keeps the big-boss-pi space alive.
+#
+# Herdr has no per-space lock: space.close ends a space and its terminals, and no hook lets a
+# mod veto it. So the space is made self-healing instead. Every few seconds: is there a space
+# named big-boss-pi? If not, rebuild it with a fresh big-boss-pi agent. The first time Herdr
+# answers after this service starts, select it, so Herdr opens on big-boss-pi.
+#
+# This guard only ever looks for, creates, and selects the space named big-boss-pi. A space
+# named pi-master belongs to the old workspace: it is never recreated from here.
+#
+# Radar Vol. 35: blip 20 (stateful guardrails) — a rule nothing checks is a rule that is gone.
+set -uo pipefail
+
+self_root=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)
+ROOT=${PI_BOSS_ROOT:-${PI_MASTER_ROOT:-$self_root}}
+SPACE_NAME=big-boss-pi
+STATE=$ROOT/state
+LOG=$STATE/guard.log
+SPACE_STATE=$STATE/space.json
+INTERVAL=${PI_BOSS_GUARD_INTERVAL:-${PI_MASTER_GUARD_INTERVAL:-5}}
+KICKOFF="Read AGENTS.md in this workspace. You are the big-boss-pi agent: you delegate, you do not do project work."
+
+mkdir -p "$STATE"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+
+# Keep the log from growing without bound during a long session.
+if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -gt 200000 ]; then
+	tail -n 500 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
+
+need_app() { command -v herdr-app >/dev/null 2>&1; }
+
+find_space() {
+	herdr-app ls 2>/dev/null | SPACE_NAME=$SPACE_NAME node -e '
+		let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+			let j={};try{j=JSON.parse(d)}catch{process.exit(1)}
+			const hit=(j.spaces||[]).find(s=>s.name===process.env.SPACE_NAME);
+			if(hit)process.stdout.write(hit.id);
+		})'
+}
+
+known_space() {
+	[ -f "$SPACE_STATE" ] || return 0
+	node -e '
+		const fs=require("fs");try{const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));if(j.space)process.stdout.write(j.space)}catch{}' "$SPACE_STATE"
+}
+
+create_space() {
+	local out argv
+	argv=$(node -e 'process.stdout.write(JSON.stringify(["sh","-lc",process.argv[1]]))' \
+		"exec $(printf '%q' "$ROOT/bin/pi-bare") -a")
+	out=$(herdr-app do space.new --name "$SPACE_NAME" --folder "$ROOT" --tab master \
+		--argv "$argv" --task "$KICKOFF" 2>&1) || {
+		log "space.new failed: $out"
+		return 1
+	}
+	local space terminal
+	field() {
+		printf '%s' "$out" | node -e '
+			let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+				let j={};try{j=JSON.parse(d)}catch{}
+				const v=process.argv[1].split(".").reduce((a,k)=>a?.[k],j);
+				if(v!==undefined&&v!==null)process.stdout.write(String(v))})' "$1"
+	}
+	space=$(field space); [ -n "$space" ] || space=$(field id); [ -n "$space" ] || space=$(field result.space)
+	terminal=$(field terminal); [ -n "$terminal" ] || terminal=$(field result.terminal)
+	[ -n "$space" ] || { log "could not read the new space id: $out"; return 1; }
+	printf '{"space":"%s","terminal":"%s","created":"%s"}\n' "$space" "$terminal" "$(date -Iseconds)" >"$SPACE_STATE"
+	log "created $SPACE_NAME ($space, terminal \`$terminal\`)"
+
+	# --task can arrive before pi listens; send it again once pi has had time to boot.
+	if [ -n "$terminal" ] && command -v hc >/dev/null 2>&1; then
+		sleep 12
+		if hc send "$terminal" "$KICKOFF" >/dev/null 2>&1; then
+			log "kickoff sent to $terminal"
+		else
+			log "could not send the kickoff message to $terminal"
+		fi
+	else
+		log "no terminal id from space.new; the agent starts without a kickoff message"
+	fi
+}
+
+ensure() {
+	local space
+	space=$(find_space) || {
+		# Log the transition, not every poll: a closed window is normal.
+		[ "$app_down" = 1 ] || log "herdr-app not answering; waiting"
+		app_down=1
+		return 0
+	}
+	# Herdr (re)started: put the person on big-boss-pi once, then never steal focus again.
+	if [ "$app_down" = 1 ]; then
+		log "herdr-app answered again"
+		app_down=0
+		herdr-app do space.select --id "$space" >/dev/null 2>&1 && log "selected $SPACE_NAME ($space)"
+	fi
+	if [ -z "$space" ]; then
+		create_space
+		return 0
+	fi
+	local known
+	known=$(known_space)
+	if [ "$space" != "$known" ]; then
+		printf '{"space":"%s","created":"%s"}\n' "$space" "$(date -Iseconds)" >"$SPACE_STATE"
+	fi
+	if [ "$1" = "select" ]; then
+		herdr-app do space.select --id "$space" >/dev/null 2>&1 && log "selected $SPACE_NAME ($space)"
+	fi
+}
+
+# Dispatch only when executed: sourcing this file just gives you the functions.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+	need_app || { log "herdr-app not on PATH; exiting"; exit 0; }
+	log "guard started (space $SPACE_NAME, root $ROOT, interval ${INTERVAL}s)"
+	app_down=0
+
+	# Recreate immediately, and put the person on it: that is "open when Herdr starts".
+	ensure select
+
+	while sleep "$INTERVAL"; do
+		ensure ""
+	done
+fi

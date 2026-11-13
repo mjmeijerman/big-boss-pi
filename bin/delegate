@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# delegate — the only way an agent in big-boss-pi starts work.
+#
+#   delegate spawn <slug> --cwd DIR [--mode bare|sandboxed|no-net] [--override-jev --reason TEXT] "<task>"
+#   delegate wait <slug> [--timeout SECONDS]
+#   delegate list
+#   delegate close <slug>
+#
+# A worker gets its own Herdr space (never the big-boss-pi space), a spec in specs/<slug>.md,
+# and one place to report back: reports/<slug>.md.
+#
+# Every spawn asks Jev, unconditionally, for the mode and for the worker count. A caller's
+# --mode is accepted only when it matches Jev's answer for that exact task text; otherwise the
+# spawn aborts and prints Jev's answer. Overriding Jev needs --override-jev with a non-empty
+# --reason, and the override is recorded. If Jev is unreachable or unsure, the spawn aborts
+# instead of guessing: that decision belongs to the user.
+#
+# Every decision lands in state/decisions.jsonl as one JSON line: timestamp, command, task
+# text, jev decision, jev reason, whether it was overridden, and the resulting slug.
+#
+# Radar Vol. 35: blip 1 (agent sandboxing, Adopt), blip 21 (subagents, Trial — capped at 4),
+# blip 17 (risk-tiered human oversight — the mode decides how much rope a worker gets).
+set -euo pipefail
+
+# ROOT: PI_BOSS_ROOT wins, PI_MASTER_ROOT is the deprecated fallback, then this script's tree.
+self_root=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)
+ROOT=${PI_BOSS_ROOT:-${PI_MASTER_ROOT:-$self_root}}
+BIN=$ROOT/bin
+STATE=$ROOT/state
+SPECS=$ROOT/specs
+REPORTS=$ROOT/reports
+DELEGATIONS=$STATE/delegations.json
+DECISIONS=$STATE/decisions.jsonl
+
+prog=delegate
+die() { printf '%s: error: %s\n' "$prog" "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is not on PATH"; }
+
+json_field() { node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{let j={};try{j=JSON.parse(d)}catch{}const v=process.argv[1].split(".").reduce((a,k)=>a?.[k],j);if(v!==undefined&&v!==null)process.stdout.write(String(v))})' "$1"; }
+
+valid_slug() { case $1 in [a-z0-9]*) ;; *) return 1 ;; esac; printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9-]{0,30}$'; }
+
+# ask_jev <mode|count> <task text> — sets JEV_DECISION and JEV_REASON; dies if Jev will not answer.
+ask_jev() {
+	local kind=$1 text=$2 out rc decision reason
+	out=$("$BIN/jev" "$kind" "$text" --json 2>&1) && rc=0 || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		case $out in
+		*unreachable* | *"returned nothing"* | *"HTTP "* | *"outside JSON"*)
+			die "jev is unreachable or broken — refusing to guess. jev said: $out" ;;
+		*)
+			die "jev $kind is unsure, so the spawn stops here. jev said: $out
+Ask the user which $kind to use. Only then re-run with --override-jev --reason '<why>'." ;;
+		esac
+	fi
+	decision=$(printf '%s' "$out" | json_field "$kind")
+	reason=$(printf '%s' "$out" | json_field reason)
+	[ -n "$decision" ] || die "jev $kind gave no usable answer: $out"
+	JEV_DECISION=$decision
+	JEV_REASON=$reason
+}
+
+# record_decision <command> <task> <decision> <reason> <overridden true|false> <slug|->
+record_decision() {
+	local cmd=$1 task=$2 decision=$3 reason=$4 overridden=$5 slug=$6
+	mkdir -p "$STATE"
+	node -e '
+		const fs=require("fs");
+		const [file,command,task,decision,reason,overridden,slug]=process.argv.slice(1);
+		const line={timestamp:new Date().toISOString(),command,task,decision,reason:reason||null,
+			overridden:overridden==="true",slug:slug==="-"?"":slug};
+		fs.appendFileSync(file,JSON.stringify(line)+"\n");' \
+		"$DECISIONS" "$cmd" "$task" "$decision" "$reason" "$overridden" "$slug"
+}
+
+cmd_spawn() {
+	local slug="" cwd="" mode="" task="" override_jev=0 reason="" runner=""
+	[ "$#" -ge 1 ] || die 'usage: delegate spawn <slug> --cwd DIR [--mode M] [--override-jev --reason TEXT] "<task>"'
+	slug=$1; shift
+	local words=()
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--cwd) cwd=${2:-}; shift 2 ;;
+		--mode) mode=${2:-}; shift 2 ;;
+		--override-jev) override_jev=1; shift ;;
+		--reason) reason=${2:-}; shift 2 ;;
+		--*) die "unknown option $1" ;;
+		*) words+=("$1"); shift ;;
+		esac
+	done
+	task="${words[*]:-}"
+	valid_slug "$slug" || die "slug must match [a-z0-9][a-z0-9-]{0,30}: '$slug'"
+	[ -n "$cwd" ] || die "spawn needs --cwd: the directory the worker works in"
+	[ -d "$cwd" ] || die "no such directory: $cwd"
+	[ -n "$task" ] || die "spawn needs a task description"
+	cwd=$(readlink -f -- "$cwd")
+	need herdr-app; need node; need hc
+
+	# 1. Jev decides the count and the mode. Always. No caller short-circuit.
+	local jev_count jev_mode count_reason mode_reason overridden=false
+	ask_jev count "$task"; jev_count=$JEV_DECISION; count_reason=$JEV_REASON
+	ask_jev mode "$task"; jev_mode=$JEV_DECISION; mode_reason=$JEV_REASON
+	if [ "$jev_count" -gt 4 ]; then jev_count=4; fi
+
+	# 2. A caller's mode must agree with Jev for this exact task text. Jev's answer is recorded
+	#    either way: a refusal is a decision too, and the audit line says why nothing spawned.
+	local refusal=""
+	if [ -n "$mode" ] && [ "$mode" != "$jev_mode" ]; then
+		if [ "$override_jev" = 1 ] && [ -n "${reason// /}" ]; then
+			overridden=true
+		elif [ "$override_jev" = 1 ]; then
+			refusal="--override-jev needs a non-empty --reason: an override without a reason is a guess"
+		else
+			refusal="--mode $mode contradicts jev, which answered '$jev_mode' for this task ($mode_reason).
+Re-run without --mode to use jev's answer, or re-run with --override-jev --reason '<why>' to overturn jev."
+		fi
+	else
+		if [ -z "$mode" ]; then mode=$jev_mode; fi
+		if [ "$override_jev" = 1 ] && [ -z "${reason// /}" ]; then
+			refusal="--override-jev needs a non-empty --reason: an override without a reason is a guess"
+		fi
+	fi
+
+	if [ -n "$refusal" ]; then
+		record_decision mode "$task" "$jev_mode" "$mode_reason" false "-"
+		record_decision count "$task" "$jev_count" "$count_reason" false "-"
+		die "$refusal"
+	fi
+	case $mode in bare|sandboxed) runner=$BIN/pi-$mode ;; no-net) runner=$BIN/pi-nonet ;; *) die "mode must be bare, sandboxed or no-net: '$mode'" ;; esac
+	[ -f "$runner" ] || die "no runner for mode $mode ($runner)"
+
+	# 3. Record both decisions before doing any work.
+	record_decision mode "$task" "$mode" "$mode_reason" "$overridden" "$slug"
+	record_decision count "$task" "$jev_count" "$count_reason" "$overridden" "$slug"
+
+	# 4 workers is the review ceiling (blip 21): refuse past it instead of hiding it.
+	local live
+	live=$(node -e '
+		const fs=require("fs");let j={};try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"))}catch{}
+		process.stdout.write(String(Object.keys(j).length));' "$DELEGATIONS" 2>/dev/null || echo 0)
+	[ "$live" -lt 8 ] || die "$live workers already tracked — close finished ones first"
+	if [ "$jev_count" -gt 1 ]; then
+		say "jev: this task wants $jev_count workers ($count_reason); spawning one now" >&2
+	fi
+
+	mkdir -p "$SPECS" "$REPORTS" "$STATE"
+	local spec=$SPECS/$slug.md report=$REPORTS/$slug.md
+	cat >"$spec" <<EOF
+# Worker \`$slug\`
+
+You are a worker. Report to the agent in the big-boss-pi workspace that started you; it is
+waiting on \`$report\`.
+
+- Work in: \`$cwd\`
+- Mode: \`$mode\` (chosen by jev${overridden:+, overridden: $reason})
+- Report file: \`$report\`
+
+## Task
+
+$task
+
+## Rules
+
+1. Do the task in \`$cwd\`. Do not touch \`$ROOT\` (write a report, nothing else).
+2. Do not spawn other agents or Herdr spaces, and do not rename, move or close any space.
+   If the task needs more hands, say so in the report.
+3. Do not merge, push to trunk, or commit on trunk.
+4. When you are done — or blocked and unable to continue — write \`$report\` with:
+   - what now works, in concrete terms (a command to run, a path, a test that passes)
+   - what you changed (branch, files)
+   - what is still open, and the one next action for the person
+   Keep it short. That file is the whole message back; nobody reads your scrollback.
+5. Then stay idle. The big-boss-pi agent closes your space when the report is read.
+EOF
+
+	local argv
+	argv=$(node -e 'process.stdout.write(JSON.stringify(["sh","-lc",process.argv[1]]))' \
+		"cd $(printf '%q' "$cwd") && exec $(printf '%q' "$runner") -a")
+	local out
+	out=$(herdr-app do space.new --name "$slug" --folder "$cwd" --tab "$slug" \
+		--argv "$argv" --task "Read $spec and do it. Report to $report." 2>&1) \
+		|| die "space.new failed: $out"
+
+	local space tab pane terminal
+	space=$(printf '%s' "$out" | json_field space)
+	[ -n "$space" ] || space=$(printf '%s' "$out" | json_field id)
+	tab=$(printf '%s' "$out" | json_field tab)
+	pane=$(printf '%s' "$out" | json_field pane)
+	terminal=$(printf '%s' "$out" | json_field terminal)
+	[ -n "$space" ] || die "could not read the new space id from: $out"
+
+	node -e '
+		const fs=require("fs");const [state,slug,space,tab,pane,terminal,cwd,mode,spec,report,jevCount,overridden,reason]=process.argv.slice(1);
+		let j={};try{j=JSON.parse(fs.readFileSync(state,"utf8"))}catch{}
+		j[slug]={slug,space,tab,pane,terminal,cwd,mode,spec,report,jevCount:Number(jevCount),
+			overridden:overridden==="true",overrideReason:reason||null,started:new Date().toISOString()};
+		fs.writeFileSync(state,JSON.stringify(j,null,2)+"\n");' \
+		"$DELEGATIONS" "$slug" "$space" "$tab" "$pane" "$terminal" "$cwd" "$mode" "$spec" "$report" \
+		"$jev_count" "$overridden" "$reason"
+
+	# space.new's --task can arrive before pi is listening, so send it again once the banner is up.
+	local i
+	for i in $(seq 1 40); do
+		hc read "$terminal" 2>/dev/null | grep -q "escape interrupt" && break
+		sleep 1
+	done
+	hc send "$terminal" "Read $spec and do it. Report to $report." >/dev/null 2>&1 \
+		|| printf '%s: warning: could not send the task to %s\n' "$prog" "$terminal" >&2
+
+	printf '{"slug":"%s","space":"%s","mode":"%s","jev_count":%s,"overridden":%s,"cwd":"%s","report":"%s"}\n' \
+		"$slug" "$space" "$mode" "$jev_count" "$overridden" "$cwd" "$report"
+}
+
+cmd_wait() {
+	local slug=${1:-}; local timeout=600
+	[ -n "$slug" ] || die 'usage: delegate wait <slug> [--timeout SECONDS]'
+	shift || true
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--timeout) timeout=${2:-600}; shift 2 ;;
+		*) die "unknown option $1" ;;
+		esac
+	done
+	local report=$REPORTS/$slug.md
+	command -v timeout >/dev/null 2>&1 || die "timeout not found"
+	local waited=0
+	while [ "$waited" -lt "$timeout" ]; do
+		if [ -s "$report" ]; then
+			say "== $slug reported =="
+			cat "$report"
+			return 0
+		fi
+		sleep 2; waited=$((waited + 2))
+	done
+	die "$slug has not reported after ${timeout}s — ask the user whether to keep waiting"
+}
+
+cmd_list() {
+	[ -f "$DELEGATIONS" ] || { say "no workers"; return 0; }
+	node -e '
+		const fs=require("fs");
+		let j={};try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"))}catch{}
+		let decisions=[];
+		try{decisions=fs.readFileSync(process.argv[2],"utf8").trim().split("\n").filter(Boolean).map(l=>{try{return JSON.parse(l)}catch{return null}}).filter(Boolean)}catch{}
+		const last=new Map();
+		for(const d of decisions)if(d.slug)last.set(d.slug,d);
+		const rows=Object.values(j);
+		if(!rows.length){console.log("no workers");process.exit(0)}
+		for(const r of rows){
+			let size=0;try{size=fs.statSync(r.report).size}catch{}
+			const d=last.get(r.slug);
+			const jev=d?`jev ${d.command}=${d.decision}${d.overridden?" (overridden)":""}`:`jev ${r.mode}${r.overridden?" (overridden)":""}`;
+			console.log([r.slug.padEnd(22),r.mode.padEnd(10),(size?"reported":"working").padEnd(9),jev.padEnd(28),r.space,"cwd="+r.cwd].join(" "));
+		}' "$DELEGATIONS" "$DECISIONS"
+}
+
+cmd_close() {
+	local slug=${1:-}
+	[ -n "$slug" ] || die 'usage: delegate close <slug>'
+	[ -f "$DELEGATIONS" ] || die "no such worker: $slug"
+	local space
+	space=$(node -e '
+		const fs=require("fs");let j={};try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"))}catch{}
+		process.stdout.write(j[process.argv[2]]?.space||"")' "$DELEGATIONS" "$slug")
+	[ -n "$space" ] || die "no such worker: $slug"
+	herdr-app do space.close --id "$space" --confirmed true >/dev/null 2>&1 \
+		|| printf '%s: warning: space.close failed for %s\n' "$prog" "$space" >&2
+	node -e '
+		const fs=require("fs");let j={};try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"))}catch{}
+		delete j[process.argv[2]];
+		fs.writeFileSync(process.argv[1],JSON.stringify(j,null,2)+"\n");' "$DELEGATIONS" "$slug"
+	printf '{"closed":"%s","space":"%s"}\n' "$slug" "$space"
+}
+
+# Dispatch only when executed: sourcing this file just gives you the functions.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+	case ${1:-} in
+	spawn) shift; cmd_spawn "$@" ;;
+	wait) shift; cmd_wait "$@" ;;
+	list | ls) cmd_list ;;
+	close) shift; cmd_close "$@" ;;
+	*) die 'usage: delegate spawn|wait|list|close ...' ;;
+	esac
+fi

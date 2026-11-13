@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Worker mode: bare. Host access, no sandbox, no network restrictions.
+# Only when Jev says the work needs what the sandbox refuses.
+set -uo pipefail
+exec env PI_BARE=1 "${PI_BIN_PATH:-/home/mark/.local/share/pnpm/bin/pi}" "$@"
