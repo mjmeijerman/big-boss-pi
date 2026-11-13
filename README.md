@@ -12,9 +12,9 @@ copy: read-only during the transition, deleted only when the user says so.
 | piece | path | why there |
 |---|---|---|
 | The rules every agent here loads | `/home/mark/big-boss-pi/AGENTS.md` | Pi loads `AGENTS.md` from the working directory and every parent, on every start, with no project trust needed. New or reloaded agents therefore start with the same knowledge |
-| Decision model | `bin/jev` → `~/.local/bin/jev` | local qwen3.8:27b on ollama; decides worker count, mode, route, and permissions |
+| Decision model | `bin/jev` → `~/.local/bin/jev` | local qwen3.8:27b on ollama; decides worker count, mode, route, thinking effort, and permissions |
 | Local worker | `bin/local-run` | runs a local task on the same model, headless: prompt in, answer on stdout, no space and no state |
-| Delegation | `bin/delegate` → `~/.local/bin/delegate` | asks Jev for mode and count, creates a Herdr space per worker, writes the spec, records where the report lands, appends every decision to `state/decisions.jsonl`; `delegate sweep` closes the workers that finished |
+| Delegation | `bin/delegate` → `~/.local/bin/delegate` | asks Jev for mode, count, route and thinking effort, creates a Herdr space per worker, writes the spec, records where the report lands, appends every decision to `state/decisions.jsonl`; `delegate sweep` closes the workers that finished |
 | Worker modes | `bin/pi-bare`, `bin/pi-sandboxed`, `bin/pi-nonet` | `delegate` picks one from Jev's answer |
 | Never-closable space | `bin/guard` → `~/.local/bin/big-boss-pi-guard` + `~/.config/systemd/user/big-boss-pi-guard.service` | polls `herdr-app ls`; recreates the `big-boss-pi` space if it disappears, selects it once when Herdr starts. It never recreates a space named `pi-master` |
 | Delegation-only enforcement | `~/.pi/agent/extensions/big-boss-pi-guard.ts` | blocks the `write` and `edit` tools, and shell writes into the directory (`echo x > …`, `rm/mv/cp/tee/sed -i`), when the session's cwd is under `/home/mark/big-boss-pi` **or** `/home/mark/pi-master`; no-ops everywhere else, including for a worker session (`PI_WORKER=1`) |
@@ -50,15 +50,40 @@ jev route "add retries to the fetch client"              # → remote (exit 1)
 
 ## Jev gates every delegation
 
-`delegate spawn` asks Jev three times on every run — `jev count`, `jev mode` and `jev route` —
-for the exact task text. A `--mode` from the caller is accepted only when it matches Jev's answer. A different one
-aborts the spawn and prints Jev's answer and its reason; overturning it needs
-`--override-jev --reason '<why>'`, and the override is recorded. If Jev is unreachable or
-answers "unsure", the spawn stops instead of guessing, because that call belongs to the user.
+`delegate spawn` asks Jev four times on every run — `jev count`, `jev mode`, `jev route` and
+`jev thinking` — for the exact task text. A `--mode` or `--thinking` from the caller is
+accepted only when it matches Jev's answer. A different one aborts the spawn and prints Jev's
+answer and its reason; overturning it needs `--override-jev --reason '<why>'`, and the
+override is recorded. If Jev is unreachable or answers "unsure", the spawn stops instead of
+guessing, because that call belongs to the user.
+
+Thinking is split in two, because the two halves are different facts. Jev answers an *effort*
+— `low`, `medium` or `high` — which is a fact about the task. Which levels the worker's model
+supports is a fact about the model, so `bin/delegate` reads it from your pi config:
+`settings.json` names the model a fresh `pi` starts with, and `models.json` or the generated
+`models-store.json` carries that model's `reasoning` flag and `thinkingLevelMap` (`null` marks
+a level the model does not support). The effort goes to the nearest supported level, ties to
+the lower one, and the worker starts with `pi --thinking <level>`. A non-reasoning model gets
+`off`; if the catalogue cannot be read the effort name is passed through and pi clamps it.
+On this machine `deepseek/deepseek-flash` supports `off`, `low`, `high`, `max`, so
+`medium` lands on `low`. The spec header and `delegate list` both show the level.
 
 Each decision is one line in `state/decisions.jsonl`:
-`{"timestamp":…,"command":"mode"|"count"|"route","task":…,"decision":…,"reason":…,"overridden":true|false,"slug":…}`.
-`delegate list` shows the last Jev decision for each worker plus its route.
+`{"timestamp":…,"command":"mode"|"count"|"route"|"thinking"|"ask","task":…,"decision":…,"reason":…,"overridden":true|false,"slug":…}`.
+`delegate list` shows Jev's mode, route and thinking level for each worker.
+
+## Ask Jev before you ask the user
+
+The user is the tie-breaker, not the first responder. `delegate ask "<question>"` puts a
+question to Jev first and records it in the same audit file:
+
+```
+delegate ask "should the retry loop ship as-is?"   # exit 0 yes, 1 no, 3 unsure
+```
+
+Exit 0 or 1 is an answer: act on it and do not interrupt the user. Only exit 3 — Jev unsure, or
+the model unreachable — belongs to the user, and then it carries Jev's reason in one line:
+`jev is unsure — <reason>`. `AGENTS.md` states the rule; the command makes it checkable.
 
 ## Worker spaces close themselves
 

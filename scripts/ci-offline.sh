@@ -64,6 +64,10 @@ expect "jev ask, model down" 3 "decision model unreachable" -- \
 	env JEV_ENDPOINT=$closed "$bin/jev" ask "ship it?"
 expect "jev route, model down" 3 "decision model unreachable" -- \
 	env JEV_ENDPOINT=$closed "$bin/jev" route "summarise this"
+# thinking is the newest decision kind and the one a spawn cannot do without: an unreachable
+# model must stop the spawn, never fall back to a default level.
+expect "jev thinking, model down" 3 "decision model unreachable" -- \
+	env JEV_ENDPOINT=$closed "$bin/jev" thinking "rename a helper"
 # local-run reports on stderr and exits 1: no answer is not the same as "ask the user".
 expect "local-run, model down" 1 "local model unreachable" -- \
 	env JEV_ENDPOINT=$closed "$bin/local-run" "say hi"
@@ -80,6 +84,8 @@ expect "delegate, missing --cwd" 1 "spawn needs --cwd" -- \
 	env PATH=$safe_path "$bin/delegate" spawn "good-slug" "do a thing"
 expect "delegate, no such directory" 1 "no such directory" -- \
 	env PATH=$safe_path "$bin/delegate" spawn "good-slug" --cwd "$work/nope" "do a thing"
+expect "delegate, bad thinking level" 1 "thinking must be off" -- \
+	env PATH=$safe_path "$bin/delegate" spawn "good-slug" --cwd "$work" --thinking louder "do a thing"
 expect "delegate, no subcommand" 1 "usage: delegate" -- \
 	env PATH=$safe_path "$bin/delegate"
 
