@@ -121,6 +121,9 @@ then close once it is answered. Every other report is relayed and its space clos
    slug, never a task dropped into the finished one.
 8. Ask Jev before the user: `delegate ask "<question>"`. Yes or no from Jev is the answer —
    act on it quietly. Only unsure or unreachable reaches the user, carrying Jev's reason.
+9. Every change lands as a pull request. A worker pushes its branch and opens a PR before **you**
+   call the work done, the PR body states the review tier, the worker never merges its own
+   branch, and you relay the PR URL. A change with no PR is unfinished.
 
 ## Layout
 

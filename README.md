@@ -87,6 +87,11 @@ the model unreachable — belongs to the user, and then it carries Jev's reason 
 
 ## Worker spaces close themselves
 
+Every worker branch ends in a pull request: the worker pushes its branch and runs
+`gh pr create --base main` with the review tier in the body, and never merges it. The report
+carries the PR URL so the boss can relay it. A change with no PR is unfinished, however green it
+looks locally — merging stays the human's call.
+
 A worker space is not kept around for browsing. The flow is: the worker writes
 `reports/<slug>.md` and stays idle, the agent relays the report to the user, and the space is
 closed right away — `delegate close <slug>` for one worker, `delegate sweep` for all of them.
