@@ -17,7 +17,7 @@ copy: read-only during the transition, deleted only when the user says so.
 | Delegation | `bin/delegate` → `~/.local/bin/delegate` | asks Jev for mode and count, creates a Herdr space per worker, writes the spec, records where the report lands, appends every decision to `state/decisions.jsonl` |
 | Worker modes | `bin/pi-bare`, `bin/pi-sandboxed`, `bin/pi-nonet` | `delegate` picks one from Jev's answer |
 | Never-closable space | `bin/guard` → `~/.local/bin/big-boss-pi-guard` + `~/.config/systemd/user/big-boss-pi-guard.service` | polls `herdr-app ls`; recreates the `big-boss-pi` space if it disappears, selects it once when Herdr starts. It never recreates a space named `pi-master` |
-| Delegation-only enforcement | `~/.pi/agent/extensions/big-boss-pi-guard.ts` | blocks the `write` and `edit` tools, and shell writes into the directory (`echo x > …`, `rm/mv/cp/tee/sed -i`), when the session's cwd is under `/home/mark/big-boss-pi` **or** `/home/mark/pi-master`; no-ops everywhere else |
+| Delegation-only enforcement | `~/.pi/agent/extensions/big-boss-pi-guard.ts` | blocks the `write` and `edit` tools, and shell writes into the directory (`echo x > …`, `rm/mv/cp/tee/sed -i`), when the session's cwd is under `/home/mark/big-boss-pi` **or** `/home/mark/pi-master`; no-ops everywhere else, including for a worker session (`PI_WORKER=1`) |
 | Rollback helper | `bin/finish-rename.sh` | closes the old `pi-master` space on request and prints how to delete the old tree. Runs nothing by default |
 
 ## Paths and the environment variable
@@ -74,6 +74,12 @@ It covers the `write`/`edit` tools and the obvious shell writes into the directo
 rule, not a sandbox: a program the agent runs (a script, a package manager) can still write
 there, and the workspace agent runs bare because it must reach the Herdr sockets. The point is
 that delegation is the path of least resistance, and a direct file edit fails loudly.
+
+The guard covers the **boss session**, not the worker it spawned. `bin/pi-bare`,
+`bin/pi-sandboxed` and `bin/pi-nonet` export `PI_WORKER=1` into the worker's environment, and
+the guard returns early for such a session: a worker writes in the workspace it was given,
+including `/home/mark/big-boss-pi` and its `specs`/`reports`. A session without `PI_WORKER` is
+the boss and stays guarded exactly as before.
 
 ## Daily use
 
