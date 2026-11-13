@@ -1,0 +1,22 @@
+# Copied from ~/.config/systemd/user/big-boss-pi-guard.service and enabled by the
+# pi installer at ~/.pi/install.sh. Edit here, then reinstall; the installed copy
+# is generated, so hand edits to it are lost.
+[Unit]
+Description=big-boss-pi workspace guard — keeps the big-boss-pi Herdr space alive and opens it on start
+Documentation=file://%h/big-boss-pi/README.md
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=DISPLAY=:1
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=XAUTHORITY=%h/.Xauthority
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin:%h/.local/share/pnpm/bin
+Environment=PI_BOSS_ROOT=%h/big-boss-pi
+ExecStart=%h/big-boss-pi/bin/guard
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
