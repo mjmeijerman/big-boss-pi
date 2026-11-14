@@ -9,6 +9,13 @@
  * The point is the last line. Until now "is the local model used" could only be inferred from
  * the absence of something else; state/usage.jsonl makes it a count.
  *
+ * The review queue is the other number worth having: how many workers have reported and nobody has
+ * read the report, and how old the oldest one is. It is current state, not a windowed count — an
+ * unread report from three days ago is exactly the problem — so it reads state/delegations.json and
+ * state/read/ directly and ignores --since. Age is the report file's mtime: when the worker wrote
+ * it. That is the queue the in-flight cap in `delegate spawn` protects, made visible without gh and
+ * without the network.
+ *
  * Both files are read defensively: a line that is not JSON is skipped and counted, a missing
  * file is an empty one, and a row written before a field existed is read without it. Older
  * decision rows carry a spawn-wide `overridden` flag (see `delegate spawn`); those rows are
@@ -27,6 +34,8 @@ const ROOT =
 	path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DECISIONS = path.join(ROOT, "state", "decisions.jsonl");
 const USAGE = path.join(ROOT, "state", "usage.jsonl");
+const DELEGATIONS = path.join(ROOT, "state", "delegations.json");
+const READ_MARKS = path.join(ROOT, "state", "read");
 
 const UNITS = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
 const DEFAULT_WINDOW = "7d";
@@ -121,8 +130,10 @@ function collect(sinceMs, windowLabel) {
 	// overturned, and it now carries jev's original answer in `jev`). A row without `jev`
 	// predates that fix and its flag is spawn-wide, so it is counted, not re-read. The
 	// obviously-wrong ones are named: a route jev answered remote was never an override.
+	// An `in-flight` line records the spawn cap, not a jev answer, so it has no `jev` field by
+	// design and is never a legacy row.
 	const overridden = dRows.filter((r) => r.overridden === true);
-	const legacy = overridden.filter((r) => r.jev === undefined);
+	const legacy = overridden.filter((r) => r.jev === undefined && r.command !== "in-flight");
 	const legacySuspect = legacy.filter((r) => r.command === "route" && r.decision === "remote");
 
 	// Usage rows: the local model calls themselves. Old files may predate `kind`, so a row
@@ -134,6 +145,32 @@ function collect(sinceMs, windowLabel) {
 	const runLatencies = okRuns.map((r) => Number(r.latency_ms)).filter((v) => Number.isFinite(v));
 	const jevLatencies = jevCalls.filter((r) => r.ok === true).map((r) => Number(r.latency_ms));
 	const lastRun = runs.length ? runs[runs.length - 1].ts || runs[runs.length - 1].timestamp || null : null;
+
+	// The review queue: reported workers whose report no read marker covers. See the header.
+	const unread = [];
+	let delegations = {};
+	try {
+		delegations = JSON.parse(fs.readFileSync(DELEGATIONS, "utf8")) || {};
+	} catch {
+		delegations = {};
+	}
+	for (const [slug, entry] of Object.entries(delegations)) {
+		const report = entry && entry.report;
+		if (!slug || !report) continue;
+		let st;
+		try {
+			st = fs.statSync(report);
+		} catch {
+			continue; // no report yet: still working, not unread
+		}
+		if (!st.size) continue;
+		try {
+			fs.statSync(path.join(READ_MARKS, slug));
+			continue; // marked read
+		} catch {}
+		unread.push({ slug, report, age_seconds: Math.max(0, Math.round((now - st.mtimeMs) / 1000)) });
+	}
+	unread.sort((a, b) => b.age_seconds - a.age_seconds);
 
 	return {
 		window: { since: new Date(cutoff).toISOString(), until: new Date(now).toISOString(), duration: windowLabel },
@@ -177,6 +214,12 @@ function collect(sinceMs, windowLabel) {
 				? `local work path: ${runs.length} invocation${runs.length === 1 ? "" : "s"} (last: ${lastRun})`
 				: "local work path: never used",
 		},
+		review_queue: {
+			unread_reports: unread.length,
+			oldest_age_seconds: unread.length ? unread[0].age_seconds : null,
+			oldest_slug: unread.length ? unread[0].slug : null,
+			unread: unread.map((u) => ({ slug: u.slug, age_seconds: u.age_seconds, report: u.report })),
+		},
 		usage: { rows: uRows.length, unreadable: usage.unreadable },
 	};
 }
@@ -189,11 +232,19 @@ function render(stats) {
 		return entries.length ? entries.map(([k, v]) => `${k} ${v}`).join("  ") : "none";
 	};
 	const ms = (v) => (v === null || v === undefined ? "—" : `${(v / 1000).toFixed(1)}s`);
+	// Seconds to something a reader can compare with a workday: m under 90 minutes, h above.
+	const age = (v) =>
+		v === null || v === undefined ? "—" : v < 90 ? `${v}s` : v < 5400 ? `${Math.round(v / 60)}m` : `${(v / 3600).toFixed(1)}h`;
+	const q = stats.review_queue;
+	const queueLine = q.unread_reports
+		? `review queue: ${q.unread_reports} unread report${q.unread_reports === 1 ? "" : "s"} (oldest ${age(q.oldest_age_seconds)}, ${q.oldest_slug})`
+		: "review queue: 0 unread reports";
 
 	out.push(`window: last ${stats.window.duration} (${stats.window.since} → ${stats.window.until})`);
 	if (!d.total && !stats.usage.rows) {
 		out.push("");
 		out.push("no local model activity in this window");
+		out.push(queueLine);
 		out.push(stats.local_work_path.summary);
 		return out.join("\n");
 	}
@@ -218,6 +269,7 @@ function render(stats) {
 		`local-run:         ${stats.local_run.invocations} invocations, ${stats.local_run.ok} ok, ${stats.local_run.failed} failed — total ${ms(stats.local_run.total_latency_ms)}, median ${ms(stats.local_run.median_latency_ms)}`,
 	);
 	out.push("");
+	out.push(queueLine);
 	out.push(stats.local_work_path.summary);
 	return out.join("\n");
 }

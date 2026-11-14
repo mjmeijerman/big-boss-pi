@@ -25,6 +25,15 @@
 # "DECISION NEEDED: <question>": that marker keeps the space open until the user answers.
 # `delegate sweep` applies exactly that rule to every tracked worker in one go.
 #
+# Work in flight is capped by review, not by generation. A report is "read" once something marks
+# it so: `delegate wait` and `delegate close` write state/read/<slug> as they print or check the
+# report, and nothing else does. While a reported worker in a --cwd still has no marker, the boss
+# has not looked at what already landed there, so `delegate spawn` refuses a second worker in that
+# same cwd and names the queue; --override-jev --reason '<why the queue can wait>' goes through
+# and lands as a command "in-flight" line in state/decisions.jsonl. Generation outrunning review
+# is invisible until it is counted, which is why `delegate stats` prints the unread queue and the
+# age of its oldest report with no network and no gh.
+#
 # Between features there is one more step, and `delegate close` enforces it: `delegate wipe
 # <slug>` prints the five consolidation questions — what did this feature make unnecessary, what
 # is duplicated, could the next feature land in this area in 30 minutes, what did we learn, what
@@ -101,6 +110,7 @@ SPECS=$ROOT/specs
 REPORTS=$ROOT/reports
 DELEGATIONS=$STATE/delegations.json
 DECISIONS=$STATE/decisions.jsonl
+READ_MARKS=$STATE/read
 
 prog=delegate
 die() { printf '%s: error: %s\n' "$prog" "$*" >&2; exit 1; }
@@ -119,6 +129,36 @@ report_needs_decision() {
 	local report=${1:-}
 	[ -f "$report" ] || return 1
 	head -n 20 -- "$report" | grep -qiE '^[[:space:]]*[*_>#-]*[[:space:]]*decision needed[[:space:]]*:'
+}
+
+# mark_read <slug> -- records that reports/<slug>.md has been read: one empty file per worker in
+# state/read/. It is the only thing that clears the in-flight block in cmd_spawn, so the two
+# writing commands are the ones that actually show the boss the report: `delegate wait` (it prints
+# it) and `delegate close` (it checks it). A marker is a fact on disk, not a memory: the boss
+# cannot be asked to remember which report it already relayed.
+mark_read() {
+	mkdir -p "$READ_MARKS"
+	: >"$READ_MARKS/$1"
+}
+
+# unread_reports_in <cwd> -- one line per tracked worker in <cwd> whose report exists, has
+# content, and has no read marker: "<slug> <age-seconds> <report>". Age is the report's mtime,
+# the moment the worker wrote it. Empty output means nothing in that area is waiting to be read.
+# A worker with no report is still working, not unread, so it never blocks.
+unread_reports_in() {
+	[ -f "$DELEGATIONS" ] || return 0
+	node -e '
+		const fs = require("fs"), path = require("path");
+		let j = {}; try { j = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch {}
+		const marks = process.argv[2], cwd = path.resolve(process.argv[3]), now = Date.now();
+		for (const slug of Object.keys(j)) {
+			const r = j[slug] || {};
+			if (!r.report || path.resolve(String(r.cwd || "")) !== cwd) continue;
+			let st; try { st = fs.statSync(r.report); } catch { continue; }
+			if (!st.size) continue;
+			if (fs.existsSync(path.join(marks, slug))) continue;
+			process.stdout.write([slug, Math.max(0, Math.round((now - st.mtimeMs) / 1000)), r.report].join(" ") + "\n");
+		}' "$DELEGATIONS" "$READ_MARKS" "$1"
 }
 
 # report_has_evidence <report> -- true when the report carries an Evidence heading with at
@@ -551,6 +591,24 @@ Forcing a remote worker needs --override-jev --reason '<why this cannot run loca
 		say "jev: this task wants $jev_count workers ($count_reason); spawning one now" >&2
 	fi
 
+	# 4b. Review sets the pace, not generation. A reported worker in this same cwd whose report has
+	#     no read marker means the boss has not looked at what already landed here; a second worker
+	#     in that area is generation outrunning the person who has to check it. Refuse, and print
+	#     the queue: the age is what makes it a queue and not a list.
+	local unread queue
+	unread=$(unread_reports_in "$cwd")
+	if [ -n "$unread" ]; then
+		queue=$(printf '%s\n' "$unread" | awk '{printf "%s%s (reported %ss ago, %s)", sep, $1, $2, $3; sep="; "}')
+		if [ "$override_jev" != 1 ]; then
+			record_decision in-flight "$task" blocked "$queue" false "-"
+			die "refusing to spawn in $cwd: a report there is still unread — $queue
+Review sets the pace, not generation. Read it, then spawn again:  $BIN/delegate wait <slug>  marks the report read as it prints it.
+Forcing a second worker in the same area needs --override-jev --reason '<why the queue can wait>'."
+		fi
+		record_decision in-flight "$task" override "$reason — blocked by: $queue" true "$slug"
+		printf '%s: note: an unread report is still open in %s (%s); spawning because --override-jev --reason was given.\n' "$prog" "$cwd" "$queue" >&2
+	fi
+
 	# 5. Guarantee the base before anything is created. The fetch works here and not inside a
 	#    sandboxed worker, so the worker's trunk is fresh by construction, not by hope.
 	ensure_fresh_trunk "$cwd"
@@ -706,6 +764,8 @@ cmd_wait() {
 		if [ -s "$report" ]; then
 			say "== $slug reported =="
 			cat "$report"
+			# Printing the report is reading it: the marker clears this cwd's in-flight block.
+			mark_read "$slug"
 			say ""
 			if report_needs_decision "$report"; then
 				say "$slug asks the user for a decision. Relay the question, and close the space once it is answered:"
@@ -889,6 +949,10 @@ cmd_close() {
 			return 1
 		fi
 	fi
+
+	# The report has been read and checked by the time a close gets here: mark it, so a cwd whose
+	# worker just closed is free for the next one.
+	mark_read "$slug"
 
 	if ! wipe_recorded "$slug"; then
 		printf '%s: refusing to close %s: no wipe step recorded for it.\n' "$prog" "$slug" >&2
