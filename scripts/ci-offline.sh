@@ -363,6 +363,8 @@ expect "delegate close, no wipe step recorded" 1 "no wipe step recorded" -- \
 expect "delegate wipe, no slug" 1 "usage: delegate wipe" -- \
 	env PI_BOSS_ROOT=$wipe_root "$bin/delegate" wipe
 
+expect "futures panel: thrown away, cycles, evidence" 0 "futures stats: ok" -- \
+	bash "$root/scripts/test-futures-stats.sh"
 expect "acceptance mode, flag, generated spec and recorded mode" 0 "acceptance mode: ok" -- \
 	bash "$root/scripts/test-acceptance.sh"
 
