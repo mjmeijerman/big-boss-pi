@@ -127,6 +127,12 @@ expect "wipe checklist, refusal and skip log" 0 "wipe: ok" -- \
 #     and a temporary root, so nothing here touches the real workspace.
 expect "provenance trailers, spec archive and PR template" 0 "provenance: ok" -- \
 	bash "$root/scripts/test-provenance.sh"
+# 5e. The guard's repair path (Radar blip 20): a stale tab is resumed from its resume entry when
+#     it has one, and only opened fresh when it never held pi — or when the resume did not start
+#     pi. Fake herdr-app, fake resume map, fake resume script; no desktop app, no session, no
+#     real space.
+expect "guard resumes before it reopens a tab" 0 "guard-resume: ok" -- \
+	bash "$root/scripts/test-guard-resume.sh"
 
 # 6. Routing is a refusal, not a warning. delegate reads jev from $PI_BOSS_ROOT/bin, so a
 #    fake jev there answers route=local without a model and without touching the real tree.

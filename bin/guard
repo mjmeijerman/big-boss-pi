@@ -8,11 +8,19 @@
 #
 # herdr-core parks kept terminals and gives them a shell on the next start, so a restart leaves
 # the space with its tabs ("master", "Pi (bare)") and no agents in them: tabs that say Pi over
-# a prompt. ensure() repairs those. A tab whose terminals are no longer pi is closed and opened
-# again with an absolute argv, so the core can restart it later — the holder's PATH has no pnpm
-# bin dir, so a bare `pi-bare` cannot be restarted. A live pi tab is never touched, one repair a
-# minute per tab keeps a pi that exits at once from becoming a spawn loop, every repair is
-# logged, and the person's space and tab are put back afterwards.
+# a prompt. ensure() repairs those.
+#
+# A repair prefers the session that was there. Every hc terminal that ran pi has a resume entry in
+# ~/.pi/agent/herdr-resume/<terminal>.json (agent/extensions/herdr-resume-map.ts), and
+# ~/.pi/scripts/herdr-resume.mjs knows how to type `exec <argv> --session <path>` back into the
+# recovered shell. So a stale tab with an entry is resumed — same conversation, same tab — and only
+# a tab that never held pi (no entry) is closed and opened again with an absolute argv, so the core
+# can restart it later: the holder's PATH has no pnpm bin dir, so a bare `pi-bare` cannot be
+# restarted. A resume that does not end with pi running falls back to that same reopen.
+#
+# A live pi tab is never touched, one repair a minute per tab keeps a pi that exits at once from
+# becoming a spawn loop, every repair is logged with the path it took (resumed terminal tN vs
+# opened a new pi), and the person's space and tab are put back afterwards.
 #
 # This guard only ever looks for, creates, selects and repairs the space named big-boss-pi.
 # A space named pi-master belongs to the old workspace: it is never touched from here.
@@ -27,6 +35,12 @@ STATE=$ROOT/state
 LOG=$STATE/guard.log
 SPACE_STATE=$STATE/space.json
 REPAIRS=$STATE/repairs
+# The resume map and its script live in ~/.pi. Both are overridable so a test can supply a fake
+# map and a fake script instead of a desktop app and a real session.
+RESUME_SCRIPT=${PI_BOSS_RESUME_SCRIPT:-${HOME:-}/.pi/scripts/herdr-resume.sh}
+RESUME_FALLBACK=${HOME:-}/.pi/scripts/herdr-resume.mjs
+RESUME_DIR=${PI_BOSS_RESUME_DIR:-${PI_HERDR_RESUME_DIR:-${HOME:-}/.pi/agent/herdr-resume}}
+RESUME_TIMEOUT=${PI_BOSS_RESUME_TIMEOUT:-45}
 INTERVAL=${PI_BOSS_GUARD_INTERVAL:-${PI_MASTER_GUARD_INTERVAL:-5}}
 # A tab is opened again at most once a minute, so a pi that dies on start is one repair a
 # minute and not five a second.
@@ -126,9 +140,11 @@ restore_focus() {
 	return 0
 }
 
-# stale_tabs <space id> — from a `herdr-app ls` snapshot on stdin, print "tab<TAB>name<TAB>index"
-# for every tab of that space whose terminals are all something other than pi. A tab with no
-# terminal is a mod, not a lost agent. A tab that still holds a live pi is left alone.
+# stale_tabs <space id> — from a `herdr-app ls` snapshot on stdin, print
+# "tab<TAB>name<TAB>index<TAB>terminal" for every tab of that space whose terminals are all
+# something other than pi. The terminal id is the key the resume map is written under
+# (agent/extensions/herdr-resume-map.ts), so the repair has to carry it. A tab with no terminal
+# is a mod, not a lost agent. A tab that still holds a live pi is left alone.
 stale_tabs() {
 	SPACE_ID=$1 node -e '
 		let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
@@ -139,9 +155,69 @@ stale_tabs() {
 				const ts=t.terminals||[];
 				if(!ts.length)return;
 				if(ts.some(x=>x&&x.app==="pi"))return;
-				process.stdout.write([t.id,t.name===null||t.name===undefined?"":t.name,i+1].join("\t")+"\n");
+				const terminal=ts[0]&&ts[0].id?ts[0].id:"";
+				process.stdout.write([t.id,t.name===null||t.name===undefined?"":t.name,i+1,terminal].join("\t")+"\n");
 			});
 		})'
+}
+
+# tab_holds_pi <space> <tab> — true when one of that tab's terminals is pi again, read from a
+# fresh `herdr-app ls` snapshot on stdin. What a resume is worth is what the app reports, not
+# what the resume script printed.
+tab_holds_pi() {
+	SPACE_ID=$1 TAB_ID=$2 node -e '
+		let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+			let j={};try{j=JSON.parse(d)}catch{process.exit(1)}
+			const sp=(j.spaces||[]).find(s=>s.id===process.env.SPACE_ID);
+			if(!sp)process.exit(1);
+			const hit=(sp.tabs||[]).find(t=>t.id===process.env.TAB_ID);
+			if(!hit)process.exit(1);
+			process.exit((hit.terminals||[]).some(x=>x&&x.app==="pi")?0:1);
+		})'
+}
+
+# resume_entry <terminal> — the resume-map file for that terminal, or nothing. Its existence is
+# the only evidence that this terminal ever held pi: a tab that never held pi has no entry and
+# must be opened fresh, not resumed.
+resume_entry() {
+	local file
+	[ -n "$1" ] || return 1
+	file=$RESUME_DIR/$(printf '%s' "$1" | sed 's/[^A-Za-z0-9_.-]/_/g').json
+	[ -f "$file" ] || return 1
+	printf '%s' "$file"
+}
+
+# resume_entries — run ~/.pi's resume script for every entry it has. The script already decides
+# per terminal: it skips a busy terminal, a terminal whose pi exited on its own, a session file
+# that is gone, and an entry it restored in this boot, and it never starts a second pi. The waits
+# are shortened so a repair cannot stall the poll, and the whole call is bounded.
+resume_entries() {
+	local script=$RESUME_SCRIPT runner
+	[ -f "$script" ] || script=$RESUME_FALLBACK
+	[ -f "$script" ] || { printf 'no resume script at %s or %s' "$RESUME_SCRIPT" "$RESUME_FALLBACK"; return 1; }
+	if [ -x "$script" ]; then
+		runner=$script
+	else
+		command -v node >/dev/null 2>&1 || { printf 'node not found; cannot run %s' "$script"; return 1; }
+		runner=node
+	fi
+	if ! command -v timeout >/dev/null 2>&1; then
+		# Without timeout the script's own waits still bound it: a few seconds per entry.
+		RESUME_TIMEOUT=0
+	fi
+	if [ "$RESUME_TIMEOUT" = 0 ]; then
+		env PI_HERDR_RESUME_WAIT_MS="${PI_HERDR_RESUME_WAIT_MS:-5000}" \
+			PI_HERDR_RESUME_ENTRY_MS="${PI_HERDR_RESUME_ENTRY_MS:-3000}" \
+			PI_HERDR_RESUME_START_MS="${PI_HERDR_RESUME_START_MS:-8000}" \
+			PI_HERDR_RESUME_DIR="$RESUME_DIR" \
+			"$runner" "$script" 2>&1
+		return 0
+	fi
+	env PI_HERDR_RESUME_WAIT_MS="${PI_HERDR_RESUME_WAIT_MS:-5000}" \
+		PI_HERDR_RESUME_ENTRY_MS="${PI_HERDR_RESUME_ENTRY_MS:-3000}" \
+		PI_HERDR_RESUME_START_MS="${PI_HERDR_RESUME_START_MS:-8000}" \
+		PI_HERDR_RESUME_DIR="$RESUME_DIR" \
+		timeout "$RESUME_TIMEOUT" "$runner" "$script" 2>&1
 }
 
 # repair_key <space id> <name> <index> — what the rate limit is counted on. The tab id changes
@@ -174,15 +250,33 @@ kickoff_later() {
 	) &
 }
 
-# repair_tab <space> <tab> <name> <index> — returns 0 only when it repaired the tab. Opens the
-# replacement first and closes the stale tab after: closing a space's only tab would end the
-# space, and a failed open leaves the person with what they had. Same name, same place, and an
-# absolute argv so the holder can restart it. The boss tab (master) resumes the session and gets
-# the kickoff message again.
+# repair_tab <space> <tab> <name> <index> <terminal> — returns 0 only when it repaired the tab.
+# Two paths, in this order:
+#   1. the terminal has a resume entry — run the resume script, then believe what herdr-app says:
+#      pi running again means the tab kept its conversation and nothing is opened or closed;
+#   2. no entry, or the resume did not put pi back — open the replacement first and close the
+#      stale tab after: closing a space's only tab would end the space, and a failed open leaves
+#      the person with what they had. Same name, same place, and an absolute argv so the holder
+#      can restart it. The boss tab (master) gets the kickoff message again.
 repair_tab() {
-	local space=$1 tab=$2 name=$3 index=$4 boss=0 argv out new_terminal args=()
-	repaired_recently "$(repair_key "$space" "$name" "$index")" && return 1
+	local space=$1 tab=$2 name=$3 index=$4 terminal=${5:-} boss=0 argv out new_terminal args=() key entry
+	key=$(repair_key "$space" "$name" "$index")
+	repaired_recently "$key" && return 1
 	[ "$name" = master ] && boss=1
+
+	if entry=$(resume_entry "$terminal"); then
+		local resumed
+		resumed=$(resume_entries)
+		mark_repaired "$key"
+		if printf '%s' "$(herdr-app ls 2>/dev/null)" | tab_holds_pi "$space" "$tab"; then
+			log "resumed terminal \`$terminal\` in tab $name ($tab) from $entry; the tab keeps its session, nothing was opened or closed"
+			return 0
+		fi
+		log "could not resume terminal \`$terminal\` in tab $name ($tab); opening a new pi instead: $(printf '%s' "$resumed" | tail -n 2 | tr '\n' ' ')"
+	else
+		log "tab $name ($tab) opened fresh: terminal \`${terminal:-unknown}\` has no entry in $RESUME_DIR, so it never held pi"
+	fi
+
 	argv=$(pi_argv "$boss")
 	[ -n "$name" ] && args+=(--name "$name")
 	out=$(herdr-app do tab.new --space "$space" "${args[@]}" --folder "$ROOT" --argv "$argv" 2>&1)
@@ -192,8 +286,8 @@ repair_tab() {
 		log "could not open a replacement for the stale tab $name ($tab): $out"
 		return 1
 	fi
-	mark_repaired "$(repair_key "$space" "$name" "$index")"
-	log "repaired tab $name ($tab -> terminal \`$new_terminal\`): its terminal was not pi, opened $argv"
+	mark_repaired "$key"
+	log "opened a new pi in tab $name ($tab -> terminal \`$new_terminal\`) with $argv"
 	out=$(herdr-app do tab.close --id "$tab" --confirmed true 2>&1) ||
 		log "could not close the stale tab $name ($tab); it is still open beside \`$new_terminal\`: $out"
 	herdr-app do tab.move --id "$new_terminal" --index "$index" >/dev/null 2>&1
@@ -208,9 +302,9 @@ repair_stale_tabs() {
 	stale=$(printf '%s' "$snapshot" | stale_tabs "$space") || return 0
 	[ -n "$stale" ] || return 0
 	before=$(screen_state)
-	while IFS=$'\t' read -r tab name index; do
+	while IFS=$'\t' read -r tab name index terminal; do
 		[ -n "$tab" ] || continue
-		repair_tab "$space" "$tab" "$name" "$index" && touched=1
+		repair_tab "$space" "$tab" "$name" "$index" "$terminal" && touched=1
 	done <<<"$stale"
 	[ "$touched" = 1 ] || return 0
 	if [ -n "$before" ]; then

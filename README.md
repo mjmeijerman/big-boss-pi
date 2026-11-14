@@ -16,7 +16,7 @@ copy: read-only during the transition, deleted only when the user says so.
 | Local worker | `bin/local-run` | runs a local task on the same model, headless: prompt in, answer on stdout, no space and no spec; records one line in `state/usage.jsonl` |
 | Delegation | `bin/delegate` → `~/.local/bin/delegate` | asks Jev for mode, count, route and thinking effort, creates a Herdr space per worker, writes the spec, records where the report lands, appends every decision to `state/decisions.jsonl`; `delegate sweep` closes the workers that finished |
 | Worker modes | `bin/pi-bare`, `bin/pi-sandboxed`, `bin/pi-nonet` | `delegate` picks one from Jev's answer |
-| Never-closable space | `bin/guard` → `~/.local/bin/big-boss-pi-guard` + `~/.config/systemd/user/big-boss-pi-guard.service` | polls `herdr-app ls`; recreates the `big-boss-pi` space if it disappears, selects it once when Herdr starts, and reopens a tab whose terminal is no longer pi (herdr-core hands parked terminals a shell on restart) with an absolute argv, at most once a minute per tab and logged in `state/guard.log`. It never touches a space named `pi-master` |
+| Never-closable space | `bin/guard` → `~/.local/bin/big-boss-pi-guard` + `~/.config/systemd/user/big-boss-pi-guard.service` | polls `herdr-app ls`; recreates the `big-boss-pi` space if it disappears, selects it once when Herdr starts, resumes a tab whose terminal is no longer pi from its `~/.pi/agent/herdr-resume/<terminal>.json` entry (`~/.pi/scripts/herdr-resume.sh`), and reopens it with an absolute argv only when there is no entry or the resume did not start pi, at most once a minute per tab and logged in `state/guard.log` with the path it took. It never touches a space named `pi-master` |
 | Delegation-only enforcement | `~/.pi/agent/extensions/big-boss-pi-guard.ts` | blocks the `write` and `edit` tools, and shell writes into the directory (`echo x > …`, `rm/mv/cp/tee/sed -i`), when the session's cwd is under `/home/mark/big-boss-pi` **or** `/home/mark/pi-master`; no-ops everywhere else, including for a worker session (`PI_WORKER=1`) |
 | Rollback helper | `bin/finish-rename.sh` | closes the old `pi-master` space on request and prints how to delete the old tree. Runs nothing by default |
 
@@ -201,12 +201,24 @@ Herdr supports.
 
 The same guard puts the agents back after herdr-core restarts. The core keeps its terminals and
 starts them again as shells, so the space comes back with its tabs ("master", "Pi (bare)") and
-nothing running in them. A tab whose terminals are all something other than pi is reopened in
-place, under its own name, with `sh -lc exec /home/mark/big-boss-pi/bin/pi-bare` — absolute,
-because the holder restarts it from a PATH without the pnpm bin dir. A live pi tab is left alone,
-a tab is reopened at most once a minute (a pi that exits at once must not become a spawn loop),
-and every repair lands in `state/guard.log`. `PI_BOSS_SPACE` points the guard at another space
-name, so the repair can be tried without touching the real one.
+nothing running in them. A repair prefers the session that was there: every hc terminal that ran
+pi has a resume entry in `~/.pi/agent/herdr-resume/<terminal>.json`, and `~/.pi/scripts/herdr-resume.sh`
+(`herdr-resume.mjs`) types `exec <argv> --session <session-file>` back into the recovered shell,
+so the tab keeps its conversation. The guard runs that script, then believes `herdr-app ls`:
+pi running again means the tab is repaired with nothing opened or closed.
+
+Only a tab that has no resume entry — a tab that never held pi — is reopened, in place, under its
+own name, with `sh -lc exec /home/mark/big-boss-pi/bin/pi-bare -a` — absolute, because the holder
+restarts it from a PATH without the pnpm bin dir. The same reopen is the fallback when a resume
+does not put pi back. A live pi tab is left alone, a tab is repaired at most once a minute (a pi
+that exits at once must not become a spawn loop), and every repair lands in `state/guard.log`
+with the path it took: `resumed terminal tN` or `opened a new pi` / `has no entry`.
+`PI_BOSS_SPACE` points the guard at another space name, so a repair can be tried without touching
+the real one; `PI_BOSS_RESUME_SCRIPT` and `PI_BOSS_RESUME_DIR` do the same for the resume map.
+
+`bash scripts/test-guard-resume.sh` drives all five cases against a fake herdr-app, a fake resume
+map and a fake resume script: resume preferred, no entry → fresh tab, failed resume → fresh tab,
+rate limit intact, `pi-master` untouched.
 
 ## What the write guard does and does not cover
 
