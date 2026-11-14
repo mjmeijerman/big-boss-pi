@@ -24,6 +24,14 @@
 # "DECISION NEEDED: <question>": that marker keeps the space open until the user answers.
 # `delegate sweep` applies exactly that rule to every tracked worker in one go.
 #
+# A report is a claim until it carries output. So `delegate close` refuses a report with no
+# `## Evidence` block, or one that still has fill-in placeholders left in it: it prints what is
+# missing and how to fix it, and exits nonzero without closing the space. The worker stays idle
+# and its space stays open, so the evidence is one edit away instead of lost. The spec and
+# report templates say the same thing to the worker, earlier: "should work", "looks correct"
+# and "tests pass" are banned without the output that shows it. Plausible is not working — the
+# genie is plausible by default, so the harness asks for the transcript.
+#
 # Every spawn asks Jev, unconditionally, for the mode, the worker count, the route (local or
 # remote) and the thinking effort. Routing is a refusal, not a warning: a task Jev calls
 # "local" stops the spawn and prints the cheaper bin/local-run command to run instead. A
@@ -102,6 +110,39 @@ report_needs_decision() {
 	local report=${1:-}
 	[ -f "$report" ] || return 1
 	head -n 20 -- "$report" | grep -qiE '^[[:space:]]*[*_>#-]*[[:space:]]*decision needed[[:space:]]*:'
+}
+
+# report_has_evidence <report> -- true when the report carries an Evidence heading with at
+# least one written line under it. A heading with nothing beneath it is the same claim as no
+# heading at all, so an empty block does not count. Both `## Evidence` and `**Evidence**` are
+# read the same way: the heading line, stripped of #, * and spaces, is the word "evidence".
+report_has_evidence() {
+	local report=${1:-}
+	[ -f "$report" ] || return 1
+	awk '
+		{
+			line = $0
+			gsub(/[#*]/, "", line)
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+			if (!inblock) {
+				if (tolower(line) ~ /^evidence([[:space:]]+block)?$/) { inblock = 1; next }
+				next
+			}
+			if (tolower(line) ~ /^(thrown away|what i would do differently)/) exit 1
+			if (line != "") found = 1
+		}
+		END { exit(found ? 0 : 1) }
+	' "$report"
+}
+
+# report_placeholders <report> -- the fill-in placeholders still left in the report, as
+# "LINE:TEXT" lines, empty when the report is written out in full. Narrow on purpose: a report
+# may quote a literal <slug> in a code fence, so only the words that mean "I did not fill this
+# in" are matched, and TODO/TBD/FIXME only as whole words.
+report_placeholders() {
+	local report=${1:-}
+	[ -f "$report" ] || return 0
+	grep -niE '<[[:space:]]*(fill|insert|your|add|paste|todo|tbd)|(^|[^[:alpha:]])(todo|tbd|fixme)([^[:alpha:]]|$)' -- "$report" || true
 }
 
 # ask_jev <mode|count|thinking> <task text> [context] — sets JEV_DECISION and JEV_REASON; dies
@@ -471,9 +512,15 @@ Forcing a remote worker needs --override-jev --reason '<why this cannot run loca
 	cat >"$spec" <<EOF
 # Worker \`$slug\`
 
-You are a worker. Report to the agent in the big-boss-pi workspace that started you; it is
-waiting on \`$report\`.
+You are the genie. Your work is plausible by default. Prove it runs.
 
+Report to the agent in the big-boss-pi workspace that started you; it is waiting on
+\`$report\`.
+
+- **Mission**: who is better off, and how we would see it. One line: the person or system that
+  gains, and the observation that shows the gain. Every effort number (LOC, tokens, files, agent
+  count) is cost, never progress — leave it out of the mission.
+- **Iteration**: expect two or more cycles. You may throw this away.
 - Work in: \`$cwd\`
 - Mode: \`$mode\` (chosen by jev$overridden_note), route: $jev_route (jev), thinking: \`$jev_level\` (jev: $jev_effort)
 - Report file: \`$report\`
@@ -504,14 +551,27 @@ $task
    never upload onto trunk, never commit on trunk. You stay sandboxed: publishing is the boss's
    job, so it never needs host access from you.
 6. When you are done — or blocked and unable to continue — write \`$report\` with:
+   - **Mission**: who is better off now, and how we would see it. The same line the spec gave
+     you, updated with what actually happened. No LOC, no token counts, no file counts, no
+     "N agents": effort is not mission, and output volume is not correctness.
    - what now works, in concrete terms (a command to run, a path, a test that passes)
    - what you changed (branch, commit sha, files), and the PR URL, or the branch to publish
    - what is still open, and the one next action for the person
+   - \`## Evidence\` — mandatory, and the only part a reader has to trust: the exact command
+     you ran and the last 20 lines of its output, pasted in a fenced block. \`delegate close\`
+     refuses a report without this block, so a missing one keeps your space open.
+   - \`## Thrown away\` — what you deleted or rewrote on purpose, and why. A rewrite is a
+     credited outcome, not a confession; "nothing" is a fine answer when it is written down.
+   - \`## What I would do differently next time\` — one or two lines. The next worker reads
+     this one, and a lesson kept costs a line.
    Keep it short. That file is the whole message back; nobody reads your scrollback.
-7. Then write the report and stay idle. Do not close, rename or move the space. The
+7. Never write "should work", "looks correct" or "tests pass" without the output that shows
+   it. If it was not run, write "not run" and what would run it. A claim without output is
+   not a result, and the report is read as a claim until the Evidence block proves it.
+8. Then write the report and stay idle. Do not close, rename or move the space. The
    big-boss-pi agent relays the report and closes the space right away, so a space never stays
    open just because the worker finished.
-8. The one exception, when the user must decide something before work can continue: make the
+9. The one exception, when the user must decide something before work can continue: make the
    first line of the report read "DECISION NEEDED: the question in one line". That marker is
    the only thing that keeps the space open, and only until the user answers.
 EOF
@@ -689,7 +749,7 @@ cmd_close() {
 	local slug=${1:-}
 	[ -n "$slug" ] || die 'usage: delegate close <slug>'
 	[ -f "$DELEGATIONS" ] || die "no such worker: $slug"
-	local space cwd branch meta
+	local space cwd branch meta report
 	meta=$(node -e '
 		const fs=require("fs");let j={};try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"))}catch{}
 		const e=j[process.argv[2]]||{};
@@ -698,6 +758,29 @@ cmd_close() {
 	[ -n "$space" ] || die "no such worker: $slug"
 	cwd=$(printf '%s' "$meta" | json_field cwd)
 	branch=$(printf '%s' "$meta" | json_field branch)
+
+	# Evidence before the space goes: a close is the last moment a claim can be checked, and a
+	# closed worker is not coming back to paste the output. Refuse, name what is missing, and
+	# leave the space open — the fix is one edit to the report, then this command again.
+	report=$REPORTS/$slug.md
+	if [ -s "$report" ]; then
+		if ! report_has_evidence "$report"; then
+			printf '%s: refusing to close %s: %s has no Evidence block, so the report proves nothing.\n' "$prog" "$slug" "$report" >&2
+			printf 'Fix: add a "## Evidence" heading with the exact command you ran and the last 20 lines of its output, then close again:\n' >&2
+			printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
+			return 1
+		fi
+		local placeholders
+		placeholders=$(report_placeholders "$report")
+		if [ -n "$placeholders" ]; then
+			printf '%s: refusing to close %s: %s still has fill-in placeholders.\n' "$prog" "$slug" "$report" >&2
+			printf '%s\n' "$placeholders" | head -n 5 | sed "s|^|  $report:|" >&2
+			printf 'Fix: replace each of them with the real value or delete the line, then close again:\n' >&2
+			printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
+			return 1
+		fi
+	fi
+
 	herdr-app do space.close --id "$space" --confirmed true >/dev/null 2>&1 \
 		|| printf '%s: warning: space.close failed for %s\n' "$prog" "$space" >&2
 	node -e '
@@ -750,7 +833,7 @@ cmd_sweep() {
 			say "closed $slug"
 			closed=$((closed + 1))
 		else
-			say "keep   $slug (close failed, close it by hand)"
+			say "keep   $slug (close refused: the report needs evidence, or has placeholders left)"
 			kept=$((kept + 1))
 		fi
 	done <<<"$slugs"
