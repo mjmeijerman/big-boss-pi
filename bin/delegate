@@ -5,7 +5,7 @@
 #                  [--acceptance] [--override-jev --reason TEXT] [--no-restore] "<task>"
 #   delegate wait <slug> [--timeout SECONDS]
 #   delegate list
-#   delegate close <slug>
+#   delegate close <slug> [--merged PR-URL-OR-NUMBER]
 #   delegate ask "<question>" [--json]
 #   delegate stats [--since DURATION] [--json]
 #   delegate sweep
@@ -60,6 +60,17 @@
 # report templates say the same thing to the worker, earlier: "should work", "looks correct"
 # and "tests pass" are banned without the output that shows it. Plausible is not working — the
 # genie is plausible by default, so the harness asks for the transcript.
+#
+# Provenance is demanded in the shape the commit can still be given it in. A report's commit
+# must carry the `Agent-Slug` trailer, which is one `git commit --amend` away while the branch
+# is unmerged. A commit that is already in trunk cannot be amended — that is a rewrite of
+# trunk — so `delegate close <slug> --merged <pr-url-or-number>` is the documented escape: it
+# re-checks the commit against `origin/<trunk>`, and only when the commit really is an ancestor
+# of it does the close go through, with a warning naming the short sha and the PR and a row in
+# state/decisions.jsonl carrying slug, sha, pr and the reason. Provenance recorded after the
+# fact is visible provenance; a silent pass is not. Without the flag nothing changes, and with
+# the flag on a commit that is not in trunk the refusal is today's plus one line saying why
+# --merged does not apply.
 #
 # Every spawn asks Jev, unconditionally, for the mode, the worker count, the route (local or
 # remote) and the thinking effort. Routing is a refusal, not a warning: a task Jev calls
@@ -278,6 +289,68 @@ wipe_recorded() {
 		process.exit(1);' "$DECISIONS" "$1"
 }
 
+# merged_pr_ref <text> — the PR number in a `--merged` argument, empty when the argument is not
+# a PR reference at all. Three shapes, because that is what people paste: 63, #63, and the URL a
+# PR page sits at. Nothing else is guessed: a branch name or a sha is not evidence of a merge.
+merged_pr_ref() {
+	printf '%s' "${1:-}" | sed -nE \
+		-e 's/^#?([0-9]{1,9})$/#\1/p' \
+		-e 's#^https?://[^/[:space:]]+/[^/[:space:]]+/[^/[:space:]]+/pull/([0-9]{1,9})/?$#\1#p' \
+		| head -n 1
+}
+
+# merged_escape <slug> <sha> <cwd> <pr-arg> — the close path for a commit that is already in trunk,
+# where the Agent-Slug trailer can no longer be added without rewriting trunk.
+#
+# Three outcomes, and the middle one is the only new permission in the whole command:
+#   - no --merged given: today's refusal, verbatim (the caller prints it, this returns 1);
+#   - --merged given but the commit is not an ancestor of origin/<trunk>: refuse, and say why the
+#     flag does not apply, because a flag that quietly does nothing is worse than no flag;
+#   - --merged given and the commit is in origin/<trunk>: close, with a warning naming the short
+#     sha and the PR, and one state/decisions.jsonl row (command "provenance", decision "merged")
+#     carrying slug, sha, pr and the reason. The row is the evidence; the warning is so the person
+#     sees it happened.
+#
+# The trunk side is read from origin/, never from the local branch: a local trunk can be behind or
+# ahead of what was actually merged, and "is this in trunk" has one meaning — the remote's.
+merged_escape() {
+	local slug=$1 sha=$2 cwd=$3 prarg=$4 full trunk short pr reason
+	full=$(git -C "$cwd" rev-parse --verify --quiet "$sha^{commit}" 2>/dev/null) || full=$sha
+	short=$(git -C "$cwd" rev-parse --short "$full" 2>/dev/null) || short=$full
+	if [ -z "$prarg" ]; then
+		printf '%s: refusing to close %s: %s records commit %s, and that commit has no Agent-Slug trailer, so nothing ties the change to this worker.\n' "$prog" "$slug" "$REPORTS/$slug.md" "$sha" >&2
+		printf 'Fix: end that commit'"'"'s message with the two trailers, then close again:\n' >&2
+		printf "  git -C %%q commit --amend --no-edit --trailer 'Agent-Slug: %s' --trailer 'Spec: specs/%s.md'\n" "$slug" "$slug" >&2
+		printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
+		return 1
+	fi
+	pr=$(merged_pr_ref "$prarg")
+	if [ -z "$pr" ]; then
+		die "--merged needs a PR number or a pull-request URL (63, #63, https://<host>/<owner>/<repo>/pull/63): '$prarg'"
+	fi
+	trunk=$(fresh_trunk_branch "$cwd")
+	if [ -z "$trunk" ]; then
+		printf '%s: refusing to close %s: %s records commit %s with no Agent-Slug trailer, and --merged does not apply: %s has no origin/trunk, origin/main or origin/master, so there is no trunk to check that commit against.\n' \
+			"$prog" "$slug" "$REPORTS/$slug.md" "$sha" "$cwd" >&2
+		printf 'Fix: fetch the remote first (%s), or amend the commit with its trailers and close again.\n' "git -C $cwd fetch origin" >&2
+		return 1
+	fi
+	if ! git -C "$cwd" merge-base --is-ancestor "$full" "refs/remotes/origin/$trunk" 2>/dev/null; then
+		printf '%s: refusing to close %s: %s records commit %s with no Agent-Slug trailer, and --merged does not apply: %s is not an ancestor of origin/%s, so it has not landed and can still be amended.\n' \
+			"$prog" "$slug" "$REPORTS/$slug.md" "$sha" "$full" "$trunk" >&2
+		printf 'Fix: amend that commit with its trailers and close again (no rewrite of trunk involved):\n' >&2
+		printf "  git -C %%q commit --amend --no-edit --trailer 'Agent-Slug: %s' --trailer 'Spec: specs/%s.md'\n" "$slug" "$slug" >&2
+		printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
+		return 1
+	fi
+	reason="commit $short carries no Agent-Slug trailer and is already in origin/$trunk, so the trailer cannot be added without rewriting trunk; provenance recorded after the fact from PR $pr"
+	printf '%s: warning: %s records commit %s, which has no Agent-Slug trailer. That commit is already in origin/%s (PR %s), so it cannot be amended without rewriting trunk; closing anyway and recording the exception in state/decisions.jsonl.\n' \
+		"$prog" "$slug" "$short" "$trunk" "$pr" >&2
+	record_decision provenance "$slug" merged "$reason" false "$slug" "" \
+		"$(printf '{"sha":"%s","pr":"%s","trunk":"origin/%s"}' "$full" "$pr" "$trunk")"
+	return 0
+}
+
 # ask_jev <mode|count|thinking> <task text> [context]
 
 # ask_jev <mode|count|thinking> <task text> [context] — sets JEV_DECISION and JEV_REASON; dies
@@ -318,20 +391,27 @@ ask_jev_route() {
 	ROUTE_REASON=$(printf '%s' "$out" | json_field reason || true)
 }
 
-# record_decision <command> <task> <decision> <reason> <overridden true|false> <slug|-> [jev]
+# record_decision <command> <task> <decision> <reason> <overridden true|false> <slug|-> [jev] [extra-json]
 # `jev` is jev's own answer for that command; `overridden` is true only when <decision>
 # differs from it. See the header: the flag is per line, never per spawn.
+#
+# `extra-json` is an object merged into the row after the standard fields, for a row that carries
+# evidence of its own: the --merged escape records the sha and the PR that justify it. It is
+# positional after `jev`, so callers that want extras and have no jev answer pass "" there. The
+# shape of every other row is untouched — one format, read by `delegate stats` and `delegate
+# list` the same way.
 record_decision() {
-	local cmd=$1 task=$2 decision=$3 reason=$4 overridden=$5 slug=$6 jev=${7:-}
+	local cmd=$1 task=$2 decision=$3 reason=$4 overridden=$5 slug=$6 jev=${7:-} extra=${8:-}
 	mkdir -p "$STATE"
 	node -e '
 		const fs=require("fs");
-		const [file,command,task,decision,reason,overridden,slug,jev]=process.argv.slice(1);
+		const [file,command,task,decision,reason,overridden,slug,jev,extra]=process.argv.slice(1);
 		const line={timestamp:new Date().toISOString(),command,task,decision,reason:reason||null,
 			overridden:overridden==="true",slug:slug==="-"?"":slug};
 		if(jev!==undefined&&jev!=="")line.jev=jev;
+		if(extra)try{Object.assign(line,JSON.parse(extra))}catch{}
 		fs.appendFileSync(file,JSON.stringify(line)+"\n");' \
-		"$DECISIONS" "$cmd" "$task" "$decision" "$reason" "$overridden" "$slug" "$jev"
+		"$DECISIONS" "$cmd" "$task" "$decision" "$reason" "$overridden" "$slug" "$jev" "$extra"
 }
 
 # worker_thinking_level <effort> — map Jev's abstract effort (low|medium|high) to a thinking
@@ -774,10 +854,14 @@ $acceptance_block
    comments, formatting; medium: application code, tests, migrations; high: extensions,
    AGENTS.md, .github/, git-hooks/, sandbox/, auth, secrets, money, deletion). Never merge,
    never upload onto trunk, never commit on trunk. You stay sandboxed: publishing is the boss's
-   End the message with two trailers: \`Agent-Slug: $slug\` and \`Spec: $SPECS/$slug.md\`.
-   \`delegate close\` refuses a report whose recorded commit sha has no \`Agent-Slug\` trailer.
    job, so it never needs host access from you.
-6. When you are done — or blocked and unable to continue — write \`$report\` with:
+6. End every commit message with two trailers: \`Agent-Slug: $slug\` and \`Spec: $SPECS/$slug.md\`.
+   \`delegate close\` refuses a report whose recorded commit sha has no \`Agent-Slug\` trailer,
+   so a commit without them cannot close its own worker. AGENT_SLUG=$slug is already in your
+   environment and the commit-msg hook stamps both trailers, so a plain \`git commit\` carries
+   them; check with \`git log -1 --format=%B\` before you report, and only amend if the hook
+   was not installed.
+7. When you are done — or blocked and unable to continue — write \`$report\` with:
    - **Mission**: who is better off now, and how we would see it. The same line the spec gave
      you, updated with what actually happened. No LOC, no token counts, no file counts, no
      "N agents": effort is not mission, and output volume is not correctness.
@@ -794,20 +878,20 @@ $acceptance_block
    - \`## What I would do differently next time\` — one or two lines. The next worker reads
      this one, and a lesson kept costs a line.
    Keep it short. That file is the whole message back; nobody reads your scrollback.
-7. Never write "should work", "looks correct" or "tests pass" without the output that shows
+8. Never write "should work", "looks correct" or "tests pass" without the output that shows
    it. If it was not run, write "not run" and what would run it. A claim without output is
    not a result, and the report is read as a claim until the Evidence block proves it.
-8. Then write the report and stay idle. Do not close, rename or move the space. The
+9. Then write the report and stay idle. Do not close, rename or move the space. The
    big-boss-pi agent relays the report and closes the space right away, so a space never stays
    open just because the worker finished.
-9. The one exception, when the user must decide something before work can continue: make the
+10. The one exception, when the user must decide something before work can continue: make the
    first line of the report read "DECISION NEEDED: the question in one line". That marker is
    the only thing that keeps the space open, and only until the user answers.
 EOF
 
 	local argv
 	argv=$(node -e 'process.stdout.write(JSON.stringify(["sh","-lc",process.argv[1]]))' \
-		"cd $(printf '%q' "$cwd") && exec $(printf '%q' "$runner") --thinking $(printf '%q' "$jev_level") -a")
+		"cd $(printf '%q' "$cwd") && export AGENT_SLUG=$(printf '%q' "$slug") && exec $(printf '%q' "$runner") --thinking $(printf '%q' "$jev_level") -a")
 	# space.new has no hidden or background mode: the new space is shown, which takes the person
 	# off the space and tab they were reading. Note both ids now, explicitly, to put them back.
 	local before=""
@@ -1037,8 +1121,17 @@ fi
 }
 
 cmd_close() {
-	local slug=${1:-}
-	[ -n "$slug" ] || die 'usage: delegate close <slug>'
+	local slug=${1:-} merged=""
+	[ "$#" -ge 1 ] || die 'usage: delegate close <slug> [--merged <pr-url-or-number>]'
+	slug=$1; shift
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--merged) merged=${2:-}; shift 2 ;;
+		--*) die "unknown option $1" ;;
+		*) die "close takes one slug: '$1' — usage: delegate close <slug> [--merged <pr-url-or-number>]" ;;
+		esac
+	done
+	[ -n "$slug" ] || die 'usage: delegate close <slug> [--merged <pr-url-or-number>]'
 	[ -f "$DELEGATIONS" ] || die "no such worker: $slug"
 	local space cwd branch meta report
 	meta=$(node -e '
@@ -1096,11 +1189,7 @@ if [ -n "$cwd" ] && [ -d "$cwd" ] && git -C "$cwd" rev-parse --git-dir >/dev/nul
 		return 1
 	fi
 	if ! printf '%s\n' "$msg" | grep -qE '^Agent-Slug:[[:space:]]*[^[:space:]]'; then
-		printf '%s: refusing to close %s: %s records commit %s, and that commit has no Agent-Slug trailer, so nothing ties the change to this worker.\n' "$prog" "$slug" "$report" "$sha" >&2
-		printf 'Fix: end that commit'"'"'s message with the two trailers, then close again:\n' >&2
-		printf "  git -C %%q commit --amend --no-edit --trailer 'Agent-Slug: %s' --trailer 'Spec: specs/%s.md'\n" "$slug" "$slug" >&2
-		printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
-		return 1
+		merged_escape "$slug" "$sha" "$cwd" "$merged" || return 1
 	fi
 fi
 

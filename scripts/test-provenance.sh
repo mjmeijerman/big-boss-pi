@@ -204,8 +204,16 @@ elif ! grep -qF "specs/archive/" "$spec"; then
 	fail "the spawn template never mentions specs/archive/"
 elif ! grep -qF "Agent-Slug: template-check" "$spec" || ! grep -qF "Spec: " "$spec"; then
 	fail "the spawn template does not name both trailers: $(grep -n 'Agent-Slug\\|Spec:' "$spec" 2>&1)"
+elif ! awk '/^[[:space:]]*job, so it never needs/ { if (prev ~ /publishing is the boss.s[[:space:]]*$/) ok = 1 } { prev = $0 } END { exit(ok ? 0 : 1) }' "$spec"; then
+	fail "the spawn template still splices the trailer rule into the middle of the publishing sentence"
+elif ! grep -qE '^6\. End every commit message with two trailers' "$spec"; then
+	fail "the trailer rule is not its own numbered item in the spawn template"
+elif [ "$(grep -cE '^[0-9]+\. ' "$spec")" != 10 ] || ! grep -qE '^10\. ' "$spec"; then
+	fail "the spawn template's rule list is not numbered 1 to 10: $(grep -oE '^[0-9]+\. ' "$spec" | tr '\n' ' ')"
+elif ! grep -qF 'AGENT_SLUG=template-check' "$work/herdr-calls" 2>/dev/null; then
+	fail "AGENT_SLUG never reached the runner command: $(grep -o 'AGENT_SLUG=[^ ]*' "$work/herdr-calls" 2>&1 | head -2)"
 else
-	pass "the spawn spec names specs/archive/ and both commit trailers"
+	pass "the spawn spec names both trailers as its own rule, and AGENT_SLUG reaches the runner"
 fi
 
 # 8. The readability gate lives in a file, so it is checkable: tier, mission, one sentence, and
@@ -223,6 +231,150 @@ if [ -n "$missing" ]; then
 	fail "pull_request_template.md is missing:$missing"
 else
 	pass "pull_request_template.md carries tier, mission, one sentence and the formatter line"
+fi
+
+# 9. The escape for a commit that is already in trunk. A repo with a real remote, a commit that
+#    landed on origin/trunk without the trailer (a squash merge looks exactly like this), and a
+#    second commit that is still only on the branch. `delegate close --merged` has one permission
+#    to give: a commit that is already in trunk cannot be amended, so the trailer is recorded
+#    after the fact instead.
+remote=$work/remote.git
+merged=$work/merged
+mkdir -p "$merged"
+git init -q --bare -b trunk "$remote"
+git -C "$merged" init -q -b trunk
+git -C "$merged" config user.email worker@example.invalid
+git -C "$merged" config user.name worker
+git -C "$merged" remote add origin "$remote"
+git -C "$merged" commit -q --allow-empty -m "feat: the base"
+git -C "$merged" push -q origin trunk
+# landed: on origin/trunk, no Agent-Slug trailer
+printf 'feat: a change that landed without a trailer\n' >"$work/msg-landed"
+git -C "$merged" commit -q --allow-empty -F "$work/msg-landed"
+landed=$(git -C "$merged" rev-parse HEAD)
+git -C "$merged" push -q origin trunk
+# in-flight: on the branch only, also no trailer
+git -C "$merged" commit -q --allow-empty -m "feat: still on the branch"
+inflight=$(git -C "$merged" rev-parse HEAD)
+git -C "$merged" fetch -q --prune origin
+# A wipe line each, because these cases are about provenance, not about the checklist.
+printf '{"timestamp":"%s","command":"wipe","task":"merged-no","decision":"done","reason":null,"overridden":false,"slug":"merged-no"}\n{"timestamp":"%s","command":"wipe","task":"merged-yes","decision":"done","reason":null,"overridden":false,"slug":"merged-yes"}\n' \
+	"$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$PI_BOSS_ROOT/state/decisions.jsonl"
+
+# run_close_in <slug> <cwd> [close args...] — the same report and registration as run_close, for
+# a worker whose cwd is another repo, with flags.
+run_close_in() {
+	local slug=$1 dir=$2
+	shift 2
+	mkdir -p "$PI_BOSS_ROOT/reports"
+	cat >"$PI_BOSS_ROOT/reports/$slug.md"
+	printf '{"%s":{"space":"space-%s","cwd":"%s","branch":""}}\n' "$slug" "$slug" "$dir" \
+		>"$PI_BOSS_ROOT/state/delegations.json"
+	local out
+	out=$("$bin/delegate" close "$slug" "$@" 2>&1) && RC=0 || RC=$?
+	OUT=$out
+}
+
+# (a) --merged on a commit that has not landed: refuse, and say the flag does not apply. A flag
+#     that quietly does nothing would teach the caller to stop reading the refusal.
+run_close_in merged-no "$merged" --merged 63 <<REPORT
+# Report
+
+Mission: the trailer is demanded only where it can still be added.
+
+Commit: $inflight
+
+## Evidence
+
+\$ bash scripts/test-provenance.sh — ok
+REPORT
+if [ "$RC" != 1 ]; then
+	fail "--merged on an unmerged commit: exit $RC, wanted 1 — $OUT"
+elif ! printf '%s' "$OUT" | grep -qF -- "--merged does not apply"; then
+	fail "--merged on an unmerged commit: the refusal does not say the flag does not apply — $OUT"
+elif ! printf '%s' "$OUT" | grep -qF "$inflight is not an ancestor of origin/trunk"; then
+	fail "--merged on an unmerged commit: the refusal does not name the sha and the trunk — $OUT"
+else
+	pass "--merged on a commit that is not in origin/trunk refuses, and says the flag does not apply"
+fi
+
+# (b) --merged on a commit that is in origin/trunk: close, warn with the short sha and the PR, and
+#     leave a row in the decision log. The warning and the row are the whole point: provenance
+#     recorded after the fact has to be visible, or it is a silent pass.
+run_close_in merged-yes "$merged" --merged 63 <<REPORT
+# Report
+
+Mission: a landed commit can close its worker without a rewrite of trunk.
+
+Commit: $landed
+
+## Evidence
+
+\$ bash scripts/test-provenance.sh — ok
+REPORT
+short=$(git -C "$merged" rev-parse --short "$landed")
+row=$(grep '"command":"provenance"' "$PI_BOSS_ROOT/state/decisions.jsonl" | tail -n 1)
+if [ "$RC" != 0 ]; then
+	fail "--merged on a commit in trunk: exit $RC, wanted 0 — $OUT"
+elif ! printf '%s' "$OUT" | grep -qF "warning:"; then
+	fail "--merged on a commit in trunk: closed without a warning — $OUT"
+elif ! printf '%s' "$OUT" | grep -qF "$short"; then
+	fail "--merged on a commit in trunk: the warning does not name the short sha $short — $OUT"
+elif ! printf '%s' "$OUT" | grep -qF "PR #63"; then
+	fail "--merged on a commit in trunk: the warning does not name the PR — $OUT"
+elif [ -z "$row" ]; then
+	fail "--merged on a commit in trunk: no provenance row in state/decisions.jsonl"
+elif ! node -e '
+		const r=JSON.parse(process.argv[1]);
+		if(r.slug!=="merged-yes"||r.sha!==process.argv[2]||r.pr!=="#63"||!r.reason||r.command!=="provenance")process.exit(1);' \
+	"$row" "$landed" 2>/dev/null; then
+	fail "--merged on a commit in trunk: the row does not carry slug, sha, pr and a reason — $row"
+else
+	pass "--merged on a commit in origin/trunk closes, warns with the short sha and the PR, and records the row"
+fi
+
+# (c) --merged needs a PR reference. A branch name is not evidence that anything was merged, and
+#     guessing one would make the whole exception unfalsifiable.
+run_close_in merged-yes "$merged" --merged "some-branch" <<REPORT
+# Report
+
+Mission: the escape names the PR it stands on.
+
+Commit: $landed
+
+## Evidence
+
+\$ bash scripts/test-provenance.sh — ok
+REPORT
+if [ "$RC" != 1 ] || ! printf '%s' "$OUT" | grep -qF -- "--merged needs a PR number"; then
+	fail "--merged with a non-PR argument: exit $RC, wanted 1 naming the flag — $OUT"
+else
+	pass "--merged with a branch name instead of a PR refuses (exit 1)"
+fi
+
+# (d) The standard row shape survives the extras, and `delegate stats` still parses the file: a
+#     row it cannot read would be counted as unreadable, which is exactly what this checks.
+if ! node -e '
+		const fs=require("fs");
+		const rows=fs.readFileSync(process.argv[1],"utf8").split("\n").filter(Boolean).map(l=>JSON.parse(l));
+		const want=["timestamp","command","task","decision","overridden","slug"];
+		for(const r of rows)for(const k of want)if(!(k in r))process.exit(1);' "$PI_BOSS_ROOT/state/decisions.jsonl"; then
+	fail "a row written by the close lost one of the standard fields"
+else
+	stats=$("$bin/delegate" stats --json 2>&1) && src=0 || src=$?
+	if [ "$src" != 0 ]; then
+		fail "delegate stats exits $src after a merged close — $(printf '%s' "$stats" | head -n 3)"
+	elif ! printf '%s' "$stats" | node -e '
+		let d="";
+		process.stdin.on("data",c=>d+=c).on("end",()=>{
+			let j={};try{j=JSON.parse(d)}catch{process.exit(1)}
+			const dec=j.decisions||{};
+			process.exit(dec.unreadable===0&&(dec.by_command||{}).provenance===1?0:1);
+		});'; then
+		fail "delegate stats does not read the log after a merged close (unreadable != 0, or provenance not counted): $(printf '%s' "$stats" | head -n 3)"
+	else
+		pass "every row keeps the standard fields and delegate stats parses the log (0 unreadable, provenance counted)"
+	fi
 fi
 
 printf '\n%s\n' "$([ "$fails" = 0 ] && echo "provenance: ok" || echo "provenance: $fails failure(s)")"
