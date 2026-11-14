@@ -247,5 +247,36 @@ else
 	fail "stats --json aggregation: $msg"
 fi
 
+# 8. The wipe step between features: five questions on stdout, the run recorded in the log, a
+#    skip recorded with its reason, and a skip with no reason refused. `delegate close` enforces
+#    this, so a silent regression here lets every finished worker through unconsolidated.
+wipe_root=$work/wiperoot
+mkdir -p "$wipe_root/state" "$wipe_root/reports"
+printf '{"wipe-one":{"space":"s1","cwd":"","branch":"wipe-one"}}\n{"wipe-none":{"space":"s2","cwd":"","branch":""}}\n' \
+	>"$wipe_root/state/delegations.json"
+expect "delegate wipe, five questions" 0 "Rewrite?" -- \
+	env PI_BOSS_ROOT=$wipe_root "$bin/delegate" wipe wipe-one
+if grep '"command":"wipe"' "$wipe_root/state/decisions.jsonl" 2>/dev/null | grep -q '"decision":"done"'; then
+	pass "wipe run recorded in state/decisions.jsonl"
+else
+	fail "no wipe done line in state/decisions.jsonl"
+fi
+expect "delegate wipe, skip without a reason" 1 "--skip needs a reason" -- \
+	env PI_BOSS_ROOT=$wipe_root "$bin/delegate" wipe wipe-none --skip "  "
+expect "delegate wipe, skip recorded with its reason" 0 "skipped, reason recorded" -- \
+	env PI_BOSS_ROOT=$wipe_root "$bin/delegate" wipe wipe-none --skip "docs only, no code to consolidate"
+if grep '"command":"wipe"' "$wipe_root/state/decisions.jsonl" 2>/dev/null |
+	grep -q '"decision":"skipped".*"reason":"docs only, no code to consolidate"'; then
+	pass "wipe skip reason recorded in state/decisions.jsonl"
+else
+	fail "no wipe skipped line carrying the reason in state/decisions.jsonl"
+fi
+# A worker with no wipe line at all: the close refuses before it asks herdr-app for anything.
+printf '{"nowiped":{"space":"s3","cwd":"","branch":""}}\n' >"$wipe_root/state/delegations.json"
+expect "delegate close, no wipe step recorded" 1 "no wipe step recorded" -- \
+	env PI_BOSS_ROOT=$wipe_root PATH=$safe_path "$bin/delegate" close nowiped
+expect "delegate wipe, no slug" 1 "usage: delegate wipe" -- \
+	env PI_BOSS_ROOT=$wipe_root "$bin/delegate" wipe
+
 printf '\n%s\n' "$([ "$fails" = 0 ] && echo "offline behaviour: ok" || echo "offline behaviour: $fails failure(s)")"
 [ "$fails" = 0 ]

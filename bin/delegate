@@ -9,6 +9,7 @@
 #   delegate ask "<question>" [--json]
 #   delegate stats [--since DURATION] [--json]
 #   delegate sweep
+#   delegate wipe <slug> [--skip "<reason>"]
 #
 # A worker gets its own Herdr space (never the big-boss-pi space), a spec in specs/<slug>.md,
 # and one place to report back: reports/<slug>.md.
@@ -23,6 +24,14 @@
 # as soon as the report has been relayed. The one exception is a report whose first line reads
 # "DECISION NEEDED: <question>": that marker keeps the space open until the user answers.
 # `delegate sweep` applies exactly that rule to every tracked worker in one go.
+#
+# Between features there is one more step, and `delegate close` enforces it: `delegate wipe
+# <slug>` prints the five consolidation questions — what did this feature make unnecessary, what
+# is duplicated, could the next feature land in this area in 30 minutes, what did we learn, what
+# would we re-implement from scratch — and records the step in state/decisions.jsonl. A step that
+# does not apply is recorded too, as `--skip "<reason>"`, with the reason, instead of being
+# dropped silently. A close with no wipe line for that slug is refused, because a rule nothing
+# checks is gone (blip 20).
 #
 # A report is a claim until it carries output. So `delegate close` refuses a report with no
 # `## Evidence` block, or one that still has fill-in placeholders left in it: it prints what is
@@ -175,6 +184,25 @@ report_placeholders() {
 		}
 	' < "$report"
 }
+
+# wipe_recorded <slug> — true when state/decisions.jsonl carries a wipe line for that slug,
+# either the step itself (decision "done") or the recorded reason it did not apply ("skipped").
+# cmd_close asks this: the wipe is mandatory, and a mandatory step nobody can check is a wish.
+wipe_recorded() {
+	[ -f "$DECISIONS" ] || return 1
+	node -e '
+		const fs=require("fs");
+		let lines=[];
+		try{lines=fs.readFileSync(process.argv[1],"utf8").split("\n")}catch{process.exit(1)}
+		for(const line of lines){
+			if(!line)continue;
+			let d;try{d=JSON.parse(line)}catch{continue}
+			if(d.command==="wipe"&&d.slug===process.argv[2])process.exit(0);
+		}
+		process.exit(1);' "$DECISIONS" "$1"
+}
+
+# ask_jev <mode|count|thinking> <task text> [context]
 
 # ask_jev <mode|count|thinking> <task text> [context] — sets JEV_DECISION and JEV_REASON; dies
 # if Jev will not answer. The context lands on Jev's own usage line in state/usage.jsonl, so a
@@ -776,6 +804,51 @@ cmd_ask() {
 	return "$rc"
 }
 
+# cmd_wipe -- the consolidation step between features: five questions, then a line in the log.
+#
+# It is a gate, not a report: the answers belong in the worker's report (`## Thrown away`) and in
+# AGENTS.md only when they generalise, so this prints the questions and records that the step
+# happened. Effort spent here is the only thing that turns a finished feature into a cheaper
+# codebase; without it every feature is an addition and the tree only grows.
+cmd_wipe() {
+	local slug=${1:-} skip=0 reason="" branch=""
+	[ -n "$slug" ] || die 'usage: delegate wipe <slug> [--skip "<reason>"]'
+	shift || true
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--skip)
+			skip=1
+			reason=${2:-}
+			[ -n "${reason// /}" ] || die "--skip needs a reason: delegate wipe $slug --skip \"<why the step does not apply>\""
+			shift 2
+			;;
+		*) die "unknown option $1" ;;
+		esac
+	done
+	if [ -f "$DELEGATIONS" ]; then
+		branch=$(node -e 'const fs=require("fs");let j={};try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"))}catch{}process.stdout.write((j[process.argv[2]]||{}).branch||"")' \
+			"$DELEGATIONS" "$slug") || branch=""
+	fi
+
+	if [ "$skip" = 1 ]; then
+		record_decision wipe "$slug" skipped "$reason" false "$slug"
+		say "wipe: $slug — skipped, reason recorded: $reason"
+		say "state/decisions.jsonl holds the line; close goes through:  $BIN/delegate close $slug"
+		return 0
+	fi
+
+	say "wipe: $slug — five answers before the next feature starts${branch:+ (branch $branch)}:"
+	say "  1. Deleted?      what did this make unnecessary, and is that code gone?"
+	say "  2. Duplicated?   what here is a second copy of something already in the tree?"
+	say "  3. Next feature? could one land in this area in 30 minutes, or does it need a rewrite?"
+	say "  4. Learned?      what belongs in AGENTS.md or a comment after this?"
+	say "  5. Rewrite?      what would you re-implement from scratch, and why?"
+	say ""
+	say "Write the answers into the report (## Thrown away), then this line records the step."
+	record_decision wipe "$slug" done "" false "$slug"
+	say "state/decisions.jsonl: wipe done for $slug — close goes through:  $BIN/delegate close $slug"
+}
+
 cmd_close() {
 	local slug=${1:-}
 	[ -n "$slug" ] || die 'usage: delegate close <slug>'
@@ -810,6 +883,13 @@ cmd_close() {
 			printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
 			return 1
 		fi
+	fi
+
+	if ! wipe_recorded "$slug"; then
+		printf '%s: refusing to close %s: no wipe step recorded for it.\n' "$prog" "$slug" >&2
+		printf 'Run the consolidation step first, or record why it does not apply:\n' >&2
+		printf '  %s wipe %s [--skip "<reason>"]\n' "$BIN/delegate" "$slug" >&2
+		return 1
 	fi
 
 	herdr-app do space.close --id "$space" --confirmed true >/dev/null 2>&1 \
@@ -864,7 +944,7 @@ cmd_sweep() {
 			say "closed $slug"
 			closed=$((closed + 1))
 		else
-			say "keep   $slug (close refused: the report needs evidence, or has placeholders left)"
+			say "keep   $slug (close refused: no evidence block, placeholders left, or no wipe step recorded)"
 			kept=$((kept + 1))
 		fi
 	done <<<"$slugs"
@@ -881,6 +961,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 	ask) shift; cmd_ask "$@" ;;
 	stats) shift; PI_BOSS_ROOT=$ROOT exec node "$self_bin/stats.mjs" "$@" ;;
 	sweep) cmd_sweep ;;
-	*) die 'usage: delegate spawn|wait|list|close|ask|stats|sweep ...' ;;
+	wipe) shift; cmd_wipe "$@" ;;
+	*) die 'usage: delegate spawn|wait|list|close|ask|stats|sweep|wipe ...' ;;
 	esac
 fi
