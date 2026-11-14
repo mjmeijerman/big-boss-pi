@@ -81,6 +81,14 @@ variables, credentials, endpoints, and the whole task text — only the first 20
 with key-shaped tokens redacted. The answer itself is never logged. Recording cannot break a
 call: a failed write is swallowed.
 
+The same screen carries the jev scorecard: per decision kind (`mode`, `count`, `route`,
+`thinking`, `in-flight`) how many rows carry jev's own answer, how many are unknown, how many
+were overridden, and the agreement rate. A row written before the `jev` field existed is
+unknown and stays out of the rate — it is never agreement. `in-flight` is the spawn cap, not a
+jev answer, so it is reported as a cap. Below that, every override is listed per slug with its
+reason and whether the worker produced a report: **an override that ended with no report ended
+with no PR, and that is jev's answer being right**.
+
 ## Jev gates every delegation
 
 `delegate spawn` asks Jev four times on every run — `jev count`, `jev mode`, `jev route` and

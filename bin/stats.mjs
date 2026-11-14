@@ -15,6 +15,13 @@
  * block. All three are credit. They are read from reports/ alone, so a report that exists and is
  * not empty is a finished one, and a missing reports/ directory is zero, not an error.
  *
+ * The jev scorecard is the gap Radar blip 62 names: the decision log records what jev answered and
+ * nothing scores it against what the human did. Per kind it splits the rows into answered / unknown /
+ * overridden and states the agreement rate, then lists every override by slug with its reason and
+ * whether that worker produced a report at all. A row written before the `jev` field existed is
+ * unknown, never agreement; a legacy spawn-wide flag is named as such instead of being scored. An
+ * override that ended with no report is an override that ended with no PR — jev was right.
+ *
  * The review queue is the other number worth having: how many workers have reported and nobody has
  * read the report, and how old the oldest one is. It is current state, not a windowed count — an
  * unread report from three days ago is exactly the problem — so it reads state/delegations.json and
@@ -218,6 +225,73 @@ function collectFutures() {
 	};
 }
 
+/**
+ * collectScorecard — per jev decision kind: answered, unknown, overridden, agreement; then every
+ * override per slug with its reason and whether a report exists. Rows that predate the `jev` field
+ * are unknown and stay out of the agreement rate (counting them as agreement is the bug blip 62
+ * describes). `in-flight` is the spawn cap, not a jev answer, so its rows are never unknown.
+ */
+function collectScorecard(rows) {
+	const KINDS = ["mode", "count", "route", "thinking", "in-flight"];
+	const answered = (r) =>
+		Object.prototype.hasOwnProperty.call(r, "jev") && r.jev !== undefined && r.jev !== null && r.jev !== "";
+	const kinds = {};
+	for (const kind of KINDS) {
+		const rs = rows.filter((r) => r.command === kind);
+		const withJev = rs.filter(answered);
+		const agreed = withJev.filter((r) => String(r.decision) === String(r.jev));
+		const overridden = rs.filter((r) => r.overridden === true);
+		const isCap = kind === "in-flight";
+		kinds[kind] = {
+			rows: rs.length,
+			answered: withJev.length,
+			unknown: isCap ? 0 : rs.length - withJev.length,
+			overridden: overridden.length,
+			overridden_with_jev: overridden.filter(answered).length,
+			agreed: agreed.length,
+			agreement_rate: withJev.length ? percent(agreed.length, withJev.length) : null,
+		};
+		if (isCap) kinds[kind].cap = rs.length;
+	}
+
+	// One entry per slug, not per row: an old overridden spawn wrote the flag on all four lines.
+	const bySlug = new Map();
+	for (const row of rows) {
+		if (row.overridden !== true) continue;
+		const slug = row.slug || "(no slug)";
+		let entry = bySlug.get(slug);
+		if (!entry) {
+			entry = { slug, rows: 0, commands: [], reasons: [], jev_known: false, report_exists: false };
+			bySlug.set(slug, entry);
+		}
+		entry.rows += 1;
+		if (row.command && !entry.commands.includes(row.command)) entry.commands.push(row.command);
+		if (row.reason && !entry.reasons.includes(row.reason)) entry.reasons.push(row.reason);
+		if (answered(row)) entry.jev_known = true;
+	}
+	const entries = [...bySlug.values()]
+		.map((entry) => {
+			let size = 0;
+			try {
+				size = fs.statSync(path.join(REPORTS, `${entry.slug}.md`)).size;
+			} catch {}
+			return { ...entry, reason: entry.reasons[0] || null, reasons: undefined, report_exists: size > 0 };
+		})
+		.sort((a, b) => Number(a.report_exists) - Number(b.report_exists) || a.slug.localeCompare(b.slug));
+	const withReport = entries.filter((e) => e.report_exists).length;
+
+	return {
+		kinds,
+		overrides: {
+			rows: entries.reduce((n, e) => n + e.rows, 0),
+			slugs: entries.length,
+			with_report: withReport,
+			without_report: entries.length - withReport,
+			entries,
+		},
+	};
+}
+
 const tally = (list, keyFn) => {
 	const out = {};
 	for (const item of list) {
@@ -349,6 +423,7 @@ function collect(sinceMs, windowLabel) {
 		},
 		usage: { rows: uRows.length, unreadable: usage.unreadable },
 		futures: collectFutures(),
+		jev_scorecard: collectScorecard(dRows),
 	};
 }
 
@@ -372,6 +447,32 @@ function render(stats) {
 		`  two+ cycles:  ${f.two_or_more_cycles.count} of ${f.finished_reports} finished reports (${f.two_or_more_cycles.share}%)`,
 		`  evidence:     ${f.evidence.count} of ${f.finished_reports} finished reports (${f.evidence.share}%)`,
 	];
+	// The scorecard: the one block that says whether the local model is worth its place, so it
+	// sits with the futures panel above the latency numbers.
+	const s = stats.jev_scorecard;
+	const hasScore = Object.values(s.kinds).some((k) => k.rows) || s.overrides.rows;
+	const scoreLines = hasScore ? ["jev scorecard (what jev answered, and whether it held):"] : ["jev scorecard: no scored decisions in this window"];
+	if (hasScore) scoreLines.push("  kind        answered/rows  unknown  overridden  agreement");
+	for (const kind of ["mode", "count", "route", "thinking", "in-flight"]) {
+		const k = s.kinds[kind];
+		if (!hasScore || !k.rows) continue;
+		const unknown = kind === "in-flight" ? `${k.cap} cap` : `${k.unknown}`;
+		scoreLines.push(
+			`  ${kind.padEnd(11)} ${String(`${k.answered}/${k.rows}`).padEnd(14)} ${String(unknown).padEnd(8)} ${String(k.overridden).padEnd(11)} ${k.agreement_rate === null ? "—" : `${k.agreement_rate}%`}`,
+		);
+	}
+	const o = s.overrides;
+	if (o.rows) scoreLines.push(
+		`override log: ${o.rows} of ${d.total} decision rows (${percent(o.rows, d.total)}%) over ${o.slugs} slug${o.slugs === 1 ? "" : "s"} — ` +
+			`${o.with_report} ended with a report, ${o.without_report} with none (no report, no PR: jev was right there)`,
+	);
+	for (const e of o.entries) {
+		const reason = (e.reason || "no reason").replace(/\s+/g, " ");
+		const short = reason.length > 80 ? `${reason.slice(0, 77)}...` : reason;
+		scoreLines.push(
+			`  ${e.report_exists ? "report  " : "no report"}  ${e.slug} (${e.commands.join("+")}${e.jev_known ? "" : ", legacy flag"}) — ${short}`,
+		);
+	}
 	const q = stats.review_queue;
 	const queueLine = q.unread_reports
 		? `review queue: ${q.unread_reports} unread report${q.unread_reports === 1 ? "" : "s"} (oldest ${age(q.oldest_age_seconds)}, ${q.oldest_slug})`
@@ -380,6 +481,8 @@ function render(stats) {
 	out.push(`window: last ${stats.window.duration} (${stats.window.since} → ${stats.window.until})`);
 	out.push("");
 	out.push(...futuresLines);
+	out.push("");
+	out.push(...scoreLines);
 	if (!d.total && !stats.usage.rows) {
 		out.push("");
 		out.push("no local model activity in this window");

@@ -26,10 +26,21 @@ fails=0
 pass() { printf '  ok    %s\n' "$*"; }
 fail() { printf '  FAIL  %s\n' "$*"; fails=$((fails + 1)); }
 
-# A decision row, so the usage numbers render and the panel's position can be checked.
+# Decision rows, one per scorecard category: an answered-and-agreed mode row, an answered-and-
+# overridden one, an answered count, a legacy route row with no `jev` field at all (unknown, its
+# override carries no jev answer either), an answered thinking row, and an in-flight row that is a
+# spawn cap rather than a jev answer. The two overridden rows name different slugs, only one of
+# which has a report.
 now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-printf '{"timestamp":"%s","command":"ask","task":"q","decision":"yes","reason":"r","overridden":false,"jev":"yes"}\n' \
-	"$now" >"$PI_BOSS_ROOT/state/decisions.jsonl"
+{
+	printf '{"timestamp":"%s","command":"ask","task":"q","decision":"yes","reason":"r","overridden":false,"jev":"yes"}\n' "$now"
+	printf '{"timestamp":"%s","command":"mode","task":"q","decision":"sandboxed","reason":"r","overridden":false,"slug":"filled","jev":"sandboxed"}\n' "$now"
+	printf '{"timestamp":"%s","command":"mode","task":"q","decision":"bare","reason":"needed the sockets","overridden":true,"slug":"filled","jev":"sandboxed"}\n' "$now"
+	printf '{"timestamp":"%s","command":"count","task":"q","decision":"1","reason":"r","overridden":false,"slug":"filled","jev":"1"}\n' "$now"
+	printf '{"timestamp":"%s","command":"route","task":"q","decision":"remote","reason":"legacy row, no jev recorded","overridden":true,"slug":"never-written"}\n' "$now"
+	printf '{"timestamp":"%s","command":"thinking","task":"q","decision":"low","reason":"r","overridden":false,"slug":"filled","jev":"low"}\n' "$now"
+	printf '{"timestamp":"%s","command":"in-flight","task":"q","decision":"blocked","reason":"queue","overridden":false,"slug":"waiting"}\n' "$now"
+} >"$PI_BOSS_ROOT/state/decisions.jsonl"
 
 # Four finished reports: one section filled in, one heading left empty, one section absent, and
 # one that writes "nothing" down instead of deleting the heading — which is still credit.
@@ -159,6 +170,60 @@ if PI_BOSS_ROOT=$empty $stats 2>&1 | grep -qF "thrown away:  0 of 0 finished rep
 	pass "screen still renders the panel with no reports"
 else
 	fail "screen has no zero panel with no reports/"
+fi
+
+# The scorecard: an unknown-answer row must never be counted as agreement, so the legacy route
+# row is unknown 1 with no agreement rate at all, and the in-flight row is a cap, not an unknown.
+got=$(printf '%s' "$json" | jget jev_scorecard.kinds.mode.answered)
+[ "$got" = "2" ] && pass "scorecard: mode has 2 answered rows" || fail "jev_scorecard.kinds.mode.answered: got $got, wanted 2"
+
+got=$(printf '%s' "$json" | jget jev_scorecard.kinds.mode.unknown)
+[ "$got" = "0" ] && pass "scorecard: mode has no unknown rows" || fail "jev_scorecard.kinds.mode.unknown: got $got, wanted 0"
+
+got=$(printf '%s' "$json" | jget jev_scorecard.kinds.mode.agreement_rate)
+[ "$got" = "50" ] && pass "scorecard: mode agreement 50% (one overridden answer)" ||
+	fail "jev_scorecard.kinds.mode.agreement_rate: got $got, wanted 50"
+
+got=$(printf '%s' "$json" | jget jev_scorecard.kinds.route.unknown)
+[ "$got" = "1" ] && pass "scorecard: a row without jev is unknown, not agreement" ||
+	fail "jev_scorecard.kinds.route.unknown: got $got, wanted 1"
+
+got=$(printf '%s' "$json" | jget jev_scorecard.kinds.route.agreement_rate)
+[ "$got" = "null" ] && pass "scorecard: no jev answer means no agreement rate, not 0%" ||
+	fail "jev_scorecard.kinds.route.agreement_rate: got $got, wanted null"
+
+got=$(printf '%s' "$json" | jget jev_scorecard.kinds.in-flight.cap)
+[ "$got" = "1" ] && pass "scorecard: in-flight row counted as a cap, not a jev answer" ||
+	fail "jev_scorecard.kinds.in-flight.cap: got $got, wanted 1"
+
+# Overrides are per slug, not per row, and whether the worker reported decides which way they read.
+got=$(printf '%s' "$json" | jget jev_scorecard.overrides.slugs)
+[ "$got" = "2" ] && pass "scorecard: 2 override slugs" || fail "jev_scorecard.overrides.slugs: got $got, wanted 2"
+
+got=$(printf '%s' "$json" | jget jev_scorecard.overrides.without_report)
+[ "$got" = "1" ] && pass "scorecard: one override ended with no report" ||
+	fail "jev_scorecard.overrides.without_report: got $got, wanted 1"
+
+got=$(printf '%s' "$json" | jget jev_scorecard.overrides.entries.0.slug)
+[ "$got" = '"never-written"' ] && pass "scorecard: the no-report override is named first" ||
+	fail "jev_scorecard.overrides.entries.0.slug: got $got, wanted \"never-written\""
+
+if printf '%s' "$screen" | grep -qE '^  mode +2/2 +0 +1 +50%$'; then
+	pass "screen carries the mode scorecard row"
+else
+	fail "screen has no 'mode 2/2 ... 50%' scorecard row"
+fi
+if printf '%s' "$screen" | grep -qF "no report  never-written"; then
+	pass "screen names the override with no report"
+else
+	fail "screen does not name the no-report override"
+fi
+panel=$(printf '%s\n' "$screen" | grep -n "jev scorecard" | cut -d: -f1)
+usage=$(printf '%s\n' "$screen" | grep -n "local model calls" | cut -d: -f1)
+if [ -n "$panel" ] && [ -n "$usage" ] && [ "$panel" -lt "$usage" ]; then
+	pass "scorecard renders above the usage numbers (line $panel before line $usage)"
+else
+	fail "scorecard is not above the usage numbers (panel='$panel', usage='$usage')"
 fi
 
 printf '\n%s\n' "$([ "$fails" = 0 ] && echo "futures stats: ok" || echo "futures stats: $fails failure(s)")"
