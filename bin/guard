@@ -6,19 +6,31 @@
 # named big-boss-pi? If not, rebuild it with a fresh big-boss-pi agent. The first time Herdr
 # answers after this service starts, select it, so Herdr opens on big-boss-pi.
 #
-# This guard only ever looks for, creates, and selects the space named big-boss-pi. A space
-# named pi-master belongs to the old workspace: it is never recreated from here.
+# herdr-core parks kept terminals and gives them a shell on the next start, so a restart leaves
+# the space with its tabs ("master", "Pi (bare)") and no agents in them: tabs that say Pi over
+# a prompt. ensure() repairs those. A tab whose terminals are no longer pi is closed and opened
+# again with an absolute argv, so the core can restart it later — the holder's PATH has no pnpm
+# bin dir, so a bare `pi-bare` cannot be restarted. A live pi tab is never touched, one repair a
+# minute per tab keeps a pi that exits at once from becoming a spawn loop, every repair is
+# logged, and the person's space and tab are put back afterwards.
+#
+# This guard only ever looks for, creates, selects and repairs the space named big-boss-pi.
+# A space named pi-master belongs to the old workspace: it is never touched from here.
 #
 # Radar Vol. 35: blip 20 (stateful guardrails) — a rule nothing checks is a rule that is gone.
 set -uo pipefail
 
 self_root=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)
 ROOT=${PI_BOSS_ROOT:-${PI_MASTER_ROOT:-$self_root}}
-SPACE_NAME=big-boss-pi
+SPACE_NAME=${PI_BOSS_SPACE:-big-boss-pi}
 STATE=$ROOT/state
 LOG=$STATE/guard.log
 SPACE_STATE=$STATE/space.json
+REPAIRS=$STATE/repairs
 INTERVAL=${PI_BOSS_GUARD_INTERVAL:-${PI_MASTER_GUARD_INTERVAL:-5}}
+# A tab is opened again at most once a minute, so a pi that dies on start is one repair a
+# minute and not five a second.
+REPAIR_EVERY=60
 KICKOFF="Read AGENTS.md in this workspace. You are the big-boss-pi agent: you delegate, you do not do project work."
 
 mkdir -p "$STATE"
@@ -32,8 +44,18 @@ fi
 
 need_app() { command -v herdr-app >/dev/null 2>&1; }
 
-find_space() {
-	herdr-app ls 2>/dev/null | SPACE_NAME=$SPACE_NAME node -e '
+# field <path> — read stdout as JSON and print one dotted field, or nothing.
+field() {
+	node -e '
+		let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+			let j={};try{j=JSON.parse(d)}catch{}
+			const v=process.argv[1].split(".").reduce((a,k)=>a?.[k],j);
+			if(v!==undefined&&v!==null)process.stdout.write(String(v))})' "$1"
+}
+
+# space_id — from a `herdr-app ls` snapshot on stdin, print this space's id, or nothing.
+space_id() {
+	SPACE_NAME=$SPACE_NAME node -e '
 		let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
 			let j={};try{j=JSON.parse(d)}catch{process.exit(1)}
 			const hit=(j.spaces||[]).find(s=>s.name===process.env.SPACE_NAME);
@@ -47,25 +69,27 @@ known_space() {
 		const fs=require("fs");try{const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));if(j.space)process.stdout.write(j.space)}catch{}' "$SPACE_STATE"
 }
 
+# pi_argv <1 for the boss tab> — the argv a replacement tab starts. Always absolute: the
+# holder restarts this command later from a PATH without the pnpm bin dir.
+pi_argv() {
+	node -e 'const [p,a]=process.argv.slice(1);
+		process.stdout.write(JSON.stringify(["sh","-lc","exec "+p+(a==="1"?" -a":"")]))' \
+		"$ROOT/bin/pi-bare" "$1"
+}
+
 create_space() {
 	local out argv
-	argv=$(node -e 'process.stdout.write(JSON.stringify(["sh","-lc",process.argv[1]]))' \
-		"exec $(printf '%q' "$ROOT/bin/pi-bare") -a")
+	argv=$(pi_argv 1)
 	out=$(herdr-app do space.new --name "$SPACE_NAME" --folder "$ROOT" --tab master \
 		--argv "$argv" --task "$KICKOFF" 2>&1) || {
 		log "space.new failed: $out"
 		return 1
 	}
 	local space terminal
-	field() {
-		printf '%s' "$out" | node -e '
-			let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
-				let j={};try{j=JSON.parse(d)}catch{}
-				const v=process.argv[1].split(".").reduce((a,k)=>a?.[k],j);
-				if(v!==undefined&&v!==null)process.stdout.write(String(v))})' "$1"
-	}
-	space=$(field space); [ -n "$space" ] || space=$(field id); [ -n "$space" ] || space=$(field result.space)
-	terminal=$(field terminal); [ -n "$terminal" ] || terminal=$(field result.terminal)
+	space=$(printf '%s' "$out" | field space); [ -n "$space" ] || space=$(printf '%s' "$out" | field id)
+	[ -n "$space" ] || space=$(printf '%s' "$out" | field result.space)
+	terminal=$(printf '%s' "$out" | field terminal)
+	[ -n "$terminal" ] || terminal=$(printf '%s' "$out" | field result.terminal)
 	[ -n "$space" ] || { log "could not read the new space id: $out"; return 1; }
 	printf '{"space":"%s","terminal":"%s","created":"%s"}\n' "$space" "$terminal" "$(date -Iseconds)" >"$SPACE_STATE"
 	log "created $SPACE_NAME ($space, terminal \`$terminal\`)"
@@ -83,9 +107,124 @@ create_space() {
 	fi
 }
 
+# --- repairing tabs whose agent is gone -------------------------------------
+
+# screen_state — the "space tab" the person is looking at, or empty when it cannot be read.
+screen_state() {
+	local out space tab
+	out=$(herdr-app status 2>/dev/null) || return 0
+	space=$(printf '%s' "$out" | field space)
+	tab=$(printf '%s' "$out" | field tab)
+	[ -n "$space" ] && [ -n "$tab" ] || return 0
+	printf '%s %s' "$space" "$tab"
+}
+
+# restore_focus <space> <tab> — select that space, then that tab, by id. Never fatal.
+restore_focus() {
+	herdr-app do space.select --id "$1" >/dev/null 2>&1 || return 1
+	herdr-app do tab.select --id "$2" >/dev/null 2>&1 || return 1
+	return 0
+}
+
+# stale_tabs <space id> — from a `herdr-app ls` snapshot on stdin, print "tab<TAB>name<TAB>index"
+# for every tab of that space whose terminals are all something other than pi. A tab with no
+# terminal is a mod, not a lost agent. A tab that still holds a live pi is left alone.
+stale_tabs() {
+	SPACE_ID=$1 node -e '
+		let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+			let j={};try{j=JSON.parse(d)}catch{process.exit(0)}
+			const sp=(j.spaces||[]).find(s=>s.id===process.env.SPACE_ID);
+			if(!sp)process.exit(0);
+			(sp.tabs||[]).forEach((t,i)=>{
+				const ts=t.terminals||[];
+				if(!ts.length)return;
+				if(ts.some(x=>x&&x.app==="pi"))return;
+				process.stdout.write([t.id,t.name===null||t.name===undefined?"":t.name,i+1].join("\t")+"\n");
+			});
+		})'
+}
+
+# repair_key <space id> <name> <index> — what the rate limit is counted on. The tab id changes
+# with every repair, so counting on it would let a broken pi be reopened every poll; the tab's
+# name and place survive, so the minute is counted there.
+repair_key() { printf '%s:%s:%s' "$1" "${2// /_}" "$3"; }
+
+repaired_recently() {
+	[ -f "$REPAIRS" ] || return 1
+	awk -v k="$1" -v c="$(($(date +%s) - REPAIR_EVERY))" \
+		'$1==k && $2>=c {found=1} END{exit !found}' "$REPAIRS"
+}
+
+mark_repaired() {
+	printf '%s %s\n' "$1" "$(date +%s)" >>"$REPAIRS"
+	if [ "$(wc -l <"$REPAIRS" 2>/dev/null || echo 0)" -gt 200 ]; then
+		tail -n 200 "$REPAIRS" >"$REPAIRS.tmp" && mv "$REPAIRS.tmp" "$REPAIRS"
+	fi
+}
+
+# kickoff_later <terminal> — send the first message once pi has had time to boot, off the loop.
+kickoff_later() {
+	(
+		sleep 12
+		if hc send "$1" "$KICKOFF" >/dev/null 2>&1; then
+			log "kickoff sent to $1"
+		else
+			log "could not send the kickoff message to $1"
+		fi
+	) &
+}
+
+# repair_tab <space> <tab> <name> <index> — returns 0 only when it repaired the tab. Opens the
+# replacement first and closes the stale tab after: closing a space's only tab would end the
+# space, and a failed open leaves the person with what they had. Same name, same place, and an
+# absolute argv so the holder can restart it. The boss tab (master) resumes the session and gets
+# the kickoff message again.
+repair_tab() {
+	local space=$1 tab=$2 name=$3 index=$4 boss=0 argv out new_terminal args=()
+	repaired_recently "$(repair_key "$space" "$name" "$index")" && return 1
+	[ "$name" = master ] && boss=1
+	argv=$(pi_argv "$boss")
+	[ -n "$name" ] && args+=(--name "$name")
+	out=$(herdr-app do tab.new --space "$space" "${args[@]}" --folder "$ROOT" --argv "$argv" 2>&1)
+	new_terminal=$(printf '%s' "$out" | field terminal)
+	[ -n "$new_terminal" ] || new_terminal=$(printf '%s' "$out" | field result.terminal)
+	if [ -z "$new_terminal" ]; then
+		log "could not open a replacement for the stale tab $name ($tab): $out"
+		return 1
+	fi
+	mark_repaired "$(repair_key "$space" "$name" "$index")"
+	log "repaired tab $name ($tab -> terminal \`$new_terminal\`): its terminal was not pi, opened $argv"
+	out=$(herdr-app do tab.close --id "$tab" --confirmed true 2>&1) ||
+		log "could not close the stale tab $name ($tab); it is still open beside \`$new_terminal\`: $out"
+	herdr-app do tab.move --id "$new_terminal" --index "$index" >/dev/null 2>&1
+	[ "$boss" = 1 ] && command -v hc >/dev/null 2>&1 && kickoff_later "$new_terminal"
+	return 0
+}
+
+# repair_stale_tabs <space id> — repair every stale tab of the space, then put the person back
+# on the space and tab they were looking at. A failed restore is one line, never a failed repair.
+repair_stale_tabs() {
+	local space=$1 snapshot=$2 stale tab name index before touched=0
+	stale=$(printf '%s' "$snapshot" | stale_tabs "$space") || return 0
+	[ -n "$stale" ] || return 0
+	before=$(screen_state)
+	while IFS=$'\t' read -r tab name index; do
+		[ -n "$tab" ] || continue
+		repair_tab "$space" "$tab" "$name" "$index" && touched=1
+	done <<<"$stale"
+	[ "$touched" = 1 ] || return 0
+	if [ -n "$before" ]; then
+		restore_focus ${before} ||
+			printf 'guard: could not restore focus to space %s tab %s after repairing %s\n' \
+				"${before%% *}" "${before##* }" "$SPACE_NAME" >&2
+	fi
+	return 0
+}
+
 ensure() {
-	local space
-	space=$(find_space) || {
+	local snapshot space
+	snapshot=$(herdr-app ls 2>/dev/null) || snapshot=""
+	space=$(printf '%s' "$snapshot" | space_id) || {
 		# Log the transition, not every poll: a closed window is normal.
 		[ "$app_down" = 1 ] || log "herdr-app not answering; waiting"
 		app_down=1
@@ -106,6 +245,7 @@ ensure() {
 	if [ "$space" != "$known" ]; then
 		printf '{"space":"%s","created":"%s"}\n' "$space" "$(date -Iseconds)" >"$SPACE_STATE"
 	fi
+	repair_stale_tabs "$space" "$snapshot"
 	if [ "$1" = "select" ]; then
 		herdr-app do space.select --id "$space" >/dev/null 2>&1 && log "selected $SPACE_NAME ($space)"
 	fi
@@ -113,6 +253,11 @@ ensure() {
 
 # Dispatch only when executed: sourcing this file just gives you the functions.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+	# The old workspace's space is not ours to keep alive, repair, or select.
+	if [ "$SPACE_NAME" = pi-master ]; then
+		printf 'guard: refusing to guard a space named pi-master\n' >&2
+		exit 0
+	fi
 	need_app || { log "herdr-app not on PATH; exiting"; exit 0; }
 	log "guard started (space $SPACE_NAME, root $ROOT, interval ${INTERVAL}s)"
 	app_down=0

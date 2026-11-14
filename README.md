@@ -16,7 +16,7 @@ copy: read-only during the transition, deleted only when the user says so.
 | Local worker | `bin/local-run` | runs a local task on the same model, headless: prompt in, answer on stdout, no space and no spec; records one line in `state/usage.jsonl` |
 | Delegation | `bin/delegate` → `~/.local/bin/delegate` | asks Jev for mode, count, route and thinking effort, creates a Herdr space per worker, writes the spec, records where the report lands, appends every decision to `state/decisions.jsonl`; `delegate sweep` closes the workers that finished |
 | Worker modes | `bin/pi-bare`, `bin/pi-sandboxed`, `bin/pi-nonet` | `delegate` picks one from Jev's answer |
-| Never-closable space | `bin/guard` → `~/.local/bin/big-boss-pi-guard` + `~/.config/systemd/user/big-boss-pi-guard.service` | polls `herdr-app ls`; recreates the `big-boss-pi` space if it disappears, selects it once when Herdr starts. It never recreates a space named `pi-master` |
+| Never-closable space | `bin/guard` → `~/.local/bin/big-boss-pi-guard` + `~/.config/systemd/user/big-boss-pi-guard.service` | polls `herdr-app ls`; recreates the `big-boss-pi` space if it disappears, selects it once when Herdr starts, and reopens a tab whose terminal is no longer pi (herdr-core hands parked terminals a shell on restart) with an absolute argv, at most once a minute per tab and logged in `state/guard.log`. It never touches a space named `pi-master` |
 | Delegation-only enforcement | `~/.pi/agent/extensions/big-boss-pi-guard.ts` | blocks the `write` and `edit` tools, and shell writes into the directory (`echo x > …`, `rm/mv/cp/tee/sed -i`), when the session's cwd is under `/home/mark/big-boss-pi` **or** `/home/mark/pi-master`; no-ops everywhere else, including for a worker session (`PI_WORKER=1`) |
 | Rollback helper | `bin/finish-rename.sh` | closes the old `pi-master` space on request and prints how to delete the old tree. Runs nothing by default |
 
@@ -190,6 +190,15 @@ Herdr has no per-space lock. `space.close` closes a space and ends its terminals
 checks every 5 seconds and rebuilds `big-boss-pi` (with a fresh agent) if it is gone. Closing
 it is possible for a few seconds, then it is back. That is the closest thing to "not closable"
 Herdr supports.
+
+The same guard puts the agents back after herdr-core restarts. The core keeps its terminals and
+starts them again as shells, so the space comes back with its tabs ("master", "Pi (bare)") and
+nothing running in them. A tab whose terminals are all something other than pi is reopened in
+place, under its own name, with `sh -lc exec /home/mark/big-boss-pi/bin/pi-bare` — absolute,
+because the holder restarts it from a PATH without the pnpm bin dir. A live pi tab is left alone,
+a tab is reopened at most once a minute (a pi that exits at once must not become a spawn loop),
+and every repair lands in `state/guard.log`. `PI_BOSS_SPACE` points the guard at another space
+name, so the repair can be tried without touching the real one.
 
 ## What the write guard does and does not cover
 
