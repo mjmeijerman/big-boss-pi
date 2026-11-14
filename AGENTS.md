@@ -17,8 +17,12 @@ Loaded on every start. Nothing here applies outside `/home/mark/big-boss-pi`.
    `--thinking` that contradicts Jev.
 4. Spawn workers in **other** Herdr spaces with `delegate spawn` — never in this space.
 5. Poll with `delegate wait <slug>`, read `reports/<slug>.md`.
-6. Relay to the user: what now works, one line per worker, what is open, the next action.
-7. `delegate close <slug>` — or `delegate sweep` — in the same turn you relay the report. A
+6. Wipe before the next feature starts: `delegate wipe <slug>`, or `--skip '<reason>'`. Five
+   answers — what did this make unnecessary and is it deleted, what is duplicated, could the
+   next feature land in this area in 30 minutes, what did we learn, what would we rebuild
+   from scratch? `delegate close` refuses a worker without it.
+7. Relay to the user: what now works, one line per worker, what is open, the next action.
+8. `delegate close <slug>` — or `delegate sweep` — in the same turn you relay the report. A
    space stays open only while the worker works, or its report says `DECISION NEEDED`.
 
 You never edit project files or run tests: a worker does that. You write only specs and
@@ -26,31 +30,15 @@ reports. The live checkout here is yours: a worker uses its own `git worktree`.
 
 ## Jev decides
 
-`jev` is the local decision model (qwen3.8:27b, no API cost, no network). Ask it, do not
-guess:
+`jev` is the local decision model (qwen3.8:27b, no API cost, no network). Its subcommands —
+route, count, mode, thinking, ask, permit — with their exit codes (0 yes, 1 no, 3 unsure) and
+the mode rules it works from are in `~/.pi/agent/skills/jev/SKILL.md`. Ask it, do not guess.
 
-| question | command | use the answer for |
-|---|---|---|
-| Locally or remotely? | `jev route "<task>"` | `local` → `bin/local-run`; `remote` → `delegate spawn` |
-| How many agents? | `jev count "<task>"` | 1-4 workers; more than 4 outruns review |
-| Which mode? | `jev mode "<worker task>"` | bare, sandboxed, or no-net |
-| How much thinking? | `jev thinking "<task>"` | low/medium/high effort → a level the model supports |
-| Anything else? | `jev ask "<question>"` | yes / no / unsure |
-| Sandbox permission? | `jev permit "<request>"` | allow, or escalate |
-
-Exit 0 = yes, 1 = no, 3 = unsure; `--json` prints the decision and reason.
-
-- **Jev says yes** → do it, no need to ask the user.
-- **Jev says no or unsure** → ask the user one short question. Only the user overrides a no.
 - **Every decision goes through Jev:** worker count, sandbox mode, yes/no/unsure calls. You
   never decide these yourself or pass a `--mode` "because you know better". `delegate spawn`
-  asks Jev unconditionally, aborts when Jev is unreachable or unsure, and refuses a `--mode`
-  that contradicts Jev for that task text. Overturning Jev needs `--override-jev --reason
-  '<why>'`, recorded in `state/decisions.jsonl`; read it to see why a worker runs as it does.
-- **Mode rules Jev works from:** a worker that needs a model cannot run `--no-net` (no
-  network means no model, blip 1). Untrusted repo scripts run `--no-net`. Read-only analysis
-  runs sandboxed. Bare only when the work needs host access the sandbox refuses (Herdr
-  sockets, GUI, docker). Publishing never justifies bare mode.
+  asks Jev again and aborts when it is unsure or unreachable. Overturning Jev needs
+  `--override-jev --reason '<why>'`, recorded in `state/decisions.jsonl`. Only the user
+  overrides a no.
 - This workspace's own agent runs bare: it must reach the Herdr sockets to start spaces.
   It does no project work, so it has nothing to sandbox.
 
@@ -87,6 +75,7 @@ delegate wait <slug> [--timeout 600]
 delegate list
 delegate close <slug>
 delegate ask "<question>"     # jev first: exit 0 yes, 1 no, 3 ask the user
+delegate wipe <slug> [--skip "<reason>"]   # the five consolidation questions
 delegate sweep                # close every reported worker, keep working ones and open decisions
 ```
 
