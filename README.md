@@ -171,6 +171,18 @@ report is plain, `keep   <slug> (still working)` when there is no report yet, an
 `delegate list` shows the same three states in its status column: `working`, `DECISION`,
 `reported`.
 
+## Review gate
+
+Every change must pass a five-minute comprehension check before it merges: a human reviewer must be able to answer "what does this change do?" in five minutes. If they cannot, the change is too large or too opaque and must be split or clarified.
+
+Review is tiered by risk:
+
+- **High** — `agent/extensions/`, `agent/AGENTS.md`, `.github/`, `git-hooks/`, `sandbox/`, and anything touching auth, secrets, money, or data deletion. Read line by line by the user. Never auto-merged.
+- **Medium** — application code, tests, migrations. Diff read with green tests.
+- **Low** — docs, comments, formatting, patch bumps. CI green plus a skim.
+
+Formatting and indentation comments are out of scope for review; a formatter owns them, never a gate.
+
 ## Why the space cannot be closed
 
 Herdr has no per-space lock. `space.close` closes a space and ends its terminals, and
