@@ -39,6 +39,10 @@ report_case() {
 	cat >"$PI_BOSS_ROOT/reports/$slug.md"
 	printf '{"%s":{"space":"space-%s","cwd":"","branch":""}}\n' "$slug" "$slug" \
 		>"$PI_BOSS_ROOT/state/delegations.json"
+	# The wipe step is mandatory before a close, so every case here records it up front: these
+	# cases are about the placeholder scan, and a refusal from the other guard would hide that.
+	printf '{"timestamp":"%s","command":"wipe","task":"%s","decision":"done","reason":null,"overridden":false,"slug":"%s"}\n' \
+		"$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$slug" >>"$PI_BOSS_ROOT/state/decisions.jsonl"
 	out=$("$bin/delegate" close "$slug" 2>&1) && rc=0 || rc=$?
 	if [ "$rc" != "$want" ]; then
 		fail "$name: exit $rc, wanted $want — $out"
@@ -140,6 +144,26 @@ Mission: the scan picks up where the fence ends.
 
 TODO paste the commit sha here
 REPORT
+
+# 8. The wipe step is mandatory, and the close guard is where it bites: a written-out report
+#    still refuses when no wipe line names the worker, and the refusal names the command.
+rm -f "$PI_BOSS_ROOT/state/decisions.jsonl"
+printf '{"nowipe":{"space":"space-nowipe","cwd":"","branch":""}}\n' >"$PI_BOSS_ROOT/state/delegations.json"
+cat >"$PI_BOSS_ROOT/reports/nowipe.md" <<'REPORT'
+# Report
+
+Mission: a clean report is still not a closed worker without the wipe step.
+
+## Evidence
+
+$ delegate close nowipe — refused
+REPORT
+out=$("$bin/delegate" close nowipe 2>&1) && rc=0 || rc=$?
+if [ "$rc" = 1 ] && printf '%s' "$out" | grep -qF "no wipe step recorded"; then
+	pass "no wipe line refuses the close (exit 1)"
+else
+	fail "close without a wipe line: exit $rc — $out"
+fi
 
 printf '\n%s\n' "$([ "$fails" = 0 ] && echo "placeholder scan: ok" || echo "placeholder scan: $fails failure(s)")"
 [ "$fails" = 0 ]

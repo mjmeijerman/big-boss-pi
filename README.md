@@ -154,6 +154,15 @@ worker cannot continue without the user, so the space stays open until the quest
 DECISION NEEDED: drop the old table or keep it for the migration?
 ```
 
+The wipe step sits between the report and the close. `delegate wipe <slug>` prints five
+consolidation questions — what did this feature make unnecessary and is that code deleted, what
+is duplicated, could the next feature land in this area in 30 minutes, what did we learn, what
+would we rebuild from scratch — and records the run in `state/decisions.jsonl`.
+`delegate wipe <slug> --skip "<reason>"` records why the step does not apply, reason included.
+`delegate close` and `delegate sweep` refuse a worker with no wipe line for it, so a finished
+feature stops being a permanent addition by default. The answers belong in the worker's report
+under `## Thrown away`.
+
 `delegate sweep` walks every tracked worker and prints one line each: `closed <slug>` when the
 report is plain, `keep   <slug> (still working)` when there is no report yet, and
 `keep   <slug> (decision needed, ask the user)` for the marker. It ends with `N closed, M kept`.
