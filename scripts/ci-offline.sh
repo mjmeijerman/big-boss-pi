@@ -116,6 +116,11 @@ expect "delegate list, empty temp root" 0 "no workers" -- \
 #     keeps those cases in CI without a second workflow step.
 expect "placeholder scan over fenced reports" 0 "placeholder scan: ok" -- \
 	bash "$root/scripts/test-placeholders.sh"
+# 5c. The wipe step between features: five checklist lines, a loud refusal on an unknown slug,
+#     and a skip recorded with its reason in state/decisions.jsonl. Same pattern, same reason
+#     for a separate script: each case needs its own temporary root and a stub herdr-app.
+expect "wipe checklist, refusal and skip log" 0 "wipe: ok" -- \
+	bash "$root/scripts/test-wipe.sh"
 
 # 6. Routing is a refusal, not a warning. delegate reads jev from $PI_BOSS_ROOT/bin, so a
 #    fake jev there answers route=local without a model and without touching the real tree.
