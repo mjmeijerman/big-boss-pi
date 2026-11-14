@@ -9,6 +9,12 @@
  * The point is the last line. Until now "is the local model used" could only be inferred from
  * the absence of something else; state/usage.jsonl makes it a count.
  *
+ * The futures panel is the newest block and the reason it sits at the top: the three numbers
+ * that make the futures the harness buys back visible — how many finished reports name what they
+ * threw away, how many say they ran two or more cycles, and how many carry a checkable Evidence
+ * block. All three are credit. They are read from reports/ alone, so a report that exists and is
+ * not empty is a finished one, and a missing reports/ directory is zero, not an error.
+ *
  * The review queue is the other number worth having: how many workers have reported and nobody has
  * read the report, and how old the oldest one is. It is current state, not a windowed count — an
  * unread report from three days ago is exactly the problem — so it reads state/delegations.json and
@@ -36,6 +42,7 @@ const DECISIONS = path.join(ROOT, "state", "decisions.jsonl");
 const USAGE = path.join(ROOT, "state", "usage.jsonl");
 const DELEGATIONS = path.join(ROOT, "state", "delegations.json");
 const READ_MARKS = path.join(ROOT, "state", "read");
+const REPORTS = path.join(ROOT, "reports");
 
 const UNITS = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
 const DEFAULT_WINDOW = "7d";
@@ -89,6 +96,126 @@ function median(values) {
 	if (!sorted.length) return null;
 	const mid = Math.floor(sorted.length / 2);
 	return sorted.length % 2 ? sorted[mid] : Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+}
+
+/**
+ * section — the body of a "## <heading>" section, or null when the report has none.
+ * A heading line ends the section; the text below it is the body either way.
+ */
+function section(text, heading) {
+	const lines = String(text).split("\n");
+	let start = -1;
+	for (let i = 0; i < lines.length; i += 1) {
+		const m = /^##\s+(.+?)\s*$/.exec(lines[i]);
+		if (m && m[1].toLowerCase() === heading) {
+			start = i + 1;
+			break;
+		}
+	}
+	if (start < 0) return null;
+	const body = [];
+	for (let i = start; i < lines.length; i += 1) {
+		if (/^#{1,2}\s/.test(lines[i])) break;
+		body.push(lines[i]);
+	}
+	return body.join("\n");
+}
+
+/** filled — a section body counts when some line carries text. "nothing" counts: it is written down. */
+const filled = (body) => body !== null && body.split("\n").some((line) => line.trim() !== "");
+
+const NUMBER_WORDS = {
+	one: 1,
+	two: 2,
+	three: 3,
+	four: 4,
+	five: 5,
+	six: 6,
+	seven: 7,
+	eight: 8,
+	nine: 9,
+	ten: 10,
+};
+
+/**
+ * statedCycles — the highest cycle count a report states, 0 when it states none.
+ * A report says it in prose ("ran 3 cycles", "it took two cycles"); the spec boilerplate a
+ * worker sometimes pastes back ("expect two or more cycles") is not the report saying it ran
+ * them, so a line carrying "expect ... cycles" is skipped.
+ */
+function statedCycles(text) {
+	let best = 0;
+	for (const line of String(text).split("\n")) {
+		if (/expect\b.*\bcycles?\b/i.test(line)) continue;
+		const seen = [];
+		for (const m of line.matchAll(/\bcycles?\s*[:=]\s*(\d+)/gi)) seen.push(Number(m[1]));
+		for (const m of line.matchAll(/\b(\d+)\s*\+?\s*cycles?\b/gi)) seen.push(Number(m[1]));
+		for (const m of line.matchAll(/\b([a-z]+)\s*\+?\s*cycles?\b/gi)) {
+			const n = NUMBER_WORDS[m[1].toLowerCase()];
+			if (n) seen.push(n);
+		}
+		for (const n of seen) if (Number.isFinite(n) && n > best) best = n;
+	}
+	return best;
+}
+
+/**
+ * futures — the three numbers nobody was counting: what the harness bought back.
+ * Throwing work away is the only way an iteration shows up as progress, so a non-empty
+ * "## Thrown away" section is credit. A report stating two or more cycles is the same credit
+ * on the other axis: the first attempt was allowed to be wrong. The Evidence share says how
+ * much of the finished work a reader can check without re-running it. Reports are the only
+ * input; a report present and non-empty is a finished one, and a missing directory is zero.
+ */
+function collectFutures() {
+	let files = [];
+	try {
+		files = fs.readdirSync(REPORTS).filter((f) => f.endsWith(".md")).sort();
+	} catch {
+		files = [];
+	}
+	let finished = 0;
+	const allSlugs = [];
+	const thrownAway = [];
+	const twoCycles = [];
+	const withEvidence = [];
+	const byCycles = [];
+	for (const file of files) {
+		let text = "";
+		try {
+			text = fs.readFileSync(path.join(REPORTS, file), "utf8");
+		} catch {
+			continue;
+		}
+		if (!text.trim()) continue;
+		finished += 1;
+		const slug = file.replace(/\.md$/, "");
+		allSlugs.push(slug);
+		if (filled(section(text, "thrown away"))) thrownAway.push(slug);
+		if (filled(section(text, "evidence"))) withEvidence.push(slug);
+		const cycles = statedCycles(text);
+		if (cycles >= 2) twoCycles.push(slug);
+		if (cycles) byCycles.push({ slug, cycles });
+	}
+	return {
+		finished_reports: finished,
+		thrown_away: {
+			count: thrownAway.length,
+			share: percent(thrownAway.length, finished),
+			reports: thrownAway,
+		},
+		two_or_more_cycles: {
+			count: twoCycles.length,
+			share: percent(twoCycles.length, finished),
+			reports: twoCycles,
+		},
+		evidence: {
+			count: withEvidence.length,
+			share: percent(withEvidence.length, finished),
+			reports_without: allSlugs.filter((s) => !withEvidence.includes(s)),
+		},
+		cycles_stated: byCycles,
+	};
 }
 
 const tally = (list, keyFn) => {
@@ -221,6 +348,7 @@ function collect(sinceMs, windowLabel) {
 			unread: unread.map((u) => ({ slug: u.slug, age_seconds: u.age_seconds, report: u.report })),
 		},
 		usage: { rows: uRows.length, unreadable: usage.unreadable },
+		futures: collectFutures(),
 	};
 }
 
@@ -235,12 +363,23 @@ function render(stats) {
 	// Seconds to something a reader can compare with a workday: m under 90 minutes, h above.
 	const age = (v) =>
 		v === null || v === undefined ? "—" : v < 90 ? `${v}s` : v < 5400 ? `${Math.round(v / 60)}m` : `${(v / 3600).toFixed(1)}h`;
+	// The futures panel goes above the usage numbers: it is the one block a reader acts on,
+	// and a number that needs scrolling past call latencies to find does not get read.
+	const f = stats.futures;
+	const futuresLines = [
+		"futures bought back (credit, not cost):",
+		`  thrown away:  ${f.thrown_away.count} of ${f.finished_reports} finished reports (${f.thrown_away.share}%)`,
+		`  two+ cycles:  ${f.two_or_more_cycles.count} of ${f.finished_reports} finished reports (${f.two_or_more_cycles.share}%)`,
+		`  evidence:     ${f.evidence.count} of ${f.finished_reports} finished reports (${f.evidence.share}%)`,
+	];
 	const q = stats.review_queue;
 	const queueLine = q.unread_reports
 		? `review queue: ${q.unread_reports} unread report${q.unread_reports === 1 ? "" : "s"} (oldest ${age(q.oldest_age_seconds)}, ${q.oldest_slug})`
 		: "review queue: 0 unread reports";
 
 	out.push(`window: last ${stats.window.duration} (${stats.window.since} → ${stats.window.until})`);
+	out.push("");
+	out.push(...futuresLines);
 	if (!d.total && !stats.usage.rows) {
 		out.push("");
 		out.push("no local model activity in this window");
