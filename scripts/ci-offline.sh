@@ -121,6 +121,12 @@ expect "placeholder scan over fenced reports" 0 "placeholder scan: ok" -- \
 #     for a separate script: each case needs its own temporary root and a stub herdr-app.
 expect "wipe checklist, refusal and skip log" 0 "wipe: ok" -- \
 	bash "$root/scripts/test-wipe.sh"
+# 5d. Provenance (Radar blips 79 and 82): a report's commit sha has to carry an Agent-Slug trailer
+#     before the close goes through, a wiped spec moves into specs/archive/, and the spawn template
+#     names both the archive and the trailers. Same pattern: the script owns a throwaway git repo
+#     and a temporary root, so nothing here touches the real workspace.
+expect "provenance trailers, spec archive and PR template" 0 "provenance: ok" -- \
+	bash "$root/scripts/test-provenance.sh"
 
 # 6. Routing is a refusal, not a warning. delegate reads jev from $PI_BOSS_ROOT/bin, so a
 #    fake jev there answers route=local without a model and without touching the real tree.

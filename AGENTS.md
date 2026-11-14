@@ -105,7 +105,8 @@ then close once it is answered. Every other report is relayed and its space clos
 10. Review sets the pace, not generation: at most one pull request per human sits in review at a
     time, and while a worker's report in an area is unread no second worker starts there
     (`delegate spawn` refuses it). Relay at most five items per turn, and run `delegate stats`
-    to see the unread queue and the age of its oldest report.
+    to see the unread queue and the age of its oldest report. Relays and PR bodies never present
+    LOC, PR count, token spend or "N agents" as progress: effort is cost, never progress.
 
 ## Layout
 
