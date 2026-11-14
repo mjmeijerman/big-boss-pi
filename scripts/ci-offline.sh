@@ -257,7 +257,9 @@ fi
 #    this, so a silent regression here lets every finished worker through unconsolidated.
 wipe_root=$work/wiperoot
 mkdir -p "$wipe_root/state" "$wipe_root/reports"
-printf '{"wipe-one":{"space":"s1","cwd":"","branch":"wipe-one"}}\n{"wipe-none":{"space":"s2","cwd":"","branch":""}}\n' \
+#    One JSON object, not one object per line: delegate parses the whole file as a single
+#    document, so a fixtures file that parsed to {} would let a wipe of an unknown slug pass.
+printf '{"wipe-one":{"space":"s1","cwd":"","branch":"wipe-one"},"wipe-none":{"space":"s2","cwd":"","branch":""}}\n' \
 	>"$wipe_root/state/delegations.json"
 expect "delegate wipe, five questions" 0 "Rewrite?" -- \
 	env PI_BOSS_ROOT=$wipe_root "$bin/delegate" wipe wipe-one

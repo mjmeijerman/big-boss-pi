@@ -159,6 +159,8 @@ consolidation questions — what did this feature make unnecessary and is that c
 is duplicated, could the next feature land in this area in 30 minutes, what did we learn, what
 would we rebuild from scratch — and records the run in `state/decisions.jsonl`.
 `delegate wipe <slug> --skip "<reason>"` records why the step does not apply, reason included.
+A slug nobody spawned is refused, nonzero, and named: a wipe that quietly does nothing is a wipe
+nobody can tell apart from a forgotten one.
 `delegate close` and `delegate sweep` refuse a worker with no wipe line for it, so a finished
 feature stops being a permanent addition by default. The answers belong in the worker's report
 under `## Thrown away`.

@@ -48,17 +48,20 @@ run() {
 	OUT=$out
 }
 
-# 1. The checklist is exactly five lines, and they are the five questions: code deleted,
-#    duplication, a new feature landing here in 30 minutes, what we learned, and what we would
-#    re-implement from scratch. Five lines is the assertion; the anchors keep it honest.
+# 1. The checklist is exactly five numbered questions, and they are the five that matter: code
+#    deleted, duplication, a new feature landing here in 30 minutes, what we learned, and what we
+#    would re-implement from scratch. Five numbered lines is the assertion; the anchors keep it
+#    honest. The header naming the worker and the closing next-step line are not counted: they are
+#    the paragraph every other delegate command prints, and forbidding them would make the wipe
+#    silent about which worker and which branch it just recorded.
 checklist_ok=0
 run wipe w1
 if [ "$RC" != 0 ]; then
 	fail "wipe on a known slug: exit $RC, wanted 0 — $OUT"
 else
-	lines=$(printf '%s\n' "$OUT" | grep -c .)
+	lines=$(printf '%s\n' "$OUT" | grep -cE '^[[:space:]]*[1-5][.)] ')
 	if [ "$lines" != 5 ]; then
-		fail "wipe printed $lines non-empty lines, wanted exactly 5 — $OUT"
+		fail "wipe printed $lines numbered questions, wanted exactly 5 — $OUT"
 	else
 		anchors="delete duplicat 30 learn scratch"
 		missing=""
