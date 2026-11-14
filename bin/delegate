@@ -2,7 +2,7 @@
 # delegate — the only way an agent in big-boss-pi starts work.
 #
 #   delegate spawn <slug> --cwd DIR [--mode bare|sandboxed|no-net] [--thinking LEVEL]
-#                  [--override-jev --reason TEXT] [--no-restore] "<task>"
+#                  [--acceptance] [--override-jev --reason TEXT] [--no-restore] "<task>"
 #   delegate wait <slug> [--timeout SECONDS]
 #   delegate list
 #   delegate close <slug>
@@ -24,6 +24,17 @@
 # as soon as the report has been relayed. The one exception is a report whose first line reads
 # "DECISION NEEDED: <question>": that marker keeps the space open until the user answers.
 # `delegate sweep` applies exactly that rule to every tracked worker in one go.
+#
+# A second opinion is a worker that has not seen the code. `delegate spawn SLUG --acceptance
+# --cwd DIR specs/some-spec.md` turns a spec into failing acceptance tests instead of an
+# implementation: the generated spec orders the worker to read that spec file and the interfaces
+# it names, never the implementation files of the change, to write one failing test per behaviour
+# the spec states, to raise DECISION NEEDED instead of guessing where the spec is silent, to
+# commit only test files and to leave production code untouched. The report has to show the tests
+# failing against the current tree, because a test that already passes proves nothing about work
+# not yet done. The mode is auditable: the spawn's state line and its printed result both carry
+# `acceptance`, so a later reader can tell a second opinion from an implementer without reading
+# the spec.
 #
 # Work in flight is capped by review, not by generation. A report is "read" once something marks
 # it so: `delegate wait` and `delegate close` write state/read/<slug> as they print or check the
@@ -474,9 +485,35 @@ Push it, or move it onto a branch, then spawn again:  git -C $cwd log --oneline 
 	say "trunk: fast-forwarded $branch in $cwd by $behind commit(s) to origin/$branch" >&2
 }
 
+# acceptance_source_spec <task> <cwd> — the spec file an acceptance-test worker reads.
+#
+# The task is the path itself, or text that names one ("specs/login.md, the magic-link flow"),
+# so the first word ending in .md is taken as the candidate. It is resolved against the worker's
+# cwd first and the boss's specs/ second, and it must end up inside a specs/ directory: the whole
+# point of the mode is that the tests come from spec text, and text that is not a spec is just
+# another instruction. Prints the absolute path, exits nonzero when there is no such file.
+acceptance_source_spec() {
+	local task=${1:-} cwd=${2:-} word cand
+	for word in $task; do
+		case $word in *.md|*.md[,.\;:]*) word=${word%%[,;:]*}; cand=$word; break ;; esac
+	done
+	[ -n "${cand:-}" ] || return 1
+	local try
+	for try in "$cwd/$cand" "$SPECS/${cand##*/}" "$ROOT/$cand"; do
+		[ -f "$try" ] || continue
+		local real dir
+		real=$(readlink -f -- "$try")
+		dir=$(dirname -- "$real")
+		[ "$(basename -- "$dir")" = specs ] || continue
+		printf '%s' "$real"
+		return 0
+	done
+	return 1
+}
+
 cmd_spawn() {
-	local slug="" cwd="" mode="" thinking="" task="" override_jev=0 reason="" runner="" no_restore=0
-	[ "$#" -ge 1 ] || die 'usage: delegate spawn <slug> --cwd DIR [--mode M] [--thinking LEVEL] [--override-jev --reason TEXT] [--no-restore] "<task>"'
+	local slug="" cwd="" mode="" thinking="" task="" override_jev=0 reason="" runner="" no_restore=0 acceptance=0
+	[ "$#" -ge 1 ] || die 'usage: delegate spawn <slug> --cwd DIR [--mode M] [--thinking LEVEL] [--acceptance] [--override-jev --reason TEXT] [--no-restore] "<task>"'
 	slug=$1; shift
 	local words=()
 	while [ "$#" -gt 0 ]; do
@@ -484,6 +521,7 @@ cmd_spawn() {
 		--cwd) cwd=${2:-}; shift 2 ;;
 		--mode) mode=${2:-}; shift 2 ;;
 		--thinking) thinking=${2:-}; shift 2 ;;
+		--acceptance) acceptance=1; shift ;;
 		--override-jev) override_jev=1; shift ;;
 		--reason) reason=${2:-}; shift 2 ;;
 		--no-restore) no_restore=1; shift ;;
@@ -501,6 +539,16 @@ cmd_spawn() {
 	*) die "thinking must be off, minimal, low, medium, high, xhigh or max: '$thinking'" ;;
 	esac
 	cwd=$(readlink -f -- "$cwd")
+	# --acceptance: the task text is, or names, a file under specs/. A second opinion that has not
+	# seen the implementation is only worth having if what it was given actually exists, so this
+	# is checked before jev is asked anything.
+	local source_spec=""
+	if [ "$acceptance" = 1 ]; then
+		source_spec=$(acceptance_source_spec "$task" "$cwd") ||
+			die "--acceptance needs a spec file under specs/ as the task: '${task}' names no such file"
+		[ "$source_spec" != "$SPECS/$slug.md" ] ||
+			die "--acceptance reads a spec, it does not write its own: '$slug' would overwrite $source_spec. Pick another slug."
+	fi
 	need herdr-app; need node; need hc
 
 	# 1. Jev decides the count, the mode, the route and the thinking effort. Always. No caller
@@ -626,6 +674,37 @@ Forcing a second worker in the same area needs --override-jev --reason '<why the
 	# overridden is the word "false" when nothing was overridden: test it, do not test for a value.
 	local overridden_note=""
 	if [ "$overridden" = true ]; then overridden_note=", overridden: $reason"; fi
+	# Acceptance mode rewrites the task section and adds one rule block. Everything else — the
+	# mission line, the worktree rule, the report shape — is the same worker, so it is the same
+	# template rather than a second one that drifts.
+	local acceptance_note="" acceptance_block="" task_block=$task acceptance_bool=false
+	if [ "$acceptance" = 1 ]; then
+		acceptance_bool=true
+		acceptance_note=", acceptance: true"
+		task_block="Acceptance tests for the spec at \`$source_spec\`. You are the second opinion: the
+spec is your whole input, and the implementation is not."
+		acceptance_block=$(cat <<ACCEPTANCE
+
+## Acceptance mode
+
+You write the tests from the spec text alone and never see what was built. A test written by
+someone who has read the code can be bent to fit it, and then it proves nothing; that distance is
+the only reason this worker exists.
+
+1. Read only \`$source_spec\` and the interface files it names by path — a header, a type
+   declaration, a documented entry point. Never open the implementation files of the change: not
+   to check a name, not to see how it is wired. A path the spec does not name is not yours to read.
+2. Write one failing test per behaviour the spec states: the commands, inputs, outputs and
+   refusals it names. Not one more, not one guess at an unstated case.
+3. Ambiguity is not yours to resolve. Where the spec does not say what should happen, make the
+   first line of your report \`DECISION NEEDED: <the question in one line>\` and stop.
+4. Commit only test files. Production code stays untouched — a failing test is the deliverable,
+   and an implementation written here would defeat the point.
+5. The report must show the tests failing against the current tree, with the output that shows
+   it. If they pass, say which it is: the work is already done, or the tests do not test the spec.
+ACCEPTANCE
+)
+	fi
 	cat >"$spec" <<EOF
 # Worker \`$slug\`
 
@@ -644,7 +723,8 @@ Report to the agent in the big-boss-pi workspace that started you; it is waiting
 
 ## Task
 
-$task
+$task_block
+$acceptance_block
 
 ## Rules
 
@@ -726,13 +806,14 @@ EOF
 	[ -n "$space" ] || die "could not read the new space id from: $out"
 
 	node -e '
-		const fs=require("fs");const [state,slug,space,tab,pane,terminal,cwd,mode,thinking,spec,report,jevCount,jevEffort,overridden,reason,branch]=process.argv.slice(1);
+		const fs=require("fs");const [state,slug,space,tab,pane,terminal,cwd,mode,thinking,spec,report,jevCount,jevEffort,overridden,reason,branch,acceptance,sourceSpec]=process.argv.slice(1);
 		let j={};try{j=JSON.parse(fs.readFileSync(state,"utf8"))}catch{}
 		j[slug]={slug,space,tab,pane,terminal,cwd,mode,thinking,thinkingEffort:jevEffort,spec,report,jevCount:Number(jevCount),
-			overridden:overridden==="true",overrideReason:reason||null,branch:branch||null,started:new Date().toISOString()};
+			overridden:overridden==="true",overrideReason:reason||null,branch:branch||null,acceptance:acceptance==="true",
+			acceptanceSpec:sourceSpec||null,started:new Date().toISOString()};
 		fs.writeFileSync(state,JSON.stringify(j,null,2)+"\n");' \
 		"$DELEGATIONS" "$slug" "$space" "$tab" "$pane" "$terminal" "$cwd" "$mode" "$thinking" "$spec" "$report" \
-		"$jev_count" "$jev_effort" "$overridden" "$reason" "$base_branch"
+		"$jev_count" "$jev_effort" "$overridden" "$reason" "$base_branch" "$acceptance_bool" "$source_spec"
 
 	# space.new's --task can arrive before pi is listening, so send it again once the banner is up.
 	local i
@@ -743,8 +824,8 @@ EOF
 	hc send "$terminal" "Read $spec and do it. Report to $report." >/dev/null 2>&1 \
 		|| printf '%s: warning: could not send the task to %s\n' "$prog" "$terminal" >&2
 
-	printf '{"slug":"%s","space":"%s","mode":"%s","thinking":"%s","thinking_effort":"%s","route":"%s","jev_count":%s,"overridden":%s,"cwd":"%s","report":"%s","branch":"%s"}\n' \
-		"$slug" "$space" "$mode" "$jev_level" "$jev_effort" "$jev_route" "$jev_count" "$overridden" "$cwd" "$report" "$base_branch"
+	printf '{"slug":"%s","space":"%s","mode":"%s","thinking":"%s","thinking_effort":"%s","route":"%s","jev_count":%s,"overridden":%s,"acceptance":%s,"cwd":"%s","report":"%s","branch":"%s"}\n' \
+		"$slug" "$space" "$mode" "$jev_level" "$jev_effort" "$jev_route" "$jev_count" "$overridden" "$acceptance_bool" "$cwd" "$report" "$base_branch"
 }
 
 cmd_wait() {
