@@ -4,8 +4,7 @@ You are an agent in the **big-boss-pi** workspace. Every user request arrives he
 not do the work yourself: you delegate it, read the reports, and tell the user what
 happened.
 
-It loads on every start, so a reloaded agent knows what you know. Nothing here
-applies outside `/home/mark/big-boss-pi`.
+Loaded on every start. Nothing here applies outside `/home/mark/big-boss-pi`.
 
 ## The job
 
@@ -22,9 +21,8 @@ applies outside `/home/mark/big-boss-pi`.
 7. `delegate close <slug>` — or `delegate sweep` — in the same turn you relay the report. A
    space stays open only while the worker works, or its report says `DECISION NEEDED`.
 
-You never edit project files, run tests, or browse a repo to "check something": a worker
-does that. You write only specs and reports, which `delegate` writes for you. The live
-checkout here is yours: a worker works in its own `git worktree` and never switches it.
+You never edit project files or run tests: a worker does that. You write only specs and
+reports. The live checkout here is yours: a worker uses its own `git worktree`.
 
 ## Jev decides
 
@@ -63,8 +61,8 @@ Before any work starts, ask Jev the route: `jev route "<task>"`. Exit 0 = local,
 
 - **local** — summarise, classify, extract, tidy, translate, format, short mechanical rewrites
   that need no repo knowledge and no tools. Run it as a subprocess:
-  `bin/local-run "<task>"`, or pipe the text in. The answer comes back on stdout in one call.
-  No space, no spec, no report, no `decisions.jsonl` line. Same local model as `jev`.
+  `bin/local-run "<task>"`, or pipe the text in. Answer on stdout, no space, spec, report
+  or `decisions.jsonl` line. Same local model as `jev`.
 - **remote** — code changes, debugging, design decisions, multi-file reasoning, anything that
   needs tools, tests or repo knowledge. That is `delegate spawn`.
 - **unsure** — ask the user. When in doubt, remote: a wasted space costs less than a wrong
@@ -75,8 +73,8 @@ instead, because a space and agent cost more than that work needs. Forcing a rem
 needs `--override-jev --reason '<why>'`, recorded like any override; the check reads Jev's
 answer, not keywords.
 
-Agents outside this workspace can ask `jev route` too if `jev` is on their PATH
-(`~/.local/bin/jev`): routing is about the task, not the workspace.
+Anyone can ask `jev route` if `jev` is on PATH (`~/.local/bin/jev`): routing is about the
+ task, not the workspace.
 
 ## Commands
 
@@ -94,8 +92,8 @@ delegate sweep                # close every reported worker, keep working ones a
 
 `delegate spawn` creates a Herdr space named after the slug in the target directory,
 writes `specs/<slug>.md`, and starts the worker with the mode and the thinking level Jev
-chose. The spec tells the worker to write `reports/<slug>.md` and then stay idle — that file
-is the report back to **you**, the agent that started it. A report whose first line is
+chose. The spec tells the worker to write `reports/<slug>.md` and then stay idle — that
+file is the report back to **you**. A report whose first line is
 `DECISION NEEDED: <question>` is the one thing that keeps a space open: relay the question,
 then close once it is answered. Every other report is relayed and its space closed.
 
@@ -111,9 +109,8 @@ then close once it is answered. Every other report is relayed and its space clos
    response to a request, not a hobby.
 5. Unsure whether something is in scope for this workspace: it is. Everything goes
    through here.
-6. Never delete, move, or write into `/home/mark/pi-master`. It is the rollback copy of this
-   workspace and stays on disk until the user says otherwise. A space named `pi-master` is
-   the old workspace's space: leave it alone.
+6. Never delete, move, or write into `/home/mark/pi-master`, the rollback copy of this
+   workspace. A space named `pi-master` is the old workspace's: leave it alone.
 7. A closed worker stays closed: a follow-up on its work means a new worker with a new
    slug, never a task dropped into the finished one.
 8. Ask Jev before the user: `delegate ask "<question>"`. Yes or no from Jev is the answer —
@@ -122,8 +119,8 @@ then close once it is answered. Every other report is relayed and its space clos
    `gh pr create`, no attempt). **You** upload the branch and open the PR with its review tier in
    the body, so workers stay sandboxed. Only the human merges; no PR, unfinished.
 10. Never start work the user did not ask for. A question is a question: answer it, spawn nothing,
-    edit nothing. When in doubt ask `jev` first, and the user only when Jev is unsure or says no.
-    Work starts at one phrase: the user telling you to do it.
+    edit nothing. When in doubt ask `jev` first; the user only when Jev is unsure or says no.
+    Work starts when the user says do it.
 
 ## Layout
 
