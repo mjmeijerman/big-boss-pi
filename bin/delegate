@@ -139,10 +139,41 @@ report_has_evidence() {
 # "LINE:TEXT" lines, empty when the report is written out in full. Narrow on purpose: a report
 # may quote a literal <slug> in a code fence, so only the words that mean "I did not fill this
 # in" are matched, and TODO/TBD/FIXME only as whole words.
+#
+# Fenced code blocks are pasted output, not prose: a test runner that prints "# todo 0" is
+# evidence the run happened, so the scan skips every line inside a fence (three or more
+# backticks or tildes; a fence closes with the same character and at least the same length).
+# A fence opened and never closed is read as fenced to end of file — a report is never refused
+# over pasted output — and one warning line goes to stderr, so the typo is still seen.
 report_placeholders() {
 	local report=${1:-}
 	[ -f "$report" ] || return 0
-	grep -niE '<[[:space:]]*(fill|insert|your|add|paste|todo|tbd)|(^|[^[:alpha:]])(todo|tbd|fixme)([^[:alpha:]]|$)' -- "$report" || true
+	awk -v prog="$prog" -v file="$report" '
+		{
+			t = $0
+			sub(/^[ \t]+/, "", t)
+			if (infence) {
+				if (match(t, /^(`{3,}|~{3,})/)) {
+					m = substr(t, RSTART, RLENGTH)
+					if (substr(t, RLENGTH + 1) ~ /^[ \t]*$/ && substr(m, 1, 1) == ch && length(m) >= len) infence = 0
+				}
+				next
+			}
+			if (match(t, /^(`{3,}|~{3,})/)) {
+				m = substr(t, RSTART, RLENGTH)
+				ch = substr(m, 1, 1); len = length(m); infence = 1; openline = NR; openrun = m
+				next
+			}
+			if (tolower($0) ~ /<[[:space:]]*(fill|insert|your|add|paste|todo|tbd)|(^|[^[:alpha:]])(todo|tbd|fixme)([^[:alpha:]]|$)/) {
+				printf "%d:%s\n", NR, $0
+			}
+		}
+		END {
+			if (infence) {
+				printf "%s: warning: %s: unclosed %s fence opened at line %d — the rest of the file is read as fenced output\n", prog, file, openrun, openline > "/dev/stderr"
+			}
+		}
+	' < "$report"
 }
 
 # ask_jev <mode|count|thinking> <task text> [context] — sets JEV_DECISION and JEV_REASON; dies

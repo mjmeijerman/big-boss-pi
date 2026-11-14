@@ -111,6 +111,12 @@ fi
 expect "delegate list, empty temp root" 0 "no workers" -- \
 	env PATH=$safe_path "$bin/delegate" list
 
+# 5b. The close guard reads prose, not pasted output. It has its own script because every case
+#     drives a real `delegate close` against its own temporary root; running it here is what
+#     keeps those cases in CI without a second workflow step.
+expect "placeholder scan over fenced reports" 0 "placeholder scan: ok" -- \
+	bash "$root/scripts/test-placeholders.sh"
+
 # 6. Routing is a refusal, not a warning. delegate reads jev from $PI_BOSS_ROOT/bin, so a
 #    fake jev there answers route=local without a model and without touching the real tree.
 #    herdr-app, hc and the runner are stubs, so a spawn that gets past the refusal cannot
