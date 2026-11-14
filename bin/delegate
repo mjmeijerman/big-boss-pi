@@ -236,6 +236,31 @@ report_placeholders() {
 	' < "$report"
 }
 
+# report_commit_sha <report> -- the commit sha the report records, empty when it records none.
+# A report names it on a line carrying the word "commit"; the sha is the longest run of hex
+# characters of 7 to 40 on that line, which is what a short and a full sha both look like.
+report_commit_sha() {
+	[ -f "${1:-}" ] || return 0
+	awk '
+		tolower($0) ~ /commit/ {
+			line = tolower($0); best = ""
+			while (match(line, /[0-9a-f]+/)) {
+				w = substr(line, RSTART, RLENGTH)
+				if (length(w) >= 7 && length(w) <= 40 && length(w) > length(best)) best = w
+				line = substr(line, RSTART + RLENGTH)
+			}
+			if (best != "") { print best; exit }
+		}
+	' "$1"
+}
+
+# commit_message <cwd> <sha> -- the full message of that commit, empty when the sha does not
+# resolve in that tree. The provenance check compares a report's sha against the repo the worker
+# was given, so a made-up sha fails instead of passing as a mystery.
+commit_message() {
+	git -C "${1:-}" log -1 --format=%B "${2:-}" 2>/dev/null
+}
+
 # wipe_recorded <slug> — true when state/decisions.jsonl carries a wipe line for that slug,
 # either the step itself (decision "done") or the recorded reason it did not apply ("skipped").
 # cmd_close asks this: the wipe is mandatory, and a mandatory step nobody can check is a wish.
@@ -717,6 +742,9 @@ Report to the agent in the big-boss-pi workspace that started you; it is waiting
   gains, and the observation that shows the gain. Every effort number (LOC, tokens, files, agent
   count) is cost, never progress — leave it out of the mission.
 - **Iteration**: expect two or more cycles. You may throw this away.
+- **Spec history**: before you start, read the most recent spec in \`specs/archive/\` for the area
+  you are working in — it is the previous decision in this place. If there is none, say so in the
+  report instead of leaving the reader to guess.
 - Work in: \`$cwd\`
 - Mode: \`$mode\` (chosen by jev$overridden_note), route: $jev_route (jev), thinking: \`$jev_level\` (jev: $jev_effort)
 - Report file: \`$report\`
@@ -746,13 +774,17 @@ $acceptance_block
    comments, formatting; medium: application code, tests, migrations; high: extensions,
    AGENTS.md, .github/, git-hooks/, sandbox/, auth, secrets, money, deletion). Never merge,
    never upload onto trunk, never commit on trunk. You stay sandboxed: publishing is the boss's
+   End the message with two trailers: \`Agent-Slug: $slug\` and \`Spec: $SPECS/$slug.md\`.
+   \`delegate close\` refuses a report whose recorded commit sha has no \`Agent-Slug\` trailer.
    job, so it never needs host access from you.
 6. When you are done — or blocked and unable to continue — write \`$report\` with:
    - **Mission**: who is better off now, and how we would see it. The same line the spec gave
      you, updated with what actually happened. No LOC, no token counts, no file counts, no
      "N agents": effort is not mission, and output volume is not correctness.
    - what now works, in concrete terms (a command to run, a path, a test that passes)
-   - what you changed (branch, commit sha, files), and the PR URL, or the branch to publish
+   - what you changed: the branch, and one \`Commit: <sha>\` line with the commit that carries
+     the work (the close checks its \`Agent-Slug\` trailer), plus the files and the PR URL or the
+     branch to publish
    - what is still open, and the one next action for the person
    - \`## Evidence\` — mandatory, and the only part a reader has to trust: the exact command
      you ran and the last 20 lines of its output, pasted in a fenced block. \`delegate close\`
@@ -991,6 +1023,15 @@ cmd_wipe() {
 	say "  5. Rewrite?      what would you re-implement from scratch, and why?"
 	say ""
 	say "Write the answers into the report (## Thrown away), then this line records the step."
+	# Spec continuity (Radar blip 82): a finished spec moves out of specs/ into specs/archive/, where
+# the next worker in the same area reads it before it starts. A spec nobody archives is one the
+# next worker re-decides from nothing.
+local spec=$SPECS/$slug.md
+if [ -f "$spec" ]; then
+	mkdir -p "$SPECS/archive"
+	mv "$spec" "$SPECS/archive/$slug.md"
+	say "spec archived: specs/archive/$slug.md — the next worker in this area reads it first"
+fi
 	record_decision wipe "$slug" done "" false "$slug"
 	say "state/decisions.jsonl: wipe done for $slug — close goes through:  $BIN/delegate close $slug"
 }
@@ -1030,6 +1071,38 @@ cmd_close() {
 			return 1
 		fi
 	fi
+
+	# Provenance (Radar blip 79): a report names the commit it stands for, and that commit names the
+# worker in an Agent-Slug trailer. Refused in the same voice as the evidence block: name what is
+# missing, print the exact command that fixes it, leave the space open. Nothing is checked when
+# the worker's cwd is not a git repo — there is no commit to resolve a sha against, and a guard
+# that refuses every report on a plain folder is a guard nobody keeps.
+if [ -n "$cwd" ] && [ -d "$cwd" ] && git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
+	local sha msg
+	sha=$(report_commit_sha "$report")
+	if [ -z "$sha" ]; then
+		printf '%s: refusing to close %s: %s records no commit sha, so nothing ties the change to this worker.\n' "$prog" "$slug" "$report" >&2
+		printf 'Fix: add a line "Commit: <sha>" to the report naming the commit that carries the work, then close again:\n' >&2
+		printf '  git -C %q log -1 --format=%%H\n' "$cwd" >&2
+		printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
+		return 1
+	fi
+	msg=$(commit_message "$cwd" "$sha" || true)
+	if [ -z "$msg" ]; then
+		printf '%s: refusing to close %s: %s records commit %s, and it does not resolve in %s, so nobody can check it.\n' "$prog" "$slug" "$report" "$sha" "$cwd" >&2
+		printf 'Fix: record the sha of the commit that carries the work, then close again:\n' >&2
+		printf '  git -C %q log -1 --format=%%H\n' "$cwd" >&2
+		printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
+		return 1
+	fi
+	if ! printf '%s\n' "$msg" | grep -qE '^Agent-Slug:[[:space:]]*[^[:space:]]'; then
+		printf '%s: refusing to close %s: %s records commit %s, and that commit has no Agent-Slug trailer, so nothing ties the change to this worker.\n' "$prog" "$slug" "$report" "$sha" >&2
+		printf 'Fix: end that commit'"'"'s message with the two trailers, then close again:\n' >&2
+		printf "  git -C %%q commit --amend --no-edit --trailer 'Agent-Slug: %s' --trailer 'Spec: specs/%s.md'\n" "$slug" "$slug" >&2
+		printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
+		return 1
+	fi
+fi
 
 	# The report has been read and checked by the time a close gets here: mark it, so a cwd whose
 	# worker just closed is free for the next one.
