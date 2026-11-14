@@ -30,17 +30,11 @@ reports. The live checkout here is yours: a worker uses its own `git worktree`.
 
 ## Jev decides
 
-`jev` is the local decision model (qwen3.8:27b, no API cost, no network). Its subcommands —
-route, count, mode, thinking, ask, permit — with their exit codes (0 yes, 1 no, 3 unsure) and
-the mode rules it works from are in `~/.pi/agent/skills/jev/SKILL.md`. Ask it, do not guess.
-
-- **Every decision goes through Jev:** worker count, sandbox mode, yes/no/unsure calls. You
-  never decide these yourself or pass a `--mode` "because you know better". `delegate spawn`
-  asks Jev again and aborts when it is unsure or unreachable. Overturning Jev needs
-  `--override-jev --reason '<why>'`, recorded in `state/decisions.jsonl`. Only the user
-  overrides a no.
-- This workspace's own agent runs bare: it must reach the Herdr sockets to start spaces.
-  It does no project work, so it has nothing to sandbox.
+Subcommands, exit codes and mode rules are in `~/.pi/agent/skills/jev/SKILL.md`; ask it, do not
+guess. `delegate spawn` asks Jev itself and aborts when it is unsure or unreachable. Never pass a
+`--mode` or `--thinking` "because you know better": overturning Jev needs `--override-jev
+--reason '<why>'`, recorded in `state/decisions.jsonl`, and only the user overrides a no. This
+agent runs bare — it needs the Herdr sockets and does no project work.
 
 ## Routing: local or remote first
 
@@ -102,14 +96,16 @@ then close once it is answered. Every other report is relayed and its space clos
    workspace. A space named `pi-master` is the old workspace's: leave it alone.
 7. A closed worker stays closed: a follow-up on its work means a new worker with a new
    slug, never a task dropped into the finished one.
-8. Ask Jev before the user: `delegate ask "<question>"`. Yes or no from Jev is the answer —
-   act on it quietly. Only unsure or unreachable reaches the user, carrying Jev's reason.
-9. Every change lands as a pull request: the worker commits on its branch and stops (no push, no
+8. Every change lands as a pull request: the worker commits on its branch and stops (no push, no
    `gh pr create`, no attempt). **You** upload the branch and open the PR with its review tier in
    the body, so workers stay sandboxed. Only the human merges; no PR, unfinished.
-10. Never start work the user did not ask for. A question is a question: answer it, spawn nothing,
-    edit nothing. When in doubt ask `jev` first; the user only when Jev is unsure or says no.
-    Work starts when the user says do it.
+9. Never start work the user did not ask for. A question is a question: answer it, spawn nothing,
+   edit nothing. When in doubt ask `jev` first; the user only when Jev is unsure or says no.
+   Work starts when the user says do it.
+10. Review sets the pace, not generation: at most one pull request per human sits in review at a
+    time, and while a worker's report in an area is unread no second worker starts there
+    (`delegate spawn` refuses it). Relay at most five items per turn, and run `delegate stats`
+    to see the unread queue and the age of its oldest report.
 
 ## Layout
 

@@ -165,6 +165,55 @@ else
 	fail "no route line with decision local and overridden true in state/decisions.jsonl"
 fi
 
+# 6b. Work in flight is capped by review. A reported worker in a cwd whose report nobody marked
+#     read blocks the next spawn there; the marker clears it and --override-jev --reason goes
+#     through. Same stub harness, with jev answering remote so the route check is not what speaks.
+cat >"$PI_BOSS_ROOT/bin/jev" <<'STUB'
+#!/usr/bin/env bash
+case $1 in
+route) printf '{"route":"remote","reason":"code change"}\n'; exit 1 ;;
+mode) printf '{"mode":"sandboxed","reason":"repo work"}\n' ;;
+count) printf '{"count":1,"reason":"one worker"}\n' ;;
+thinking) printf '{"thinking":"low","reason":"mechanical"}\n' ;;
+*) printf '{"reason":"stub"}\n' ;;
+esac
+exit 0
+STUB
+chmod +x "$PI_BOSS_ROOT/bin/jev"
+mkdir -p "$PI_BOSS_ROOT/reports" "$PI_BOSS_ROOT/state"
+printf 'reported, waiting to be read\n' >"$PI_BOSS_ROOT/reports/old-worker.md"
+cat >"$PI_BOSS_ROOT/state/delegations.json" <<DELEGATIONS
+{"old-worker":{"slug":"old-worker","space":"s1","cwd":"$work","report":"$PI_BOSS_ROOT/reports/old-worker.md","branch":""}}
+DELEGATIONS
+expect "delegate spawn, unread report in the same cwd refuses" 1 "a report there is still unread" -- \
+	env PATH=$stub:$safe_path "$bin/delegate" spawn "new-worker" --cwd "$work" "change one file"
+if grep '"command":"in-flight"' "$PI_BOSS_ROOT/state/decisions.jsonl" 2>/dev/null | grep -q '"decision":"blocked"'; then
+	pass "in-flight refusal recorded in state/decisions.jsonl"
+else
+	fail "no in-flight blocked line in state/decisions.jsonl"
+fi
+# A read marker is what clears it: the spawn then gets past the queue and dies later, on the stub
+# herdr-app's missing space id. That line is the proof the refusal above came from the queue alone.
+mkdir -p "$PI_BOSS_ROOT/state/read"
+: >"$PI_BOSS_ROOT/state/read/old-worker"
+expect "delegate spawn, read marker clears the block" 1 "could not read the new space id" -- \
+	env PATH=$stub:$safe_path "$bin/delegate" spawn "new-worker" --cwd "$work" "change one file"
+rm -f "$PI_BOSS_ROOT/state/read/old-worker"
+env PATH=$stub:$safe_path "$bin/delegate" spawn "new-worker" --cwd "$work" --override-jev \
+	--reason "the queue can wait, this is a one-line fix" "change one file" >/dev/null 2>&1 || true
+if grep '"command":"in-flight"' "$PI_BOSS_ROOT/state/decisions.jsonl" 2>/dev/null | grep -q '"decision":"override".*"overridden":true'; then
+	pass "in-flight override recorded with its reason in state/decisions.jsonl"
+else
+	fail "no in-flight override line with overridden true in state/decisions.jsonl"
+fi
+# `delegate wait` prints the report and marks it read in one go: the queue drains by reading, and
+# nothing else marks a report read.
+expect "delegate wait marks the report read" 0 "old-worker reported" -- \
+	"$bin/delegate" wait old-worker --timeout 5
+[ -f "$PI_BOSS_ROOT/state/read/old-worker" ] &&
+	pass "delegate wait wrote state/read/old-worker" ||
+	fail "delegate wait left no read marker for old-worker"
+
 # 7. delegate stats: the aggregation over both files, with fixtures written into the
 #    temporary root. The numbers below are the assertion: counts per command, the route split,
 #    the override count (including one legacy row whose flag predates the per-line fix), and the
@@ -206,6 +255,21 @@ expect "stats, legacy override named" 0 "1 legacy rows" -- \
 expect "stats, bad duration refused" 2 "--since takes a duration" -- \
 	"$bin/delegate" stats --since 7
 
+# The review queue is current state, not a window: two reported workers, one read, so one unread
+# whose report was written two hours ago. The age printed must be the report's, not the run's.
+mkdir -p "$PI_BOSS_ROOT/reports" "$PI_BOSS_ROOT/state/read"
+printf 'reported\n' >"$PI_BOSS_ROOT/reports/queue-old.md"
+printf 'reported\n' >"$PI_BOSS_ROOT/reports/queue-read.md"
+: >"$PI_BOSS_ROOT/state/read/queue-read"
+touch -d '2 hours ago' "$PI_BOSS_ROOT/reports/queue-old.md"
+cat >"$PI_BOSS_ROOT/state/delegations.json" <<DELEGATIONS
+{"queue-old":{"slug":"queue-old","space":"s1","cwd":"$work","report":"$PI_BOSS_ROOT/reports/queue-old.md"},
+ "queue-read":{"slug":"queue-read","space":"s2","cwd":"$work","report":"$PI_BOSS_ROOT/reports/queue-read.md"},
+ "queue-working":{"slug":"queue-working","space":"s3","cwd":"$work","report":"$PI_BOSS_ROOT/reports/queue-working.md"}}
+DELEGATIONS
+expect "stats, unread review queue" 0 "review queue: 1 unread report (oldest 2.0h, queue-old)" -- \
+	"$bin/delegate" stats
+
 # assert_stats '<json>' -- compare dotted paths in the stats JSON against the wanted values,
 # read from stdin. Prints the mismatches and exits 1 when any disagree.
 assert_stats() {
@@ -245,11 +309,25 @@ if msg=$(printf '%s' "$stats_json" | assert_stats '{
 	"local_run.total_latency_ms":6000,
 	"local_run.median_latency_ms":3000,
 	"local_work_path.used":true,
-	"local_work_path.invocations":3
+	"local_work_path.invocations":3,
+	"review_queue.unread_reports":1,
+	"review_queue.oldest_slug":"queue-old"
 }'); then
 	pass "stats --json aggregation matches the fixtures"
 else
 	fail "stats --json aggregation: $msg"
+fi
+# The age of the queue is read off the report, and a worker with no report is still working, not
+# unread — so the count above is one and the age is about two hours.
+oldest=$(printf '%s' "$stats_json" | node -e '
+	let d = "";
+	process.stdin.on("data", (c) => (d += c)).on("end", () => {
+		try { process.stdout.write(String(JSON.parse(d).review_queue.oldest_age_seconds)); } catch { process.stdout.write(""); }
+	});')
+if [ -n "$oldest" ] && [ "$oldest" -ge 7100 ] && [ "$oldest" -le 7400 ]; then
+	pass "stats, oldest unread age is the report's age (${oldest}s)"
+else
+	fail "stats, oldest unread age: got '${oldest}', wanted about 7200"
 fi
 
 # 8. The wipe step between features: five questions on stdout, the run recorded in the log, a
