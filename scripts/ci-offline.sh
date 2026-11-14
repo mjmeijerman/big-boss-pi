@@ -363,5 +363,8 @@ expect "delegate close, no wipe step recorded" 1 "no wipe step recorded" -- \
 expect "delegate wipe, no slug" 1 "usage: delegate wipe" -- \
 	env PI_BOSS_ROOT=$wipe_root "$bin/delegate" wipe
 
+expect "acceptance mode, flag, generated spec and recorded mode" 0 "acceptance mode: ok" -- \
+	bash "$root/scripts/test-acceptance.sh"
+
 printf '\n%s\n' "$([ "$fails" = 0 ] && echo "offline behaviour: ok" || echo "offline behaviour: $fails failure(s)")"
 [ "$fails" = 0 ]
