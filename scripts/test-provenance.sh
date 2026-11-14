@@ -84,6 +84,8 @@ elif ! printf '%s' "$OUT" | grep -qF "Agent-Slug"; then
 	fail "commit without Agent-Slug: the refusal does not name the trailer — $OUT"
 elif ! printf '%s' "$OUT" | grep -qF -- "--trailer 'Agent-Slug: no-trailer'"; then
 	fail "commit without Agent-Slug: the refusal does not print the git fix — $OUT"
+elif printf '%s' "$OUT" | grep -qE -- '--merged|patch-id|cherry'; then
+	fail "a close with no --merged mentions the escape, so the byte-identical case has grown — $OUT"
 else
 	pass "commit without an Agent-Slug trailer refuses, and prints the fix (exit 1)"
 fi
@@ -236,8 +238,12 @@ fi
 # 9. The escape for a commit that is already in trunk. A repo with a real remote, a commit that
 #    landed on origin/trunk without the trailer (a squash merge looks exactly like this), and a
 #    second commit that is still only on the branch. `delegate close --merged` has one permission
-#    to give: a commit that is already in trunk cannot be amended, so the trailer is recorded
-#    after the fact instead.
+#    to give: a change that is already in trunk cannot be amended, so the trailer is recorded
+#    after the fact instead — and since this repo squash-merges, "already in trunk" has to include
+#    the same patch under another sha, or every close after a squash refuses forever.
+#
+#    The fixture carries real file content rather than empty commits on purpose: every empty commit
+#    has the same patch-id, so a repo of those cannot tell a landed change from an unlanded one.
 remote=$work/remote.git
 merged=$work/merged
 mkdir -p "$merged"
@@ -246,15 +252,18 @@ git -C "$merged" init -q -b trunk
 git -C "$merged" config user.email worker@example.invalid
 git -C "$merged" config user.name worker
 git -C "$merged" remote add origin "$remote"
-git -C "$merged" commit -q --allow-empty -m "feat: the base"
+printf 'one\ntwo\nthree\n' >"$merged/f"
+git -C "$merged" add f
+git -C "$merged" commit -q -m "feat: the base"
 git -C "$merged" push -q origin trunk
 # landed: on origin/trunk, no Agent-Slug trailer
-printf 'feat: a change that landed without a trailer\n' >"$work/msg-landed"
-git -C "$merged" commit -q --allow-empty -F "$work/msg-landed"
+printf 'one\nTWO\nthree\n' >"$merged/f"
+git -C "$merged" commit -q -a -m "feat: a change that landed without a trailer"
 landed=$(git -C "$merged" rev-parse HEAD)
 git -C "$merged" push -q origin trunk
-# in-flight: on the branch only, also no trailer
-git -C "$merged" commit -q --allow-empty -m "feat: still on the branch"
+# in-flight: on the branch only, also no trailer, and a different patch
+printf 'one\nTWO\nTHREE\n' >"$merged/f"
+git -C "$merged" commit -q -a -m "feat: still on the branch"
 inflight=$(git -C "$merged" rev-parse HEAD)
 git -C "$merged" fetch -q --prune origin
 # A wipe line each, because these cases are about provenance, not about the checklist.
@@ -375,6 +384,257 @@ else
 	else
 		pass "every row keeps the standard fields and delegate stats parses the log (0 unreadable, provenance counted)"
 	fi
+fi
+
+# The cases below accept closes of their own, so they get their wipe lines in one go: a refusal in
+# them is about provenance, not about the consolidation checklist.
+printf '{"timestamp":"%s","command":"wipe","task":"%s","decision":"done","reason":null,"overridden":false,"slug":"%s"}\n' \
+	"$(date -u +%Y-%m-%dT%H:%M:%SZ)" merged-order merged-order \
+	"$(date -u +%Y-%m-%dT%H:%M:%SZ)" merged-equiv merged-equiv \
+	"$(date -u +%Y-%m-%dT%H:%M:%SZ)" merged-neighbour merged-neighbour \
+	"$(date -u +%Y-%m-%dT%H:%M:%SZ)" merged-reverted merged-reverted \
+	"$(date -u +%Y-%m-%dT%H:%M:%SZ)" merged-shallow merged-shallow \
+	>>"$PI_BOSS_ROOT/state/decisions.jsonl"
+
+# (e) The ordering, proved rather than asserted. The ancestor case is answered by
+#     `merge-base --is-ancestor` alone; the patch-id machinery must never be reached on it, or the
+#     cheapest test has become the most expensive one. A git on PATH that exits 97 when it is
+#     asked for cherry, patch-id or apply makes "never reached" observable — there is no test-only
+#     branch in bin/delegate a production run could take instead.
+realgit=$(command -v git)
+mkdir -p "$work/stub-git"
+{
+	printf '#!/usr/bin/env bash\n'
+	printf 'for a in "$@"; do case $a in cherry|patch-id|apply) printf "%%s\\n" "$*" >>"%s/patch-id-called"; exit 97 ;; esac; done\n' "$work"
+	printf 'exec %s "$@"\n' "$realgit"
+} >"$work/stub-git/git"
+chmod +x "$work/stub-git/git"
+mkdir -p "$PI_BOSS_ROOT/reports"
+cat >"$PI_BOSS_ROOT/reports/merged-order.md" <<REPORT
+# Report
+
+Mission: the cheap ancestor test answers before the patch-id machinery is asked anything.
+
+Commit: $landed
+
+## Evidence
+
+\$ bash scripts/test-provenance.sh — ok
+REPORT
+printf '{"merged-order":{"space":"space-merged-order","cwd":"%s","branch":""}}\n' "$merged" \
+	>"$PI_BOSS_ROOT/state/delegations.json"
+out=$(PATH=$work/stub-git:$PATH "$bin/delegate" close merged-order --merged 63 2>&1) && rc=0 || rc=$?
+if [ -s "$work/patch-id-called" ]; then
+	fail "the ancestor case reached the patch-id machinery: $(head -n 3 "$work/patch-id-called")"
+elif [ "$rc" != 0 ]; then
+	fail "the ancestor case through a patch-id-hostile git: exit $rc, wanted 0 — $out"
+elif ! printf '%s' "$out" | grep -qF "is already in origin/trunk"; then
+	fail "the ancestor case: the warning stopped saying the commit is already in trunk — $out"
+else
+	pass "the ancestor case closes on merge-base alone: cherry, patch-id and apply are never called"
+fi
+
+# (f) The case this repo actually produces. A worker's own commit is never an ancestor of
+#     origin/trunk, because the branch is squash-merged: the landed commit has another sha and the
+#     same patch. The close has to accept it, and say which two commits are the same change — in
+#     the warning and in the row, because the row is what a later reader checks.
+equiv=$work/equiv
+git init -q --bare -b trunk "$work/remote-equiv.git"
+mkdir -p "$equiv"
+git -C "$equiv" init -q -b trunk
+git -C "$equiv" config user.email worker@example.invalid
+git -C "$equiv" config user.name worker
+git -C "$equiv" remote add origin "$work/remote-equiv.git"
+printf 'alpha\nbeta\ngamma\n' >"$equiv/f"
+git -C "$equiv" add f
+git -C "$equiv" commit -q -m "feat: the base"
+git -C "$equiv" push -q origin trunk
+git -C "$equiv" checkout -q -b feat
+printf 'alpha\nBETA\ngamma\n' >"$equiv/f"
+git -C "$equiv" commit -q -a -m "feat: a change that lands as a squash"
+equiv_sha=$(git -C "$equiv" rev-parse HEAD)
+git -C "$equiv" checkout -q trunk
+git -C "$equiv" cherry-pick feat >/dev/null 2>&1
+git -C "$equiv" commit -q --amend -m "feat: a change that lands as a squash (#65)"
+equiv_landed=$(git -C "$equiv" rev-parse HEAD)
+git -C "$equiv" push -q origin trunk
+git -C "$equiv" fetch -q --prune origin
+run_close_in merged-equiv "$equiv" --merged 65 <<REPORT
+# Report
+
+Mission: a squash-merged change closes its worker without a hand-edit of the report.
+
+Commit: $equiv_sha
+
+## Evidence
+
+\$ bash scripts/test-provenance.sh — ok
+REPORT
+equiv_short=$(git -C "$equiv" rev-parse --short "$equiv_sha")
+equiv_landed_short=$(git -C "$equiv" rev-parse --short "$equiv_landed")
+row=$(grep '"slug":"merged-equiv"' "$PI_BOSS_ROOT/state/decisions.jsonl" | tail -n 1)
+if [ "$RC" != 0 ]; then
+	fail "patch-equivalent squash: exit $RC, wanted 0 — $OUT"
+elif ! printf '%s' "$OUT" | grep -qF "$equiv_short"; then
+	fail "patch-equivalent squash: the warning does not name the report's sha $equiv_short — $OUT"
+elif ! printf '%s' "$OUT" | grep -qF "$equiv_landed_short"; then
+	fail "patch-equivalent squash: the warning does not name the landed sha $equiv_landed_short — $OUT"
+elif ! printf '%s' "$OUT" | grep -qF "PR #65"; then
+	fail "patch-equivalent squash: the warning does not name the PR — $OUT"
+elif [ -z "$row" ]; then
+	fail "patch-equivalent squash: no row for the slug in state/decisions.jsonl"
+elif ! node -e '
+		const r=JSON.parse(process.argv[1]);
+		if(r.command!=="provenance"||r.slug!=="merged-equiv")process.exit(1);
+		if(r.sha!==process.argv[2]||r.landed!==process.argv[3])process.exit(1);
+		if(r.pr!=="#65"||r.trunk!=="origin/trunk"||!r.reason)process.exit(1);' \
+	"$row" "$equiv_sha" "$equiv_landed" 2>/dev/null; then
+	fail "patch-equivalent squash: the row does not name both shas, the PR and the reason — $row"
+else
+	pass "patch-equivalent squash closes, and the warning and the row name both shas and the PR"
+fi
+
+# (g) A squash that also touched neighbouring lines moves the patch-id while the content goes in.
+#     git will not certify it, so the close refuses — with its own message and its own two fixes,
+#     because amending the branch commit and recording the merge by hand are different moves from
+#     "it never landed".
+neigh=$work/neighbour
+git init -q --bare -b trunk "$work/remote-neighbour.git"
+mkdir -p "$neigh"
+git -C "$neigh" init -q -b trunk
+git -C "$neigh" config user.email worker@example.invalid
+git -C "$neigh" config user.name worker
+git -C "$neigh" remote add origin "$work/remote-neighbour.git"
+printf 'l1\nl2\nl3\n' >"$neigh/f"
+git -C "$neigh" add f
+git -C "$neigh" commit -q -m "feat: the base"
+git -C "$neigh" push -q origin trunk
+git -C "$neigh" checkout -q -b feat
+printf 'l1\nL2\nl3\n' >"$neigh/f"
+git -C "$neigh" commit -q -a -m "feat: L2"
+neigh_sha=$(git -C "$neigh" rev-parse HEAD)
+git -C "$neigh" checkout -q trunk
+printf 'l1\nL2\nl3\nl4\n' >"$neigh/f"
+git -C "$neigh" commit -q -a -m "feat: L2 and a neighbouring line (#66)"
+git -C "$neigh" push -q origin trunk
+git -C "$neigh" fetch -q --prune origin
+run_close_in merged-neighbour "$neigh" --merged 66 <<REPORT
+# Report
+
+Mission: a squash that moved the patch-id is refused in its own words, not as never-landed.
+
+Commit: $neigh_sha
+
+## Evidence
+
+\$ bash scripts/test-provenance.sh — ok
+REPORT
+row=$(grep '"command":"provenance"' "$PI_BOSS_ROOT/state/decisions.jsonl" | grep '"slug":"merged-neighbour"' | tail -n 1)
+if [ "$RC" != 1 ]; then
+	fail "neighbouring-line squash: exit $RC, wanted 1 — $OUT"
+elif ! printf '%s' "$OUT" | grep -qF "neighbouring lines"; then
+	fail "neighbouring-line squash: the refusal does not say a squash moved the patch-id — $OUT"
+elif printf '%s' "$OUT" | grep -qF "is not an ancestor of origin/trunk, so it has not landed"; then
+	fail "neighbouring-line squash: refused as plain not-in-trunk, so the fix it offers is the wrong one — $OUT"
+elif [ -n "$row" ]; then
+	fail "neighbouring-line squash: a provenance row was written for a refused close — $row"
+else
+	pass "a squash that also touched neighbouring lines is refused, in a message of its own"
+fi
+
+# (h) A landing that was later reverted is still reachable from trunk, so git cherry still marks the
+#     patch `-`. Provenance must not accept it: the content is gone, so nothing landed. The refusal
+#     names the landing commit, which is what a human needs to check the revert.
+revd=$work/reverted
+git init -q --bare -b trunk "$work/remote-reverted.git"
+mkdir -p "$revd"
+git -C "$revd" init -q -b trunk
+git -C "$revd" config user.email worker@example.invalid
+git -C "$revd" config user.name worker
+git -C "$revd" remote add origin "$work/remote-reverted.git"
+printf 'one\ntwo\nthree\n' >"$revd/f"
+git -C "$revd" add f
+git -C "$revd" commit -q -m "feat: the base"
+git -C "$revd" push -q origin trunk
+git -C "$revd" checkout -q -b feat
+printf 'one\nTWO\nthree\n' >"$revd/f"
+git -C "$revd" commit -q -a -m "feat: a change that lands and is backed out"
+revd_sha=$(git -C "$revd" rev-parse HEAD)
+git -C "$revd" checkout -q trunk
+git -C "$revd" cherry-pick feat >/dev/null 2>&1
+git -C "$revd" commit -q --amend -m "feat: a change that lands and is backed out (#67)"
+revd_landed=$(git -C "$revd" rev-parse HEAD)
+git -C "$revd" push -q origin trunk
+printf 'one\ntwo\nthree\n' >"$revd/f"
+git -C "$revd" commit -q -a -m "revert: back the change out"
+git -C "$revd" push -q origin trunk
+git -C "$revd" fetch -q --prune origin
+run_close_in merged-reverted "$revd" --merged 67 <<REPORT
+# Report
+
+Mission: a reverted landing is not a landed change, and the close refuses it.
+
+Commit: $revd_sha
+
+## Evidence
+
+\$ bash scripts/test-provenance.sh — ok
+REPORT
+revd_landed_short=$(git -C "$revd" rev-parse --short "$revd_landed")
+row=$(grep '"command":"provenance"' "$PI_BOSS_ROOT/state/decisions.jsonl" | grep '"slug":"merged-reverted"' | tail -n 1)
+if [ "$RC" != 1 ]; then
+	fail "reverted landing: exit $RC, wanted 1 — $OUT"
+elif ! printf '%s' "$OUT" | grep -qF "reverted"; then
+	fail "reverted landing: the refusal does not say the change was reverted — $OUT"
+elif ! printf '%s' "$OUT" | grep -qF "$revd_landed_short"; then
+	fail "reverted landing: the refusal does not name the landing commit $revd_landed_short — $OUT"
+elif [ -n "$row" ]; then
+	fail "reverted landing: a provenance row was written for a reverted change — $row"
+else
+	pass "a landing that was later reverted is refused, and the refusal names the landing commit"
+fi
+
+# (i) A commit whose history was never fetched has no parent to diff against, and `git cherry`
+#     answers that with silence. Silence is not "not upstream": the close must say fetch, because
+#     "git could not look" and "the change is not there" are different findings.
+shallow=$work/shallow
+git init -q --bare -b trunk "$work/remote-shallow.git"
+mkdir -p "$work/shallow-origin"
+git -C "$work/shallow-origin" init -q -b trunk
+git -C "$work/shallow-origin" config user.email worker@example.invalid
+git -C "$work/shallow-origin" config user.name worker
+git -C "$work/shallow-origin" remote add origin "$work/remote-shallow.git"
+printf 'x\ny\n' >"$work/shallow-origin/f"
+git -C "$work/shallow-origin" add f
+git -C "$work/shallow-origin" commit -q -m "feat: the base"
+git -C "$work/shallow-origin" push -q origin trunk
+git -C "$work/shallow-origin" checkout -q -b side
+printf 'x\nY\n' >"$work/shallow-origin/f"
+git -C "$work/shallow-origin" commit -q -a -m "feat: a change on a side branch"
+git -C "$work/shallow-origin" push -q origin side
+git clone -q --depth 1 --no-single-branch "file://$work/remote-shallow.git" "$shallow"
+git -C "$shallow" config user.email worker@example.invalid
+git -C "$shallow" config user.name worker
+side_sha=$(git -C "$shallow" rev-parse refs/remotes/origin/side)
+run_close_in merged-shallow "$shallow" --merged 68 <<REPORT
+# Report
+
+Mission: an unfetched commit is met with "fetch first", not with a guess about trunk.
+
+Commit: $side_sha
+
+## Evidence
+
+\$ bash scripts/test-provenance.sh — ok
+REPORT
+if [ "$RC" != 1 ]; then
+	fail "unfetched commit: exit $RC, wanted 1 — $OUT"
+elif ! printf '%s' "$OUT" | grep -qiF "fetch"; then
+	fail "unfetched commit: the refusal does not say to fetch first — $OUT"
+elif printf '%s' "$OUT" | grep -qF "is not an ancestor of origin/trunk"; then
+	fail "unfetched commit: refused as plain not-in-trunk, so a missing ref read as an answer — $OUT"
+else
+	pass "a commit whose history was not fetched is refused as \"fetch first\", never as not-upstream"
 fi
 
 printf '\n%s\n' "$([ "$fails" = 0 ] && echo "provenance: ok" || echo "provenance: $fails failure(s)")"
