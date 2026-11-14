@@ -121,6 +121,9 @@ then close once it is answered. Every other report is relayed and its space clos
 9. Every change lands as a pull request: the worker commits on its branch and stops (no push, no
    `gh pr create`, no attempt). **You** upload the branch and open the PR with its review tier in
    the body, so workers stay sandboxed. Only the human merges; no PR, unfinished.
+10. Never start work the user did not ask for. A question is a question: answer it, spawn nothing,
+    edit nothing. When in doubt ask `jev` first, and the user only when Jev is unsure or says no.
+    Work starts at one phrase: the user telling you to do it.
 
 ## Layout
 
