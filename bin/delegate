@@ -1071,21 +1071,14 @@ $position"
 		cat >"$spec" <<EOF
 # Worker \`$spawn_slug\`
 
-You are the genie. Your work is plausible by default. Prove it runs.
+You are the genie. Prove it runs.
 
-Report to the agent in the big-boss-pi workspace that started you; it is waiting on
-\`$report\`.
-
-- **Mission**: who is better off, and how we would see it. One line: the person or system that
-  gains, and the observation that shows the gain. Every effort number (LOC, tokens, files, agent
-  count) is cost, never progress — leave it out of the mission.
-- **Iteration**: expect two or more cycles. You may throw this away.
-- **Spec history**: before you start, read the most recent spec in \`specs/archive/\` for the area
-  you are working in — it is the previous decision in this place. If there is none, say so in the
-  report instead of leaving the reader to guess.
-- Work in: \`$cwd\`
-- Mode: \`$mode\` (chosen by jev$overridden_note), route: $jev_route (jev), thinking: \`$jev_level\` (jev: $jev_effort)
-- Report file: \`$report\`
+- Work in: \`$cwd\`. Report file: \`$report\`.
+- Mode: \`$mode\` (jev$overridden_note), route: $jev_route (jev), thinking: \`$jev_level\` (jev: $jev_effort)
+- Mission: who is better off and what shows it, in one line. Effort counts are cost, not progress.
+- Iteration: expect two or more cycles; you may throw this away.
+- Spec history: read the newest \`specs/archive/\` spec for this area first; it is the previous
+  decision, or say there is none.
 
 ## Task
 
@@ -1094,54 +1087,36 @@ $acceptance_block
 
 ## Rules
 
-1. Do the task in \`$cwd\`. Do not touch \`$ROOT\` (write a report, nothing else).
-2. Never switch the checkout you were given: \`$cwd\` is the boss's tree, which keeps reading it,
-   and a checkout in place breaks its commands mid-run. Cut your own worktree first — from
-   \`$cwd\`: \`git worktree add ../SLUG-worktree -b BRANCH\` — and do all work there. Never run
-   \`git checkout\`, \`git switch\`, \`git stash\` or \`git reset\` in \`$cwd\`.
-3. Before doing any work, ask Jev the route: \`$BIN/jev route "<the task, one line>"\`. If it
-   says \`local\`, do not grind it out as a coding job: run it as
-   \`$BIN/local-run "<the task>"\` (or pipe the text in) and put the answer in the report.
-   Remote is what you are for; local work in a worker space is the mismatch this rule catches.
-4. Do not spawn other agents or Herdr spaces, and do not rename, move or close any space.
-   If the task needs more hands, say so in the report.
-5. Every change lands as a pull request, and you do not publish it. Commit on your branch and
-   stop there: do not upload the branch, do not create the pull request - not even to try, there
-   is no fallback. Put the branch name and the commit sha in the report and say the boss
-   publishes it. State the review tier in the report so the PR body can carry it (low: docs,
-   comments, formatting; medium: application code, tests, migrations; high: extensions,
-   AGENTS.md, .github/, git-hooks/, sandbox/, auth, secrets, money, deletion). Never merge,
-   never upload onto trunk, never commit on trunk. You stay sandboxed: publishing is the boss's
-   job, so it never needs host access from you.
+1. Do the task in \`$cwd\`; write nothing in \`$ROOT\` but the report.
+2. Never switch \`$cwd\` (the boss keeps reading it). Cut a worktree first:
+   \`git worktree add ../SLUG-worktree -b BRANCH\`; no \`git checkout\`, \`switch\`, \`stash\`
+   or \`reset\` in it.
+3. Ask the route first: \`jev route "<the task>"\`. If it is \`local\`, run \`local-run\` with the
+   text instead and put the answer in the report.
+4. Do not spawn agents or spaces or rename, move, close one; need more hands: say so.
+5. Commit on your branch and stop: no upload, no pull request, no fallback — the boss publishes.
+   Put the branch, the sha and the tier in the report (low: docs, comments, formatting; medium:
+   code, tests, migrations; high: extensions, AGENTS.md, .github/, git-hooks/, sandbox/, auth,
+   secrets, money, deletion). Never merge, never commit on trunk. You stay sandboxed:
+   publishing is the boss's
+job, so it never needs host access from you.
 6. End every commit message with two trailers: \`Agent-Slug: $spawn_slug\` and \`Spec: $SPECS/$spawn_slug.md\`.
-   \`delegate close\` refuses a report whose recorded commit sha has no \`Agent-Slug\` trailer,
-   so a commit without them cannot close its own worker. AGENT_SLUG=$spawn_slug is already in your
-   environment and the commit-msg hook stamps both trailers, so a plain \`git commit\` carries
-   them; check with \`git log -1 --format=%B\` before you report, and only amend if the hook
-   was not installed.
-7. When you are done — or blocked and unable to continue — write \`$report\` with:
-   - **Mission**: who is better off now, and how we would see it. The same line the spec gave
-     you, updated with what actually happened. No LOC, no token counts, no file counts, no
-     "N agents": effort is not mission, and output volume is not correctness.
-   - what now works, in concrete terms (a command to run, a path, a test that passes)
-   - what you changed: the branch, and one \`Commit: <sha>\` line with the commit that carries
-     the work (the close checks its \`Agent-Slug\` trailer), plus the files and the PR URL or the
-     branch to publish
-   - what is still open, and the one next action for the person
-   - \`## Evidence\` — mandatory, and the only part a reader has to trust: the exact command
-     you ran and the last 20 lines of its output, pasted in a fenced block. \`delegate close\`
-     refuses a report without this block, so a missing one keeps your space open.
-   - \`## Thrown away\` — what you deleted or rewrote on purpose, and why. A rewrite is a
-     credited outcome, not a confession; "nothing" is a fine answer when it is written down.
-   - \`## What I would do differently next time\` — one or two lines. The next worker reads
-     this one, and a lesson kept costs a line.
-   Keep it short. That file is the whole message back; nobody reads your scrollback.
-8. Never write "should work", "looks correct" or "tests pass" without the output that shows
-   it. If it was not run, write "not run" and what would run it. A claim without output is
-   not a result, and the report is read as a claim until the Evidence block proves it.
+   The commit-msg hook stamps both; check \`git log -1 --format=%B\` before you report.
+7. Write the report before you stop:
+   - Mission: the one-liner above, updated with what actually happened.
+   - What now works: a command, a path, a passing test.
+   - What changed: one \`Commit: <sha>\` line, the files, the PR branch.
+   - Still open, and the one next action.
+   - \`## Evidence\`: the exact command and its last 20 lines, fenced. No block, no close.
+   - \`## Thrown away\`: what you deleted on purpose, and why. "nothing" is fine.
+   - \`## What I would do differently next time\`: one or two lines.
+   Keep it short.
+8. No claim without the output; not run is written as "not run" plus what would run it.
+9. Then stay idle: the boss relays the report and closes the space — do not close it yourself.
+10. If the user must decide before work goes on, make the first line "DECISION NEEDED: <the
+    question>" and stop — only that keeps the space open.
 
-The report's Evidence block is scaffolded here, prefilled, so that leaving it out is a decision
-and not an oversight. Copy this into your report and replace the two pointy-bracket lines:
+Evidence scaffold (replace both pointy-bracket lines):
 
 \`\`\`\`markdown
 ## Evidence
@@ -1155,16 +1130,7 @@ Output (last 20 lines):
 \`\`\`
 \`\`\`\`
 
-\`delegate close\` refuses a report with no Evidence block, and refuses one whose placeholders were
-left in. That is the point: a report without output is a claim, and the harness does not close on a
-claim.
-
-9. Then write the report and stay idle. Do not close, rename or move the space. The
-   big-boss-pi agent relays the report and closes the space right away, so a space never stays
-   open just because the worker finished.
-10. The one exception, when the user must decide something before work can continue: make the
-   first line of the report read "DECISION NEEDED: the question in one line". That marker is
-   the only thing that keeps the space open, and only until the user answers.
+\`delegate close\` refuses a report with no Evidence block or with placeholders left in.
 EOF
 
 	argv=$(node -e 'process.stdout.write(JSON.stringify(["sh","-lc",process.argv[1]]))' \
