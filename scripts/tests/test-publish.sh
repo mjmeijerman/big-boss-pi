@@ -191,6 +191,49 @@ sed '/^Review tier:/d' "$REPORTER" >"$CASE/r" && mv "$CASE/r" "$REPORTER"
 run worker
 refused "a report with no Review tier line is refused" "Review tier"
 
+# --- the tier survives the markdown the report is written in -----------------------------------
+#
+# A report is markdown, so the tier arrives wearing it: `**Medium**`, `` `low` ``, `"High"`, a
+# trailing period, a reason after it. The body carries the bare word — a body gate should not have
+# to parse decoration to find the tier — and the one thing still refused is a value that is not a
+# tier at all.
+
+tier_case() { # <name> <tier line> — the good report with exactly that review-tier line
+	new_case "$1"
+	{
+		printf '**Mission**: the tier survives the markdown it was written in.\n\n'
+		printf 'Review tier: %s\n\n' "$2"
+		printf '## Evidence\n\n```\ntest-publish: ok\n```\n'
+	} >"$REPORTER"
+	run worker
+}
+
+tier_publishes() { # <name> <tier line> <the bare word the body must carry>
+	tier_case "$1" "$2"
+	if [ "$rc" -eq 0 ]; then pass "a report saying '$2' publishes"; else fail "a report saying '$2' publishes (exit $rc: $err)"; fi
+	check "  ...the body carries '$3'" bash -c "grep -qxF 'Review tier: $3' '$FAKE_BODY_OUT'"
+	check "  ...and it is the only tier line in the body" bash -c "[ \$(grep -c '^Review tier:' '$FAKE_BODY_OUT') -eq 1 ]"
+}
+
+tier_publishes bolded '**Medium**' Medium
+tier_publishes underscored '__high__' High
+tier_publishes backticked '`low`' Low
+tier_publishes quoted '"High"' High
+tier_publishes lowercase 'medium' Medium
+tier_publishes trailing-period 'Low.' Low
+tier_publishes with-reason 'High — one script plus its suite' High
+tier_publishes real-report-form '**medium** (script plus tests)' Medium
+
+tier_case made-up-tier 'Whatever'
+refused "a made-up tier value is refused" "Review tier"
+check "  ...the refusal names what it read" bash -c "printf '%s' \"$err\" | grep -q 'Whatever'"
+check "  ...and nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
+check "  ...and no PR was created" bash -c '! grep -q "pr create" "$FAKE_LOG"'
+
+tier_case empty-tier ''
+refused "an empty tier value is refused" "Review tier"
+check "  ...and nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
+
 new_case no-trailer
 export FAKE_TRAILERS='Subject only
 
@@ -261,7 +304,7 @@ check "the branch was pushed to origin" calls '^git .*push .*origin feat/worker'
 check "a PR was opened against main" calls '^gh pr create .*--base main'
 check "the title came from the branch HEAD subject" bash -c 'grep -qF -- "--title feat: a worker change" "$FAKE_LOG"'
 check "the body carries the Mission line" bash -c "grep -qF 'the person merges once instead of retyping the mission and the tier' '$FAKE_BODY_OUT'"
-check "the body carries the Review tier line" bash -c "grep -qF 'Review tier: **medium** (script plus tests)' '$FAKE_BODY_OUT'"
+check "the body carries the Review tier line" bash -c "grep -qxF 'Review tier: Medium' '$FAKE_BODY_OUT'"
 check "the body carries the Evidence block" bash -c "grep -qF 'test-publish: ok' '$FAKE_BODY_OUT'"
 check "the body carries the Thrown away section" bash -c "grep -qF '## Thrown away' '$FAKE_BODY_OUT'"
 check "nothing was merged" bash -c '! grep -q "pr merge" "$FAKE_LOG"'
@@ -326,7 +369,7 @@ check "  ...the branch is found by its trailer" bash -c "printf '%s' \"$err\" | 
 check "  ...and names the missing delegation entry" bash -c "printf '%s' \"$err\" | grep -q 'unknown worker slug'"
 check "  ...the found branch is pushed" calls '^git .*push .*origin feat/closed'
 check "  ...a PR is opened against main" calls '^gh pr create .*--base main'
-check "  ...the body still carries the Review tier" bash -c "grep -qF 'Review tier: **medium**' '$FAKE_BODY_OUT'"
+check "  ...the body still carries the Review tier" bash -c "grep -qxF 'Review tier: Medium' '$FAKE_BODY_OUT'"
 check "  ...and the Evidence block from reports/closed.md" bash -c "grep -qF 'test-publish: ok' '$FAKE_BODY_OUT'"
 check "  ...nothing was merged" bash -c '! grep -q "pr merge" "$FAKE_LOG"'
 
