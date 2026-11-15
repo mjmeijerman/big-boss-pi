@@ -188,6 +188,24 @@ report is plain, `keep   <slug> (still working)` when there is no report yet, an
 
 ## Publishing a finished worker
 
+`delegate finish <slug>` is the boss's whole tail in one command: publish, wipe, close, in that
+order. Four turns for one intent is where a step gets dropped, so the order is built in — each
+step runs only because the one before it succeeded, and a failure stops the run, names the step,
+and says which state the worker is in. Closed-but-unpublished is unreachable by construction.
+
+```
+delegate finish <slug>                  # publish, wipe, close
+delegate finish <slug> --skip "<why>"   # same, with the wipe recorded as not applying
+delegate finish <slug> --cwd <repo>     # a worker whose delegations.json entry is already gone
+```
+
+They stay three gates. The publish is the same `bin/publish` (found on PATH, else next to
+`bin/delegate`) with its Evidence and `Review tier:` checks; the wipe is the same `delegate wipe`
+and now also refuses a report with no `## Thrown away` block, because a recorded step with no
+answers behind it stands for nothing; the close is the same `delegate close` with its provenance
+trailer check. Rerunning after a close refusal is clean: the existing PR is printed rather than
+opened twice, and a wipe already recorded is kept rather than recorded again.
+
 `bin/publish <slug>` is the one command between a reported worker and a pull request. It reads
 `state/delegations.json` for the slug's tree and report, then builds the PR body out of the report
 itself: the Mission line verbatim, the `Review tier:` line, the `## Evidence` block,

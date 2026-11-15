@@ -16,14 +16,18 @@ Loaded on every start. Nothing here applies outside `/home/mark/big-boss-pi`.
    still recorded as the four decision lines. It refuses a `--mode` or `--thinking` that
    contradicts Jev.
 4. Spawn workers in **other** Herdr spaces with `delegate spawn` — never in this space.
+   Independent items may be spawned in the same turn: the in-flight block is by touched paths,
+   not by directory.
 5. Poll with `delegate wait <slug>`, read `reports/<slug>.md`.
-6. Wipe before the next feature starts: `delegate wipe <slug>`, or `--skip '<reason>'`. Five
-   answers — what did this make unnecessary and is it deleted, what is duplicated, could the
-   next feature land in this area in 30 minutes, what did we learn, what would we rebuild
-   from scratch? `delegate close` refuses a worker without it.
+6. `delegate finish <slug>` — or `delegate sweep` — in the same turn you relay the report: one
+   command publishes it as a PR (`bin/publish`), records the wipe — the five consolidation
+   questions: what did this make unnecessary and is it deleted, what is duplicated, could the
+   next feature land in this area in 30 minutes, what did we learn, what would we rebuild from
+   scratch? — and closes the space, in that order. `--skip '<reason>'` records why the wipe does
+   not apply. They stay three gates: a failure stops at that step and names it, so a space is
+   never closed before its PR exists. A space stays open only while the worker works, or until
+   the question in a report that opens with `DECISION NEEDED` is answered.
 7. Relay to the user: what now works, one line per worker, what is open, the next action.
-8. `delegate close <slug>` — or `delegate sweep` — in the same turn you relay the report. A
-   space stays open only while the worker works, or its report says `DECISION NEEDED`.
 
 You never edit project files or run tests: a worker does that. You write only specs and
 reports. The live checkout here is yours: a worker uses its own `git worktree`.
@@ -55,8 +59,8 @@ instead, because a space and agent cost more than that work needs. Forcing a rem
 needs `--override-jev --reason '<why>'`, recorded like any override; the check reads Jev's
 answer, not keywords.
 
-Anyone can ask `jev route` if `jev` is on PATH (`~/.local/bin/jev`): routing is about the
- task, not the workspace.
+Anyone can ask `jev route` — it is on PATH (`~/.local/bin/jev`), because routing is about the
+task, not the workspace.
 
 ## Commands
 
@@ -67,9 +71,9 @@ local-run "<task>"            # or: ... | local-run
 delegate spawn <slug> --cwd <dir> [--mode bare|sandboxed|no-net] [--thinking LEVEL] [--override-jev --reason TEXT] "<task>"
 delegate wait <slug> [--timeout 600]
 delegate list
+delegate finish <slug> [--cwd <dir>] [--skip "<reason>"]   # publish, wipe, close — the whole tail
 delegate close <slug> [--nothing "<why>"]   # --nothing: a worker that legitimately landed no commit
-delegate ask "<question>"     # jev first: exit 0 yes, 1 no, 3 ask the user
-delegate wipe <slug> [--skip "<reason>"]   # the five consolidation questions
+delegate wipe <slug> [--skip "<reason>"]   # the five consolidation questions, on their own
 delegate sweep                # close every reported worker, keep working ones and open decisions
 ```
 
@@ -97,7 +101,7 @@ then close once it is answered. Every other report is relayed and its space clos
 7. A closed worker stays closed: a follow-up on its work means a new worker with a new
    slug, never a task dropped into the finished one.
 8. Every change lands as a pull request: the worker commits on its branch and stops (no push, no
-   `gh pr create`, no attempt). **You** publish with `bin/publish SLUG`, which refuses a report
+   `gh pr create`, no attempt). **You** publish with `delegate finish SLUG`, which refuses a report
    with no Evidence block or no `Review tier:` line, so workers stay sandboxed. Publish before the
    wipe and the close: closing drops the delegation entry the command reads. Only the human
    merges; no PR, unfinished.
