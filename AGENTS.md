@@ -12,9 +12,9 @@ Loaded on every start. Nothing here applies outside `/home/mark/big-boss-pi`.
    user first (`/grill`): no workers before the answers.
 2. Ask Jev before the user: `delegate ask "<question>"`. Only "unsure" or an unreachable
    model reaches the user.
-3. Ask Jev how many workers, what mode, what thinking effort, and whether the work is local
-   or remote at all (below). `delegate spawn` asks again and refuses a `--mode` or
-   `--thinking` that contradicts Jev.
+3. `delegate spawn` asks Jev once: `jev plan` answers count, mode, route and thinking together,
+   still recorded as the four decision lines. It refuses a `--mode` or `--thinking` that
+   contradicts Jev.
 4. Spawn workers in **other** Herdr spaces with `delegate spawn` — never in this space.
 5. Poll with `delegate wait <slug>`, read `reports/<slug>.md`.
 6. Wipe before the next feature starts: `delegate wipe <slug>`, or `--skip '<reason>'`. Five
@@ -61,7 +61,7 @@ Anyone can ask `jev route` if `jev` is on PATH (`~/.local/bin/jev`): routing is 
 ## Commands
 
 ```
-jev ask|mode|count|permit|route|thinking <text> [--json]
+jev ask|mode|count|permit|route|thinking|plan <text> [--json]
 local-run "<task>"            # or: ... | local-run
 
 delegate spawn <slug> --cwd <dir> [--mode bare|sandboxed|no-net] [--thinking LEVEL] [--override-jev --reason TEXT] "<task>"
@@ -97,16 +97,18 @@ then close once it is answered. Every other report is relayed and its space clos
 7. A closed worker stays closed: a follow-up on its work means a new worker with a new
    slug, never a task dropped into the finished one.
 8. Every change lands as a pull request: the worker commits on its branch and stops (no push, no
-   `gh pr create`, no attempt). **You** upload the branch and open the PR with its review tier in
-   the body, so workers stay sandboxed. Only the human merges; no PR, unfinished.
+   `gh pr create`, no attempt). **You** publish with `bin/publish SLUG`, which refuses a report
+   with no Evidence block or no `Review tier:` line, so workers stay sandboxed. Only the human
+   merges; no PR, unfinished.
 9. Never start work the user did not ask for. A question is a question: answer it, spawn nothing,
    edit nothing. When in doubt ask `jev` first; the user only when Jev is unsure or says no.
    Work starts when the user says do it.
 10. Review sets the pace, not generation: at most one pull request per human sits in review at a
-    time, and while a worker's report in an area is unread no second worker starts there
-    (`delegate spawn` refuses it). Relay at most five items per turn, and run `delegate stats`
-    to see the unread queue and the age of its oldest report. Relays and PR bodies never present
-    LOC, PR count, token spend or "N agents" as progress: effort is cost, never progress.
+    time, and an unread report blocks a new worker only where the worker's branch diff meets a
+    path the task names (`delegate spawn` refuses it). Relay at most five items per turn, and
+    run `delegate stats` to see the unread queue and the age of its oldest report. Relays and PR
+    bodies never present LOC, PR count, token spend or "N agents" as progress: effort is cost,
+    never progress.
 
 ## Layout
 
