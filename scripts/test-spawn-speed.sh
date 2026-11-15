@@ -18,6 +18,11 @@
 #      is a throwaway repo with a bare origin, so the branch diff is a real branch diff.
 #   D. The generated spec carries the report's Evidence scaffold, and a report copied from it
 #      without filling it in is refused by the placeholder scan — opt-out, not opt-in.
+#   E. A generated spec stays under a stated byte ceiling. The worker reads that file before it
+#      reads the repo, so a template that grows back into a wall of prose is a slowdown nothing
+#      would notice. The fixture paths are folded to one character, so the number is about the
+#      template and not about where mktemp put the throwaway tree.
+#   F. An unsure plan stops the spawn before a spec, a space or a default count exists.
 #
 #   bash scripts/test-spawn-speed.sh      exit 0 = every case held
 set -uo pipefail
@@ -36,6 +41,11 @@ export HOME=$work/home
 fails=0
 pass() { printf '  ok    %s\n' "$*"; }
 fail() { printf '  FAIL  %s\n' "$*"; fails=$((fails + 1)); }
+
+# The plain-spec byte ceiling asserted in E, with the fixture paths folded to one character each.
+# The template was ~6.1 KB before #36 halved it; the ceiling sits just above the halved size, so
+# an addition has room and a paragraph of prose coming back does not.
+SPEC_CEILING=3000
 
 # ---------------------------------------------------------------------------------------------
 # A. `jev plan`: one call, four answers, same validation.
@@ -422,7 +432,28 @@ else
 	fail "unfilled scaffold: exit $rc — $out"
 fi
 
-# E. An unsure plan stops the spawn before anything exists: no spec, no space, no default count.
+# E. The spec has a byte ceiling. A worker reads this file before it reads the repo, so a template
+#    that grows back into a wall of prose is a slowdown no assertion would otherwise notice.
+rm -f "$PI_BOSS_ROOT/state/delegations.json" "$PI_BOSS_ROOT"/specs/*.md
+spawn slim-plain --cwd "$area" "edit one line in README.md"
+plain=$PI_BOSS_ROOT/specs/slim-plain.md
+if [ "$SPAWN_RC" != 0 ] || [ ! -f "$plain" ]; then
+	fail "the ceiling fixture never wrote a spec: exit $SPAWN_RC — $spawn_out"
+else
+	plain_bytes=$(sed "s|$work|@|g" "$plain" | wc -c)
+	if [ "$plain_bytes" -le "$SPEC_CEILING" ]; then
+		pass "a plain spec is $plain_bytes bytes, ceiling $SPEC_CEILING"
+	else
+		fail "a plain spec is $plain_bytes bytes, over the $SPEC_CEILING-byte ceiling — the template grew: $plain"
+	fi
+	if grep -q '^## Acceptance mode$' "$plain"; then
+		fail "the plain spec carries the acceptance block, which only --acceptance should inline"
+	else
+		pass "the plain spec carries no acceptance block"
+	fi
+fi
+
+# F. An unsure plan stops the spawn before anything exists: no spec, no space, no default count.
 cat >"$PI_BOSS_ROOT/bin/jev" <<'STUB'
 #!/usr/bin/env bash
 printf '{"count":null,"mode":null,"route":null,"thinking":null,"reason":"the task is too thin","confidence":0.2}\n'
