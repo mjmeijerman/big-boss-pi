@@ -141,6 +141,12 @@ expect "spawn plan, worker count, path blocking and evidence scaffold" 0 "spawn 
 #     real space.
 expect "guard resumes before it reopens a tab" 0 "guard-resume: ok" -- \
 	bash "$root/scripts/test-guard-resume.sh"
+# 5g. Warm model: every jev request asks ollama to keep the model resident (keep_alive from
+#     bin/jev-model.mjs), an endpoint that refuses the field with 400 still gets a decision on
+#     one retry, and JEV_KEEP_ALIVE overrides the value. Fake ollama on a loopback port that
+#     records the request bodies; no real model, no real 8-second load.
+expect "keep_alive sent, retried without it on 400, overridable" 0 "jev keep-alive: ok" -- \
+	bash "$root/scripts/tests/test-jev-warm.sh"
 
 # 6. Routing is a refusal, not a warning. delegate reads jev from $PI_BOSS_ROOT/bin, so a
 #    fake jev there answers route=local without a model and without touching the real tree.
