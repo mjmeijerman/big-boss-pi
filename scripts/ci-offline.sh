@@ -147,7 +147,13 @@ expect "guard resumes before it reopens a tab" 0 "guard-resume: ok" -- \
 #     records the request bodies; no real model, no real 8-second load.
 expect "keep_alive sent, retried without it on 400, overridable" 0 "jev keep-alive: ok" -- \
 	bash "$root/scripts/tests/test-jev-warm.sh"
-# 5h. The local copy of this workflow's four jobs (scripts/ci-local.sh): a planted syntax error
+# 5h. The boss's tail in one command (Radar blip 20): publish, wipe and close run in that order,
+#     each keeps its own gate, and a failure stops at the step that failed with the state named. Its
+#     own script because it needs a fake `publish` on PATH and a fake herdr-app at once, and reads
+#     the decisions log and the delegation entry rather than the command's own output.
+expect "delegate finish publishes, wipes and closes in order" 0 "finish: ok" -- \
+	bash "$root/scripts/tests/test-finish.sh"
+# 5i. The local copy of this workflow's four jobs (scripts/ci-local.sh): a planted syntax error
 #     and an AGENTS.md over budget exit non-zero with the file named, an absent shellcheck says
 #     SKIPPED instead of reading as a pass, and a clean tree passes. Its own suite of throwaway
 #     checkouts; it only ever asks ci-local for the jobs that cannot recurse back into here.

@@ -7,6 +7,7 @@
 #   delegate list
 #   delegate close <slug> [--merged PR-URL-OR-NUMBER]
 #   delegate close <slug> --nothing "<why nothing landed>"   (a worker whose change never landed)
+#   delegate finish <slug> [--cwd DIR] [--skip "<reason>"]   (publish, wipe, close — the whole tail)
 #   delegate ask "<question>" [--json]
 #   delegate stats [--since DURATION] [--json]
 #   delegate sweep
@@ -60,8 +61,16 @@
 #
 # The close is the last step of the three, not the second: publish the report while the delegation
 # entry still exists, or after the entry is gone if it has to be (`bin/publish` finds the branch by
-# its Agent-Slug trailer then), then wipe, then close. `delegate wait` prints that order, because
-# that is the moment the boss reads it.
+# its Agent-Slug trailer then), then wipe, then close. `delegate finish` runs all three in that
+# order, because four turns for one intent is where the boss drops a step; a failure stops the run,
+# names the step and says which state the worker is in, and `closed but not published` stays
+# unreachable by construction. Fewer turns, not fewer gates: each step keeps its own checks.
+#
+# The wipe is asked for the answers as well as the questions. A report with no `## Thrown away`
+# block (or the `## Wipe` block an older report writes) has not answered anything, so recording
+# the step over it would put a line in the log standing for nothing. A worker with no report at
+# all is left alone: there is nothing to answer, and close already refuses that worker for the
+# evidence block it does not have.
 #
 # A report is a claim until it carries output. So `delegate close` refuses a report with no
 # `## Evidence` block, or one that still has fill-in placeholders left in it: it prints what is
@@ -373,6 +382,33 @@ wipe_recorded() {
 			if(d.command==="wipe"&&d.slug===process.argv[2])process.exit(0);
 		}
 		process.exit(1);' "$DECISIONS" "$1"
+}
+
+# wipe_answers_present <report> — true when the report carries the answers the wipe asks for: a
+# `## Thrown away` block (this repo's own heading) or the `## Wipe` block an older report writes,
+# with at least one written line under it. A heading with nothing beneath it is the same claim as
+# no heading at all, the way an empty Evidence block is.
+#
+# A report that does not exist passes: there is nothing to answer, and `delegate close` already
+# refuses that worker for the Evidence block it does not have. A report that exists and says
+# nothing about what was thrown away is refused, because the wipe's whole value is the answers —
+# a recorded step with no answers behind it is a rule that got clicked through.
+wipe_answers_present() {
+	local report=${1:-}
+	[ -f "$report" ] || return 0
+	awk '
+		{
+			line = $0
+			gsub(/[#*]/, "", line)
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+			if (!inblock) {
+				if (tolower(line) ~ /^(thrown away|wipe)([[:space:]].*)?$/) { inblock = 1; next }
+				next
+			}
+			if (line != "") found = 1
+		}
+		END { exit(found ? 0 : 1) }
+	' "$report"
 }
 
 # merged_pr_ref <text> — the PR number in a `--merged` argument, empty when the argument is not
@@ -1210,10 +1246,8 @@ cmd_wait() {
 				say "$slug asks the user for a decision. Relay the question, and close the space once it is answered:"
 				say "  $BIN/delegate close $slug"
 			else
-				say "$slug is done. Relay the report, then publish it before the wipe and the close — in that order, because closing drops the delegation entry:"
-				say "  $BIN/publish $slug"
-				say "  $BIN/delegate wipe $slug"
-				say "  $BIN/delegate close $slug"
+				say "$slug is done. One command publishes it, wipes it and closes it, in that order:"
+				say "  $BIN/delegate finish $slug"
 			fi
 			return 0
 		fi
@@ -1342,6 +1376,12 @@ cmd_wipe() {
 		say "wipe: $slug — skipped, reason recorded: $reason"
 		say "state/decisions.jsonl holds the line; close goes through:  $BIN/delegate close $slug"
 		return 0
+	fi
+
+	# The step is recorded only over answers. `--skip` above is the one honest way to record a
+	# wipe that does not apply, and the reason it needs is why it is not the gap this closes.
+	if ! wipe_answers_present "$REPORTS/$slug.md"; then
+		die "refusing to wipe $slug: $REPORTS/$slug.md has no \"## Thrown away\" block with the answers under it, so recording the step would stand for nothing. Write the five answers there, or record why the step does not apply: delegate wipe $slug --skip \"<reason>\""
 	fi
 
 	say "wipe: $slug — five answers before the next feature starts${branch:+ (branch $branch)}:"
@@ -1537,6 +1577,85 @@ fi
 	printf '{"closed":"%s","space":"%s"}\n' "$slug" "$space"
 }
 
+# cmd_finish -- the boss's whole tail for a finished worker, in one turn: publish, wipe, close.
+#
+# Four commands for one intent (wait, publish, wipe, close) is four chances to stop halfway, and
+# three of them are gates that only work in one order. So the order is built into one command:
+# each step runs because the one before it succeeded, a failure stops the run, names the step and
+# says which state the worker is in. `closed but not published` is unreachable by construction —
+# close is the last step — and nothing half-done is ever printed as done.
+#
+# The steps are not reimplemented here: publish is the real `bin/publish`, run the way a person
+# runs it (found on PATH, else next to this script), and wipe and close are cmd_wipe and cmd_close
+# in a subshell, so their own refusals stop the step instead of the whole command and their own
+# checks — the `## Thrown away` block, the Evidence block, the Agent-Slug trailer, the recorded
+# wipe, the placeholders — stay exactly where they are. Fewer turns, not fewer checks.
+#
+# Rerunning after a close refusal is clean: publish prints the existing PR instead of opening a
+# second one, and a wipe already recorded is kept rather than recorded twice.
+cmd_finish() {
+	local slug=${1:-} lookup_cwd="" skip="" skip_given="" pub
+	[ -n "$slug" ] || die 'usage: delegate finish <slug> [--cwd DIR] [--skip "<reason>"]'
+	shift || true
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--cwd)
+			[ "$#" -ge 2 ] && [ -n "$2" ] || die "--cwd needs a directory"
+			lookup_cwd=$2
+			shift 2
+			;;
+		--skip)
+			skip=${2:-}
+			skip_given=1
+			if [ "$#" -ge 2 ]; then shift 2; else shift 1; fi
+			;;
+		*) die "unknown option $1 — usage: delegate finish <slug> [--cwd DIR] [--skip \"<reason>\"]" ;;
+		esac
+	done
+	[ -n "$slug" ] || die 'usage: delegate finish <slug> [--cwd DIR] [--skip "<reason>"]'
+	# A skip with no reason is the one thing a skip may not be: it says the step does not apply,
+	# and only the sentence says why. Refused before the report is published, so a typo costs
+	# nothing (the wipe refuses it too; this is the cheap, first refusal).
+	if [ -n "$skip_given" ] && [ -z "${skip// /}" ]; then
+		die "--skip needs a reason: delegate finish $slug --skip \"<why the step does not apply>\""
+	fi
+
+	pub=$(command -v publish 2>/dev/null || true)
+	[ -n "$pub" ] || pub=$self_bin/publish
+	[ -x "$pub" ] || die "cannot publish $slug: no publish command on PATH, and none at $self_bin/publish"
+
+	say "finish: $slug — 1/3 publish"
+	if ! "$pub" "$slug" ${lookup_cwd:+--cwd "$lookup_cwd"}; then
+		printf '%s: finish stopped at step 1 of 3 (publish) for %s: nothing was wiped, nothing was closed, and the space is still open.\n' "$prog" "$slug" >&2
+		printf 'Fix: the refusal above names what the report is missing. Once it is fixed, run this again:\n' >&2
+		printf '  %s finish %s\n' "$BIN/delegate" "$slug" >&2
+		return 1
+	fi
+
+	if wipe_recorded "$slug"; then
+		say "finish: $slug — 2/3 wipe: already recorded, keeping that line"
+	else
+		say "finish: $slug — 2/3 wipe"
+		local wipe_args=( "$slug" )
+		[ -z "$skip_given" ] || wipe_args+=( --skip "$skip" )
+		if ! ( cmd_wipe "${wipe_args[@]}" ); then
+			printf '%s: finish stopped at step 2 of 3 (wipe) for %s: the report is published, so its PR exists, but nothing was wiped, nothing was closed, and the space is still open.\n' "$prog" "$slug" >&2
+			printf 'Fix: write the five answers under "## Thrown away" in %s — or say why the step does not apply — then run this again:\n' "$REPORTS/$slug.md" >&2
+			printf '  %s finish %s\n' "$BIN/delegate" "$slug" >&2
+			return 1
+		fi
+	fi
+
+	say "finish: $slug — 3/3 close"
+	if ! ( cmd_close "$slug" ); then
+		printf '%s: finish stopped at step 3 of 3 (close) for %s: the report is published and the wipe is recorded, but the space is still open.\n' "$prog" "$slug" >&2
+		printf 'Fix: the refusal above names what the report still needs; then run this again — the wipe is kept and the PR is not opened twice:\n' >&2
+		printf '  %s finish %s\n' "$BIN/delegate" "$slug" >&2
+		return 1
+	fi
+	say "finish: $slug — published, wiped, closed"
+}
+
 # cmd_sweep -- close every worker whose report exists and does not need a user decision.
 # Kept: no report yet (still working), and a report carrying the DECISION NEEDED marker.
 cmd_sweep() {
@@ -1583,6 +1702,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 	stats) shift; PI_BOSS_ROOT=$ROOT exec node "$self_bin/stats.mjs" "$@" ;;
 	sweep) cmd_sweep ;;
 	wipe) shift; cmd_wipe "$@" ;;
-	*) die 'usage: delegate spawn|wait|list|close|ask|stats|sweep|wipe ...' ;;
+	finish) shift; cmd_finish "$@" ;;
+	*) die 'usage: delegate spawn|wait|list|close|ask|stats|sweep|wipe|finish ...' ;;
 	esac
 fi
