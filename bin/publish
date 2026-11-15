@@ -118,7 +118,7 @@ case $branch in
 	recorded=$branch
 	for candidate in $(git -C "$cwd" for-each-ref --format='%(refname:short)' refs/heads/); do
 		if git -C "$cwd" log --format=%B "refs/remotes/origin/$trunk..$candidate" 2>/dev/null |
-			grep -qE "^Agent-Slug:[[:space:]]*$slug[[:space:]]*$"; then
+			grep -qE "^Agent-Slug:[[:space:]]*${slug}[[:space:]]*$"; then
 			found="$found$candidate"$'\n'
 		fi
 	done
