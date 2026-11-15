@@ -26,6 +26,7 @@ mkdir -p "$HOME"
 cat >"$PI_BOSS_ROOT/bin/jev" <<'STUB'
 #!/usr/bin/env bash
 case $1 in
+plan) printf '{"count":1,"mode":"sandboxed","route":"remote","thinking":"low","reason":"one worker","confidence":0.9}\n' ;;
 route) printf '{"route":"remote","reason":"code work"}\n'; exit 1 ;;
 mode) printf '{"mode":"sandboxed","reason":"repo work"}\n' ;;
 count) printf '{"count":1,"reason":"one worker"}\n' ;;

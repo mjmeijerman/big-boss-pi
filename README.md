@@ -14,7 +14,7 @@ copy: read-only during the transition, deleted only when the user says so.
 | The rules every agent here loads | `/home/mark/big-boss-pi/AGENTS.md` | Pi loads `AGENTS.md` from the working directory and every parent, on every start, with no project trust needed. New or reloaded agents therefore start with the same knowledge |
 | Decision model | `bin/jev` → `~/.local/bin/jev` | local qwen3.8:27b on ollama; decides worker count, mode, route, thinking effort, and permissions |
 | Local worker | `bin/local-run` | runs a local task on the same model, headless: prompt in, answer on stdout, no space and no spec; records one line in `state/usage.jsonl` |
-| Delegation | `bin/delegate` → `~/.local/bin/delegate` | asks Jev for mode, count, route and thinking effort, creates a Herdr space per worker, writes the spec, records where the report lands, appends every decision to `state/decisions.jsonl`; `delegate sweep` closes the workers that finished |
+| Delegation | `bin/delegate` → `~/.local/bin/delegate` | one jev call for mode, count, route and thinking effort, one Herdr space per worker jev asked for, the spec, where the report lands, and every decision in `state/decisions.jsonl`; `delegate sweep` closes the workers that finished |
 | Worker modes | `bin/pi-bare`, `bin/pi-sandboxed`, `bin/pi-nonet` | `delegate` picks one from Jev's answer |
 | Never-closable space | `bin/guard` → `~/.local/bin/big-boss-pi-guard` + `~/.config/systemd/user/big-boss-pi-guard.service` | polls `herdr-app ls`; recreates the `big-boss-pi` space if it disappears, selects it once when Herdr starts, resumes a tab whose terminal is no longer pi from its resume entry — found by terminal id **or** by the tab id the entry recorded, newest `updated_at` first, session file required — first through `~/.pi/scripts/herdr-resume.sh` and then, when that declines, with its own `hc send` on the entry's terminal, and reopens it with an absolute argv only when there is no usable entry or the resume did not start pi, at most once a minute per tab and logged in `state/guard.log` with the path it took. Only tabs it is allowed to repair: the parked tabs it saw when it started, and the ones it opened itself — a tab the person opens while it runs is theirs, kept in `state/tab-classes` so a restart does not take it either. It never touches a space named `pi-master` |
 | Delegation-only enforcement | `~/.pi/agent/extensions/big-boss-pi-guard.ts` | blocks the `write` and `edit` tools, and shell writes into the directory (`echo x > …`, `rm/mv/cp/tee/sed -i`), when the session's cwd is under `/home/mark/big-boss-pi` **or** `/home/mark/pi-master`; no-ops everywhere else, including for a worker session (`PI_WORKER=1`) |
@@ -59,7 +59,7 @@ delegate stats --since 24h        # 24h, 90m, 2w — <number><s|m|h|d|w>
 delegate stats --json | jq .      # the same numbers, machine-readable
 ```
 
-It prints jev calls per command (`ask`, `route`, `mode`, `count`, `thinking`), the route,
+It prints jev calls per command (`ask`, `route`, `mode`, `count`, `thinking`, `plan`), the route,
 mode and thinking splits, how often a caller overruled jev and at what rate, the local-run
 invocation count with total and median latency, and the line everything else is there for:
 
@@ -91,13 +91,20 @@ with no PR, and that is jev's answer being right**.
 
 ## Jev gates every delegation
 
-`delegate spawn` asks Jev four times on every run — `jev count`, `jev mode`, `jev route` and
-`jev thinking` — for the exact task text. A `--mode` or `--thinking` from the caller is
+`delegate spawn` asks Jev once on every run — `jev plan` answers the count, the mode, the route
+and the thinking effort together, for the exact task text — and records them as the four
+decision lines it always did. A `--mode` or `--thinking` from the caller is
 accepted only when it matches Jev's answer. A different one aborts the spawn and prints Jev's
 answer and its reason; overturning it needs `--override-jev --reason '<why>'`, and the
 override is recorded. A `local` route aborts the same way, pointing at `bin/local-run`. If Jev
 is unreachable or answers "unsure", the spawn stops instead of guessing, because that call
 belongs to the user.
+
+Jev's count is started, not noted. A count of three is three spaces — `SLUG`, `SLUG-2`,
+`SLUG-3` — each with its own spec, its own report path and the same mode and thinking level;
+a count that would cross the live ceiling refuses instead of quietly starting one. Review still
+sets the pace: an unread report blocks a new spawn only when the paths its branch touched meet
+the paths the new task names, and `delegate stats` prints the unread queue and its oldest age.
 
 Thinking is split in two, because the two halves are different facts. Jev answers an *effort*
 — `low`, `medium` or `high` — which is a fact about the task. Which levels the worker's model
