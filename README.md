@@ -208,7 +208,9 @@ opened twice, and a wipe already recorded is kept rather than recorded again.
 
 `bin/publish <slug>` is the one command between a reported worker and a pull request. It reads
 `state/delegations.json` for the slug's tree and report, then builds the PR body out of the report
-itself: the Mission line verbatim, the `Review tier:` line, the `## Evidence` block,
+itself: the Mission line verbatim, the `Review tier:` line reduced to its bare word (`Review
+tier: **Medium**` and `Review tier: medium.` both reach the body as `Review tier: Medium`), the
+`## Evidence` block,
 and the `## Thrown away` section when the worker wrote one. The title is the branch HEAD's
 subject. That is why the tier cannot be forgotten — nothing is retyped.
 
@@ -240,9 +242,9 @@ already exists for the branch prints its URL instead of failing. Trunk is never 
 is force-pushed, and nothing is merged — the merge stays yours.
 
 It refuses, naming the reason, when the slug is unknown, the report is missing or has no
-Evidence block (the same check `delegate close` uses), the report has no `Review tier:` line,
-the branch carries no `Agent-Slug:` trailer, `gh` is not on PATH, or the tree is not a git
-repo.
+Evidence block (the same check `delegate close` uses), the report has no `Review tier:` line or
+names a tier that is not High, Medium or Low, the branch carries no `Agent-Slug:` trailer, `gh`
+is not on PATH, or the tree is not a git repo.
 
 ## Review gate
 

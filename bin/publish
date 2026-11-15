@@ -22,8 +22,10 @@
 #     (never a guess about a typo);
 #   - a report that is missing, or has no Evidence block — the same check `delegate close`
 #     uses, sourced from there so the two commands cannot drift apart;
-#   - a report with no line starting `Review tier:` (the tier is the one thing the PR body must
-#     carry, so a publish with no tier is not a publish);
+#   - a report with no line starting `Review tier:`, or one whose value is not High, Medium or
+#     Low (the tier is the one thing the PR body must carry, so a publish with no tier is not a
+#     publish). A report is markdown, so the value may arrive bolded, backticked, quoted or with a
+#     trailing period or a reason after it; the body carries the bare word, never the decoration;
 #   - a branch with no commit carrying the `Agent-Slug:` trailer (nothing ties the branch to the
 #     worker that wrote the report);
 #   - `gh` not on PATH, and a tree that is not a git repo.
@@ -135,9 +137,24 @@ if ! report_has_evidence "$report"; then
 fi
 [ -n "$cwd" ] || die "state/delegations.json records no cwd for this worker"
 
-# 3. The review tier is the one line the update cannot do without.
-tier=$(grep -m1 -E '^Review tier:' "$report" || true)
-[ -n "$tier" ] || die "$report has no line starting 'Review tier:', so the PR body would omit the tier"
+# 3. The review tier is the one line the update cannot do without. The value is read out of the
+# markdown around it — `**Medium**`, `` `low` ``, `"High".`, `High — one script` — because a
+# report is markdown and a worker should not have to write a bare word to be published. The body
+# carries the bare word so a body gate never has to parse decoration to find the tier.
+tier_line=$(grep -m1 -E '^Review tier:' "$report" || true)
+[ -n "$tier_line" ] || die "$report has no line starting 'Review tier:', so the PR body would omit the tier"
+tier_raw=${tier_line#Review tier:}
+tier_raw=${tier_raw#"${tier_raw%%[![:space:]]*}"} # leading blanks
+tier_raw=${tier_raw%%[[:space:]]*}            # the first word is the tier
+# The word may be wrapped in bold/code/quotes and end in a period; the tier itself has none of
+# those characters, so deleting them from the word leaves it intact.
+tier_word=$(printf '%s' "$tier_raw" | tr -d "\`*_\".'" | tr '[:upper:]' '[:lower:]')
+case $tier_word in
+high) tier=High ;;
+medium) tier=Medium ;;
+low) tier=Low ;;
+*) die "$report's 'Review tier:' line reads '$tier_raw', which is not High, Medium or Low, so the PR body would carry no tier" ;;
+esac
 
 # 4. The branch has to carry a commit that names this worker.
 if ! command -v git >/dev/null 2>&1; then
@@ -241,7 +258,7 @@ body=$(mktemp "${TMPDIR:-/tmp}/publish-body.XXXXXX")
 trap 'rm -f "$body"' EXIT
 {
 	printf '%s\n\n' "$mission"
-	printf '%s\n\n' "$tier"
+	printf 'Review tier: %s\n\n' "$tier"
 	printf '## Evidence\n\n%s\n' "$evidence"
 	if [ -n "$thrown" ]; then
 		printf '\n## Thrown away\n\n%s\n' "$thrown"
