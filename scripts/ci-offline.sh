@@ -153,6 +153,12 @@ expect "keep_alive sent, retried without it on 400, overridable" 0 "jev keep-ali
 #     the decisions log and the delegation entry rather than the command's own output.
 expect "delegate finish publishes, wipes and closes in order" 0 "finish: ok" -- \
 	bash "$root/scripts/tests/test-finish.sh"
+# 5i. The local copy of this workflow's four jobs (scripts/ci-local.sh): a planted syntax error
+#     and an AGENTS.md over budget exit non-zero with the file named, an absent shellcheck says
+#     SKIPPED instead of reading as a pass, and a clean tree passes. Its own suite of throwaway
+#     checkouts; it only ever asks ci-local for the jobs that cannot recurse back into here.
+expect "ci-local: four jobs, planted failures, no silent skip" 0 "ci-local: ok" -- \
+	bash "$root/scripts/tests/test-ci-local.sh"
 
 # 6. Routing is a refusal, not a warning. delegate reads jev from $PI_BOSS_ROOT/bin, so a
 #    fake jev there answers route=local without a model and without touching the real tree.
