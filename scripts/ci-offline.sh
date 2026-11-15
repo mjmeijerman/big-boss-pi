@@ -68,6 +68,9 @@ expect "jev route, model down" 3 "decision model unreachable" -- \
 # model must stop the spawn, never fall back to a default level.
 expect "jev thinking, model down" 3 "decision model unreachable" -- \
 	env JEV_ENDPOINT=$closed "$bin/jev" thinking "rename a helper"
+# plan is the one call a spawn makes: if it can be answered without a model there is no gate left.
+expect "jev plan, model down" 3 "decision model unreachable" -- \
+	env JEV_ENDPOINT=$closed "$bin/jev" plan "rename a helper"
 # local-run reports on stderr and exits 1: no answer is not the same as "ask the user".
 expect "local-run, model down" 1 "local model unreachable" -- \
 	env JEV_ENDPOINT=$closed "$bin/local-run" "say hi"
@@ -127,7 +130,12 @@ expect "wipe checklist, refusal and skip log" 0 "wipe: ok" -- \
 #     and a temporary root, so nothing here touches the real workspace.
 expect "provenance trailers, spec archive and PR template" 0 "provenance: ok" -- \
 	bash "$root/scripts/test-provenance.sh"
-# 5e. The guard's repair path (Radar blip 20): a stale tab is resumed from its resume entry when
+# 5e. Spawn speed and count: one jev call per spawn, N spaces for a count of N, in-flight blocking
+#     on the paths a report actually touched, and the Evidence scaffold in the generated spec. Its
+#     own script because it needs a fake ollama, real git branches and a stub herdr-app at once.
+expect "spawn plan, worker count, path blocking and evidence scaffold" 0 "spawn speed: ok" -- \
+	bash "$root/scripts/test-spawn-speed.sh"
+# 5f. The guard's repair path (Radar blip 20): a stale tab is resumed from its resume entry when
 #     it has one, and only opened fresh when it never held pi — or when the resume did not start
 #     pi. Fake herdr-app, fake resume map, fake resume script; no desktop app, no session, no
 #     real space.
@@ -152,6 +160,7 @@ STUB
 cat >"$PI_BOSS_ROOT/bin/jev" <<'STUB'
 #!/usr/bin/env bash
 case $1 in
+plan) printf '{"count":1,"mode":"sandboxed","route":"local","thinking":"low","reason":"one sentence to translate","confidence":0.9}\n' ;;
 route) printf '{"route":"local","reason":"one sentence to translate"}\n' ;;
 mode) printf '{"mode":"sandboxed","reason":"read-only work"}\n' ;;
 count) printf '{"count":1,"reason":"one sentence"}\n' ;;
@@ -177,12 +186,30 @@ else
 	fail "no route line with decision local and overridden true in state/decisions.jsonl"
 fi
 
-# 6b. Work in flight is capped by review. A reported worker in a cwd whose report nobody marked
-#     read blocks the next spawn there; the marker clears it and --override-jev --reason goes
+# 6b. Work in flight is capped by review, in the area the work is in. An unread report blocks the
+#     next spawn only when the paths its branch touched meet the paths the new task names, so the
+#     fixture is a real repo: main holds bin/thing.sh and README.md, branch old-worker changes
+#     bin/thing.sh and nothing else. The marker clears the block and --override-jev --reason goes
 #     through. Same stub harness, with jev answering remote so the route check is not what speaks.
+git init -q --bare -b main "$work/inflight-remote.git"
+git clone -q "$work/inflight-remote.git" "$work/inflight" 2>/dev/null
+git -C "$work/inflight" config user.email worker@example.invalid
+git -C "$work/inflight" config user.name worker
+mkdir -p "$work/inflight/bin"
+printf 'echo one\n' >"$work/inflight/bin/thing.sh"
+printf 'readme\n' >"$work/inflight/README.md"
+git -C "$work/inflight" add -A
+git -C "$work/inflight" commit -q -m "feat: the base"
+git -C "$work/inflight" push -q origin main
+git -C "$work/inflight" checkout -q -b old-worker
+printf 'echo two\n' >"$work/inflight/bin/thing.sh"
+git -C "$work/inflight" commit -q -am "feat: thing, second line"
+git -C "$work/inflight" checkout -q main
+inflight=$work/inflight
 cat >"$PI_BOSS_ROOT/bin/jev" <<'STUB'
 #!/usr/bin/env bash
 case $1 in
+plan) printf '{"count":1,"mode":"sandboxed","route":"remote","thinking":"low","reason":"one worker","confidence":0.9}\n' ;;
 route) printf '{"route":"remote","reason":"code change"}\n'; exit 1 ;;
 mode) printf '{"mode":"sandboxed","reason":"repo work"}\n' ;;
 count) printf '{"count":1,"reason":"one worker"}\n' ;;
@@ -195,24 +222,28 @@ chmod +x "$PI_BOSS_ROOT/bin/jev"
 mkdir -p "$PI_BOSS_ROOT/reports" "$PI_BOSS_ROOT/state"
 printf 'reported, waiting to be read\n' >"$PI_BOSS_ROOT/reports/old-worker.md"
 cat >"$PI_BOSS_ROOT/state/delegations.json" <<DELEGATIONS
-{"old-worker":{"slug":"old-worker","space":"s1","cwd":"$work","report":"$PI_BOSS_ROOT/reports/old-worker.md","branch":""}}
+{"old-worker":{"slug":"old-worker","space":"s1","cwd":"$inflight","report":"$PI_BOSS_ROOT/reports/old-worker.md","branch":"old-worker"}}
 DELEGATIONS
-expect "delegate spawn, unread report in the same cwd refuses" 1 "a report there is still unread" -- \
-	env PATH=$stub:$safe_path "$bin/delegate" spawn "new-worker" --cwd "$work" "change one file"
-if grep '"command":"in-flight"' "$PI_BOSS_ROOT/state/decisions.jsonl" 2>/dev/null | grep -q '"decision":"blocked"'; then
-	pass "in-flight refusal recorded in state/decisions.jsonl"
+expect "delegate spawn, unread report on the same path refuses" 1 "a report there is still unread" -- \
+	env PATH=$stub:$safe_path "$bin/delegate" spawn "new-worker" --cwd "$inflight" "change bin/thing.sh"
+if grep '"command":"in-flight"' "$PI_BOSS_ROOT/state/decisions.jsonl" 2>/dev/null | grep -q '"decision":"blocked".*bin/thing.sh'; then
+	pass "in-flight refusal recorded in state/decisions.jsonl, with both path lists"
 else
-	fail "no in-flight blocked line in state/decisions.jsonl"
+	fail "no in-flight blocked line naming bin/thing.sh in state/decisions.jsonl"
 fi
+# A task on a different file is a different area: the queue does not block it, and the note says
+# why rather than leaving the person to guess whether the check ran.
+expect "delegate spawn, unread report on another path passes" 1 "touch no path this task names" -- \
+	env PATH=$stub:$safe_path "$bin/delegate" spawn "new-readme" --cwd "$inflight" "change README.md"
 # A read marker is what clears it: the spawn then gets past the queue and dies later, on the stub
 # herdr-app's missing space id. That line is the proof the refusal above came from the queue alone.
 mkdir -p "$PI_BOSS_ROOT/state/read"
 : >"$PI_BOSS_ROOT/state/read/old-worker"
 expect "delegate spawn, read marker clears the block" 1 "could not read the new space id" -- \
-	env PATH=$stub:$safe_path "$bin/delegate" spawn "new-worker" --cwd "$work" "change one file"
+	env PATH=$stub:$safe_path "$bin/delegate" spawn "new-worker" --cwd "$inflight" "change bin/thing.sh"
 rm -f "$PI_BOSS_ROOT/state/read/old-worker"
-env PATH=$stub:$safe_path "$bin/delegate" spawn "new-worker" --cwd "$work" --override-jev \
-	--reason "the queue can wait, this is a one-line fix" "change one file" >/dev/null 2>&1 || true
+env PATH=$stub:$safe_path "$bin/delegate" spawn "new-worker" --cwd "$inflight" --override-jev \
+	--reason "the queue can wait, this is a one-line fix" "change bin/thing.sh" >/dev/null 2>&1 || true
 if grep '"command":"in-flight"' "$PI_BOSS_ROOT/state/decisions.jsonl" 2>/dev/null | grep -q '"decision":"override".*"overridden":true'; then
 	pass "in-flight override recorded with its reason in state/decisions.jsonl"
 else

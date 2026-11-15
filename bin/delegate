@@ -40,11 +40,15 @@
 # Work in flight is capped by review, not by generation. A report is "read" once something marks
 # it so: `delegate wait` and `delegate close` write state/read/<slug> as they print or check the
 # report, and nothing else does. While a reported worker in a --cwd still has no marker, the boss
-# has not looked at what already landed there, so `delegate spawn` refuses a second worker in that
-# same cwd and names the queue; --override-jev --reason '<why the queue can wait>' goes through
-# and lands as a command "in-flight" line in state/decisions.jsonl. Generation outrunning review
-# is invisible until it is counted, which is why `delegate stats` prints the unread queue and the
-# age of its oldest report with no network and no gh.
+# has not looked at what already landed there. The block is by area, not by directory: each unread
+# worker's paths come from its own branch (`git diff --name-only` against the merge base with the
+# origin trunk) and the new task's paths come from the paths the task text names, so only an
+# overlapping unread report refuses — with the queue and both path lists — while a task that
+# touches different files, or names no path at all, goes through with a note saying why.
+# --override-jev --reason '<why the queue can wait>' goes through and lands as a command
+# "in-flight" line in state/decisions.jsonl, which is written either way. Generation outrunning
+# review is invisible until it is counted, which is why `delegate stats` prints the unread queue
+# and the age of its oldest report with no network and no gh.
 #
 # Between features there is one more step, and `delegate close` enforces it: `delegate wipe
 # <slug>` prints the five consolidation questions — what did this feature make unnecessary, what
@@ -56,11 +60,13 @@
 #
 # A report is a claim until it carries output. So `delegate close` refuses a report with no
 # `## Evidence` block, or one that still has fill-in placeholders left in it: it prints what is
-# missing and how to fix it, and exits nonzero without closing the space. The worker stays idle
-# and its space stays open, so the evidence is one edit away instead of lost. The spec and
-# report templates say the same thing to the worker, earlier: "should work", "looks correct"
-# and "tests pass" are banned without the output that shows it. Plausible is not working — the
-# genie is plausible by default, so the harness asks for the transcript.
+# missing and how to fix it, and exits nonzero without closing the space. The generated spec
+# carries the scaffold, command line and fence included, so the block is copied into the report
+# and deleting it is a decision; the worker stays idle and its space stays open, so the evidence
+# is one edit away instead of lost. The spec and report templates say the same thing to the
+# worker, earlier: "should work", "looks correct" and "tests pass" are banned without the output
+# that shows it. Plausible is not working — the genie is plausible by default, so the harness asks
+# for the transcript.
 #
 # Provenance is demanded in the shape the commit can still be given it in. A report's commit
 # must carry the `Agent-Slug` trailer, which is one `git commit --amend` away while the branch
@@ -91,14 +97,24 @@
 # instead of a bare yes. A commit whose parent has not been fetched is refused as "fetch first",
 # never read as `+`.
 #
-# Every spawn asks Jev, unconditionally, for the mode, the worker count, the route (local or
-# remote) and the thinking effort. Routing is a refusal, not a warning: a task Jev calls
-# "local" stops the spawn and prints the cheaper bin/local-run command to run instead. A
-# caller's --mode or --thinking is accepted only when it matches Jev's answer for that exact
-# task text; otherwise the spawn aborts and prints Jev's answer. Overriding Jev — a mode, a
-# thinking level or a local route — needs --override-jev with a non-empty --reason, and the
+# Every spawn asks Jev, unconditionally, for the count, the mode, the route (local or remote) and
+# the thinking effort — in one call (`jev plan`), because four questions about the same task are
+# one judgement and four latencies. One call, one usage line, and the same gates: every field is
+# validated the way its own subcommand validates it, and an unusable field or a dead model aborts
+# the spawn instead of guessing. The four answers are still recorded as four decision lines
+# (count, mode, route, thinking), each carrying jev's own answer. Routing is a refusal, not a
+# warning: a task Jev calls "local" stops the spawn and prints the cheaper bin/local-run command
+# to run instead. A caller's --mode or --thinking is accepted only when it matches Jev's answer
+# for that exact task text; otherwise the spawn aborts and prints Jev's answer. Overriding Jev — a
+# mode, a thinking level or a local route — needs --override-jev with a non-empty --reason, and the
 # override is recorded. If Jev is unreachable or unsure, the spawn aborts instead of guessing:
 # that decision belongs to the user. An "unsure" route is recorded and the spawn continues.
+#
+# Jev's count is honoured, not noted. A task that needs three workers starts three spaces,
+# `SLUG`, `SLUG-2`, `SLUG-3`, each with its own spec and report file, the same task text plus its
+# position in the group, and the same mode and thinking level. Count 1 is exactly the old
+# behaviour and the old slug. A count that would cross the live-worker ceiling refuses rather than
+# quietly starting one, because a count jev gave and the boss dropped is a decision nobody made.
 #
 # Thinking is the one decision with two halves. Jev answers an abstract effort, low | medium |
 # high: it cannot know which thinking levels the worker's model supports. So the effort is
@@ -183,9 +199,11 @@ mark_read() {
 }
 
 # unread_reports_in <cwd> -- one line per tracked worker in <cwd> whose report exists, has
-# content, and has no read marker: "<slug> <age-seconds> <report>". Age is the report's mtime,
-# the moment the worker wrote it. Empty output means nothing in that area is waiting to be read.
-# A worker with no report is still working, not unread, so it never blocks.
+# content, and has no read marker: "<slug> <age-seconds> <report> <branch>". Age is the report's
+# mtime, the moment the worker wrote it. Empty output means nothing in that area is waiting to be
+# read. A worker with no report is still working, not unread, so it never blocks. The branch is
+# what cmd_spawn reads the worker's touched paths from: a report names what the worker says it
+# did, the branch diff names what it actually changed.
 unread_reports_in() {
 	[ -f "$DELEGATIONS" ] || return 0
 	node -e '
@@ -198,9 +216,53 @@ unread_reports_in() {
 			let st; try { st = fs.statSync(r.report); } catch { continue; }
 			if (!st.size) continue;
 			if (fs.existsSync(path.join(marks, slug))) continue;
-			process.stdout.write([slug, Math.max(0, Math.round((now - st.mtimeMs) / 1000)), r.report].join(" ") + "\n");
+			process.stdout.write([slug, Math.max(0, Math.round((now - st.mtimeMs) / 1000)), r.report, r.branch || ""].join(" ") + "\n");
 		}' "$DELEGATIONS" "$READ_MARKS" "$1"
 }
+
+# worker_paths <cwd> <branch> -- the paths a worker's branch actually changes, one per line, and
+# nothing when that cannot be read (no branch recorded, no origin trunk, no merge base). A report
+# says what the worker believes it did; this says what the tree says, which is the side the next
+# worker would collide with. The diff is against the merge base with the origin trunk, so a
+# branch that has fallen behind does not read as touching every file trunk touched since.
+worker_paths() {
+	local cwd=$1 branch=$2 trunk base
+	[ -n "$branch" ] || return 0
+	trunk=$(fresh_trunk_branch "$cwd")
+	[ -n "$trunk" ] || return 0
+	base=$(git -C "$cwd" merge-base "refs/remotes/origin/$trunk" "$branch" 2>/dev/null) || return 0
+	[ -n "$base" ] || return 0
+	git -C "$cwd" diff --name-only "$base" "$branch" 2>/dev/null || true
+}
+
+# task_paths <task text> -- the paths a task text names, one per line, deduplicated and sorted.
+# A path is a word with a slash in it (bin/delegate, src/auth.ts, agent/extensions/): that is what
+# a person writes when they mean a file, and an idea does not carry one. A URL is dropped, because
+# "https://..." is a slash and not a file this repo holds. Text that names no path prints nothing:
+# that is an honest "no overlap established", said out loud in cmd_spawn's note, not a silent
+# "safe to overlap".
+task_paths() {
+	printf '%s\n' "${1:-}" | tr -s '[:space:]' '\n' \
+		| sed -e 's/^[^[:alnum:]._@+~/-]*//' -e 's/[^[:alnum:]._@+~/-]*$//' \
+		| grep -E '^[[:alnum:]._@+~-]+(/[[:alnum:]._@+~-]+)+/?$' \
+		| sed -e 's#/*$##' | sort -u || true
+}
+
+# paths_overlap <worker-paths> <task-paths> -- the task paths that meet a worker path, one per line
+# as "<task path> -> <worker path>". Two paths meet when they are equal or when one is the other's
+# directory: bin/delegate and bin are the same area of work, and a worker that touched bin/delegate
+# is not someone a change to bin/delegate/... can be started beside.
+paths_overlap() {
+	WORKER_PATHS=${1:-} TASK_PATHS=${2:-} node -e '
+		const w = String(process.env.WORKER_PATHS || "").split("\n").filter(Boolean);
+		const t = String(process.env.TASK_PATHS || "").split("\n").filter(Boolean);
+		const meets = (a, b) => a === b || a.startsWith(b + "/") || b.startsWith(a + "/");
+		const out = [];
+		for (const tp of t) for (const wp of w) if (meets(tp, wp)) { out.push(tp + " -> " + wp); break; }
+		process.stdout.write(out.join("\n"));
+	'
+}
+
 
 # report_has_evidence <report> -- true when the report carries an Evidence heading with at
 # least one written line under it. A heading with nothing beneath it is the same claim as no
@@ -499,44 +561,34 @@ patch_already_in_trunk() {
 	return 1
 }
 
-# ask_jev <mode|count|thinking> <task text> [context]
-
-# ask_jev <mode|count|thinking> <task text> [context] — sets JEV_DECISION and JEV_REASON; dies
-# if Jev will not answer. The context lands on Jev's own usage line in state/usage.jsonl, so a
-# local call can be tied to the worker or question that caused it.
-ask_jev() {
-	local kind=$1 text=$2 ctx=${3:-} out rc decision reason
-	out=$(PI_BOSS_CONTEXT="$ctx" "$BIN/jev" "$kind" "$text" --json 2>&1) && rc=0 || rc=$?
+# plan_jev <task text> [context] -- sets JEV_COUNT, JEV_MODE, JEV_ROUTE, JEV_THINKING,
+# JEV_REASON from ONE `jev plan` call, and dies if Jev will not answer for any of them.
+#
+# One call instead of four: the four questions are one judgement about one task, and asking the
+# local model four times costs four latencies (~20-60s of spawn) for answers that agree with each
+# other anyway. The gates are unchanged — an unusable field, a low-confidence answer, or a dead
+# model is still a refusal, never a default — and the decision lines written by the caller are
+# still four, each carrying jev's own answer. The context lands on Jev's one usage line in
+# state/usage.jsonl, so the call can be tied to the worker or question that caused it.
+plan_jev() {
+	local text=$1 ctx=${2:-} out rc
+	out=$(PI_BOSS_CONTEXT="$ctx" "$BIN/jev" plan "$text" --json 2>&1) && rc=0 || rc=$?
 	if [ "$rc" -ne 0 ]; then
 		case $out in
 		*unreachable* | *"returned nothing"* | *"HTTP "* | *"outside JSON"*)
 			die "jev is unreachable or broken — refusing to guess. jev said: $out" ;;
 		*)
-			die "jev $kind is unsure, so the spawn stops here. jev said: $out
-Ask the user which $kind to use. Only then re-run with --override-jev --reason '<why>'." ;;
+			die "jev plan is unsure, so the spawn stops here. jev said: $out
+Ask the user about the field it named. Only then re-run with --override-jev --reason '<why>'." ;;
 		esac
 	fi
-	decision=$(printf '%s' "$out" | json_field "$kind")
-	reason=$(printf '%s' "$out" | json_field reason)
-	[ -n "$decision" ] || die "jev $kind gave no usable answer: $out"
-	JEV_DECISION=$decision
-	JEV_REASON=$reason
-}
-
-# ask_jev_route <task text> — sets JEV_ROUTE (local|remote|unsure) and ROUTE_REASON.
-# Never dies here: the refusal lives in cmd_spawn beside the mode check, so one run records
-# every decision. That check reads Jev's answer only, never keywords in the task text: "quick"
-# and "small" show up in plenty of remote work.
-ask_jev_route() {
-	local text=$1 ctx=${2:-} out rc
-	JEV_ROUTE=unsure ROUTE_REASON=""
-	out=$(PI_BOSS_CONTEXT="$ctx" "$BIN/jev" route "$text" --json 2>&1) && rc=0 || rc=$?
-	case $rc in
-	0) JEV_ROUTE=local ;;
-	1) JEV_ROUTE=remote ;;
-	*) JEV_ROUTE=unsure ;;
-	esac
-	ROUTE_REASON=$(printf '%s' "$out" | json_field reason || true)
+	JEV_COUNT=$(printf '%s' "$out" | json_field count)
+	JEV_MODE=$(printf '%s' "$out" | json_field mode)
+	JEV_ROUTE=$(printf '%s' "$out" | json_field route)
+	JEV_THINKING=$(printf '%s' "$out" | json_field thinking)
+	JEV_REASON=$(printf '%s' "$out" | json_field reason)
+	[ -n "$JEV_COUNT" ] && [ -n "$JEV_MODE" ] && [ -n "$JEV_ROUTE" ] && [ -n "$JEV_THINKING" ] \
+		|| die "jev plan gave no usable answer: $out"
 }
 
 # record_decision <command> <task> <decision> <reason> <overridden true|false> <slug|-> [jev] [extra-json]
@@ -805,18 +857,26 @@ cmd_spawn() {
 	need herdr-app; need node; need hc
 
 	# 1. Jev decides the count, the mode, the route and the thinking effort. Always. No caller
-	#    short-circuit.
-	local jev_count jev_mode count_reason mode_reason overridden=false
+	#    short-circuit. One call answers all four (see plan_jev); each answer is still checked and
+	#    still recorded on its own line below, so a reader cannot tell the difference in the log.
+	local jev_count jev_mode jev_route jev_effort plan_reason overridden=false
+	local count_reason mode_reason route_reason thinking_reason
 	local mode_overridden=false thinking_overridden=false route_overridden=false
 	local task_ctx="spawn:$slug"
-	ask_jev count "$task" "$task_ctx"; jev_count=$JEV_DECISION; count_reason=$JEV_REASON
-	ask_jev mode "$task" "$task_ctx"; jev_mode=$JEV_DECISION; mode_reason=$JEV_REASON
-	local jev_route route_reason
-	ask_jev_route "$task" "$task_ctx"; jev_route=$JEV_ROUTE; route_reason=$ROUTE_REASON
-	if [ "$jev_count" -gt 4 ]; then jev_count=4; fi
+	plan_jev "$task" "$task_ctx"
+	jev_count=$JEV_COUNT
+	jev_mode=$JEV_MODE
+	jev_route=$JEV_ROUTE
+	jev_effort=$JEV_THINKING
+	plan_reason=$JEV_REASON
+	# One reason for four decisions: jev gave one sentence for one judgement, and a line that
+	# invented three more would be recording prose nobody wrote.
+	count_reason=$plan_reason
+	mode_reason=$plan_reason
+	route_reason=$plan_reason
+	thinking_reason=$plan_reason
 	# The effort is Jev's; the level is the model's. See worker_thinking_level.
-	local jev_effort thinking_reason thinking_map jev_level jev_effort_level
-	ask_jev thinking "$task" "$task_ctx"; jev_effort=$JEV_DECISION; thinking_reason=$JEV_REASON
+	local thinking_map jev_level jev_effort_level
 	thinking_map=$(worker_thinking_level "$jev_effort")
 	jev_level=$(printf '%s' "$thinking_map" | json_field level)
 	[ -n "$jev_level" ] || die "could not map jev's thinking effort '$jev_effort' to a level: $thinking_map"
@@ -882,32 +942,55 @@ Forcing a remote worker needs --override-jev --reason '<why this cannot run loca
 	record_decision route "$task" "$jev_route" "$route_reason" "$route_overridden" "$slug" "$jev_route"
 	record_decision thinking "$task" "$jev_level" "$thinking_reason (jev effort $jev_effort → $jev_level)" "$thinking_overridden" "$slug" "$jev_effort_level"
 
-	# The review ceiling is 4 workers (blip 21): refuse past it instead of hiding it.
+	# The review ceiling is 4 workers (blip 21) and 8 live spaces is the hard stop. Jev's count is
+	# honoured or the spawn refuses: starting one worker for a three-worker task is a decision
+	# nobody made, and the person then believes three areas are being worked at once.
 	local live
 	live=$(node -e '
 		const fs=require("fs");let j={};try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"))}catch{}
 		process.stdout.write(String(Object.keys(j).length));' "$DELEGATIONS" 2>/dev/null || echo 0)
-	[ "$live" -lt 8 ] || die "$live workers already tracked — close finished ones first"
-	if [ "$jev_count" -gt 1 ]; then
-		say "jev: this task wants $jev_count workers ($count_reason); spawning one now" >&2
+	if [ $((live + jev_count)) -gt 8 ]; then
+		die "$live workers already tracked and jev asks for $jev_count more, past the live ceiling of 8 — close finished ones first, or split the task."
+	fi
+	# A count of N needs N slugs, and a slug is at most 31 characters; "-2" .. "-4" is what is
+	# appended, so a shorter slug is the only thing that has to change.
+	if [ "$jev_count" -gt 1 ] && [ "${#slug}" -gt 29 ]; then
+		die "jev wants $jev_count workers, named $slug-2 .. $slug-$jev_count, and a slug is at most 31 characters: use a slug of at most 29 characters."
 	fi
 
-	# 4b. Review sets the pace, not generation. A reported worker in this same cwd whose report has
-	#     no read marker means the boss has not looked at what already landed here; a second worker
-	#     in that area is generation outrunning the person who has to check it. Refuse, and print
-	#     the queue: the age is what makes it a queue and not a list.
-	local unread queue
+	# 4b. Review sets the pace in the area the work is in, not across the whole directory. An
+	#     unread report blocks only when the worker's branch touches a path this task names; the
+	#     worker's side comes from its branch diff, this task's side from its own text. Both lists
+	#     go into the refusal, because "overlaps" without the paths is a claim, not a finding.
+	#     No paths named means no overlap established — recorded and said out loud, never silent.
+	local unread uslug uage ureport ubranch wpaths hits tpaths tpaths_one blocking="" quiet=""
+	tpaths=$(task_paths "$task")
+	tpaths_one=$(printf '%s\n' "$tpaths" | paste -sd' ' -)
 	unread=$(unread_reports_in "$cwd")
-	if [ -n "$unread" ]; then
-		queue=$(printf '%s\n' "$unread" | awk '{printf "%s%s (reported %ss ago, %s)", sep, $1, $2, $3; sep="; "}')
+	while read -r uslug uage ureport ubranch; do
+		[ -n "${uslug:-}" ] || continue
+		wpaths=$(worker_paths "$cwd" "$ubranch")
+		hits=$(paths_overlap "$wpaths" "$tpaths")
+		if [ -n "$hits" ]; then
+			blocking="${blocking:+$blocking; }$uslug (reported ${uage}s ago, $ureport) touches: $(printf '%s\n' "${wpaths:-unknown}" | paste -sd' ' -); this task names: $(printf '%s\n' "$hits" | paste -sd' ' -)"
+		else
+			quiet="${quiet:+$quiet; }$uslug (reported ${uage}s ago) touches: $(printf '%s\n' "${wpaths:-nothing}" | paste -sd' ' -)"
+		fi
+	done <<<"$unread"
+
+	if [ -n "$blocking" ]; then
 		if [ "$override_jev" != 1 ]; then
-			record_decision in-flight "$task" blocked "$queue" false "-"
-			die "refusing to spawn in $cwd: a report there is still unread — $queue
+			record_decision in-flight "$task" blocked "$blocking" false "-"
+			die "refusing to spawn in $cwd: a report there is still unread — $blocking
+This task names: ${tpaths_one:-no path at all}.
 Review sets the pace, not generation. Read it, then spawn again:  $BIN/delegate wait <slug>  marks the report read as it prints it.
 Forcing a second worker in the same area needs --override-jev --reason '<why the queue can wait>'."
 		fi
-		record_decision in-flight "$task" override "$reason — blocked by: $queue" true "$slug"
-		printf '%s: note: an unread report is still open in %s (%s); spawning because --override-jev --reason was given.\n' "$prog" "$cwd" "$queue" >&2
+		record_decision in-flight "$task" override "$reason — blocked by: $blocking" true "$slug"
+		printf '%s: note: an unread report in %s touches a path this task names (%s); spawning because --override-jev --reason was given.\n' "$prog" "$cwd" "$blocking" >&2
+	elif [ -n "$quiet" ]; then
+		record_decision in-flight "$task" allowed "no overlap with the unread report(s): $quiet; this task names: ${tpaths_one:-no path}" false "$slug"
+		printf '%s: note: unread report(s) in %s touch no path this task names (%s): %s — spawning.\n' "$prog" "$cwd" "${tpaths_one:-the task names no path, so this is no overlap established}" "$quiet" >&2
 	fi
 
 	# 5. Guarantee the base before anything is created. The fetch works here and not inside a
@@ -923,18 +1006,18 @@ Forcing a second worker in the same area needs --override-jev --reason '<why the
 	fi
 
 	mkdir -p "$SPECS" "$REPORTS" "$STATE"
-	local spec=$SPECS/$slug.md report=$REPORTS/$slug.md
 	# overridden is the word "false" when nothing was overridden: test it, do not test for a value.
 	local overridden_note=""
 	if [ "$overridden" = true ]; then overridden_note=", overridden: $reason"; fi
 	# Acceptance mode rewrites the task section and adds one rule block. Everything else — the
 	# mission line, the worktree rule, the report shape — is the same worker, so it is the same
 	# template rather than a second one that drifts.
-	local acceptance_note="" acceptance_block="" task_block=$task acceptance_bool=false
+	local acceptance_note="" acceptance_block="" acceptance_task="" task_block=$task base_task=$task
+	local acceptance_bool=false
 	if [ "$acceptance" = 1 ]; then
 		acceptance_bool=true
 		acceptance_note=", acceptance: true"
-		task_block="Acceptance tests for the spec at \`$source_spec\`. You are the second opinion: the
+		acceptance_task="Acceptance tests for the spec at \`$source_spec\`. You are the second opinion: the
 spec is your whole input, and the implementation is not."
 		acceptance_block=$(cat <<ACCEPTANCE
 
@@ -958,8 +1041,30 @@ the only reason this worker exists.
 ACCEPTANCE
 )
 	fi
-	cat >"$spec" <<EOF
-# Worker \`$slug\`
+
+	# One space per worker jev asked for: SLUG, SLUG-2 .. SLUG-N. Every one gets its own spec, its
+	# own report path, its own space, and the same mode and thinking level. The task text carries
+	# the worker's position, so its report reads as one of a group instead of as the whole job.
+	local n spawn_slug spec report argv before out space tab pane terminal position
+	for n in $(seq 1 "$jev_count"); do
+		if [ "$n" = 1 ]; then spawn_slug=$slug; else spawn_slug=$slug-$n; fi
+		spec=$SPECS/$spawn_slug.md
+		report=$REPORTS/$spawn_slug.md
+		position=""
+		if [ "$jev_count" -gt 1 ]; then
+			position="This is worker $n of $jev_count started for this task at the same moment, each in
+its own worktree with its own report. Do not expect the other workers' changes in your tree, and
+do not edit anyone else's report."
+		fi
+		task_block=$base_task
+		if [ "$acceptance" = 1 ]; then task_block=$acceptance_task; fi
+		if [ -n "$position" ]; then
+			task_block="$task_block
+
+$position"
+		fi
+		cat >"$spec" <<EOF
+# Worker \`$spawn_slug\`
 
 You are the genie. Your work is plausible by default. Prove it runs.
 
@@ -1003,9 +1108,9 @@ $acceptance_block
    AGENTS.md, .github/, git-hooks/, sandbox/, auth, secrets, money, deletion). Never merge,
    never upload onto trunk, never commit on trunk. You stay sandboxed: publishing is the boss's
    job, so it never needs host access from you.
-6. End every commit message with two trailers: \`Agent-Slug: $slug\` and \`Spec: $SPECS/$slug.md\`.
+6. End every commit message with two trailers: \`Agent-Slug: $spawn_slug\` and \`Spec: $SPECS/$spawn_slug.md\`.
    \`delegate close\` refuses a report whose recorded commit sha has no \`Agent-Slug\` trailer,
-   so a commit without them cannot close its own worker. AGENT_SLUG=$slug is already in your
+   so a commit without them cannot close its own worker. AGENT_SLUG=$spawn_slug is already in your
    environment and the commit-msg hook stamps both trailers, so a plain \`git commit\` carries
    them; check with \`git log -1 --format=%B\` before you report, and only amend if the hook
    was not installed.
@@ -1029,6 +1134,26 @@ $acceptance_block
 8. Never write "should work", "looks correct" or "tests pass" without the output that shows
    it. If it was not run, write "not run" and what would run it. A claim without output is
    not a result, and the report is read as a claim until the Evidence block proves it.
+
+The report's Evidence block is scaffolded here, prefilled, so that leaving it out is a decision
+and not an oversight. Copy this into your report and replace the two pointy-bracket lines:
+
+\`\`\`\`markdown
+## Evidence
+
+Command: <fill in: the exact command you ran, flags and all>
+
+Output (last 20 lines):
+
+\`\`\`
+<paste the last 20 lines of that command's output here>
+\`\`\`
+\`\`\`\`
+
+\`delegate close\` refuses a report with no Evidence block, and refuses one whose placeholders were
+left in. That is the point: a report without output is a claim, and the harness does not close on a
+claim.
+
 9. Then write the report and stay idle. Do not close, rename or move the space. The
    big-boss-pi agent relays the report and closes the space right away, so a space never stays
    open just because the worker finished.
@@ -1037,20 +1162,17 @@ $acceptance_block
    the only thing that keeps the space open, and only until the user answers.
 EOF
 
-	local argv
 	argv=$(node -e 'process.stdout.write(JSON.stringify(["sh","-lc",process.argv[1]]))' \
-		"cd $(printf '%q' "$cwd") && export AGENT_SLUG=$(printf '%q' "$slug") && exec $(printf '%q' "$runner") --thinking $(printf '%q' "$jev_level") -a")
+		"cd $(printf '%q' "$cwd") && export AGENT_SLUG=$(printf '%q' "$spawn_slug") && exec $(printf '%q' "$runner") --thinking $(printf '%q' "$jev_level") -a")
 	# space.new has no hidden or background mode: the new space is shown, which takes the person
 	# off the space and tab they were reading. Note both ids now, explicitly, to put them back.
-	local before=""
+	before=""
 	if [ "$no_restore" = 0 ]; then before=$(screen_state); fi
 
-	local out
-	out=$(herdr-app do space.new --name "$slug" --folder "$cwd" --tab "$slug" \
+	out=$(herdr-app do space.new --name "$spawn_slug" --folder "$cwd" --tab "$spawn_slug" \
 		--argv "$argv" --task "Read $spec and do it. Report to $report." 2>&1) \
-		|| die "space.new failed: $out"
+		|| die "space.new failed for $spawn_slug: $out"
 
-	local space tab pane terminal
 	space=$(printf '%s' "$out" | json_field space)
 	[ -n "$space" ] || space=$(printf '%s' "$out" | json_field id)
 	tab=$(printf '%s' "$out" | json_field tab)
@@ -1076,7 +1198,7 @@ EOF
 			overridden:overridden==="true",overrideReason:reason||null,branch:branch||null,acceptance:acceptance==="true",
 			acceptanceSpec:sourceSpec||null,started:new Date().toISOString()};
 		fs.writeFileSync(state,JSON.stringify(j,null,2)+"\n");' \
-		"$DELEGATIONS" "$slug" "$space" "$tab" "$pane" "$terminal" "$cwd" "$mode" "$thinking" "$spec" "$report" \
+		"$DELEGATIONS" "$spawn_slug" "$space" "$tab" "$pane" "$terminal" "$cwd" "$mode" "$thinking" "$spec" "$report" \
 		"$jev_count" "$jev_effort" "$overridden" "$reason" "$base_branch" "$acceptance_bool" "$source_spec"
 
 	# space.new's --task can arrive before pi is listening, so send it again once the banner is up.
@@ -1089,7 +1211,8 @@ EOF
 		|| printf '%s: warning: could not send the task to %s\n' "$prog" "$terminal" >&2
 
 	printf '{"slug":"%s","space":"%s","mode":"%s","thinking":"%s","thinking_effort":"%s","route":"%s","jev_count":%s,"overridden":%s,"acceptance":%s,"cwd":"%s","report":"%s","branch":"%s"}\n' \
-		"$slug" "$space" "$mode" "$jev_level" "$jev_effort" "$jev_route" "$jev_count" "$overridden" "$acceptance_bool" "$cwd" "$report" "$base_branch"
+		"$spawn_slug" "$space" "$mode" "$jev_level" "$jev_effort" "$jev_route" "$jev_count" "$overridden" "$acceptance_bool" "$cwd" "$report" "$base_branch"
+	done
 }
 
 cmd_wait() {

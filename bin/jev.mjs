@@ -12,6 +12,16 @@
  *   jev mode "<worker task>"  bare | sandboxed | no-net
  *   jev count "<task>"        1..4 workers
  *   jev thinking "<task>"     low | medium | high — how much effort the worker needs
+ *   jev plan "<task>"         count + mode + route + thinking in one call
+ *
+ * "plan" exists because a spawn asks the same model four times about the same task, and three
+ * of those four answers are cheap variations on one judgement. One call answers all of them in
+ * one JSON object, so a spawn costs one latency and one usage line instead of four. The rules
+ * do not relax: every field is validated by the same check its own subcommand makes, and one
+ * unusable field still means "unsure", which stops a spawn rather than guessing at that field
+ * while trusting the other three. Exit 0 means all four are usable — the route is read from the
+ * payload (a local route is still a refusal, made by the caller) — 3 means unsure or the model
+ * is unreachable, 2 usage.
  *
  * "thinking" answers an abstract effort, never a pi level name: which levels the concrete
  * model supports is a fact about that model, not about the task, so the caller does the
@@ -91,7 +101,7 @@ function parseArgs(argv) {
 	const rest = [];
 	for (const arg of argv) {
 		if (arg === "--json") opts.json = true;
-		else if (!opts.kind && ["ask", "permit", "mode", "count", "route", "thinking"].includes(arg))
+		else if (!opts.kind && ["ask", "permit", "mode", "count", "route", "thinking", "plan"].includes(arg))
 		opts.kind = arg;
 		else rest.push(arg);
 	}
@@ -106,6 +116,7 @@ const SHAPES = {
 	count: '{"count":1-4,"confidence":0.0-1.0,"reason":"one sentence"}',
 	route: '{"route":"local|remote","confidence":0.0-1.0,"reason":"one sentence"}',
 	thinking: '{"thinking":"low|medium|high","confidence":0.0-1.0,"reason":"one sentence"}',
+	plan: '{"count":1-4,"mode":"bare|sandboxed|no-net","route":"local|remote","thinking":"low|medium|high","confidence":0.0-1.0,"reason":"one sentence"}',
 };
 
 const PROMPTS = {
@@ -120,6 +131,8 @@ const PROMPTS = {
 		`Task:\n${text}\n\nShould this run local (a small local model, no repo, no tools) or remote (a coding agent with the repo and tools)? Answer local or remote.`,
 	thinking: (text) =>
 		`A worker will be started for this task:\n${text}\n\nHow much thinking effort does it need? Answer low, medium, or high — the effort the task needs, not a model's level name.`,
+	plan: (text) =>
+		`A worker will be started for this task:\n${text}\n\nAnswer all four in one JSON object, each by the rule its own question states: how many parallel workers it needs (an integer 1 to 4), which mode (bare, sandboxed or no-net), whether it runs local or remote, and how much thinking effort it needs (low, medium or high).`,
 };
 
 async function decide(kind, text) {
@@ -162,7 +175,7 @@ async function decide(kind, text) {
 
 const opts = parseArgs(process.argv.slice(2));
 command = opts.kind;
-if (!opts.kind) fail("usage: jev ask|permit|mode|count|route|thinking <text> [--json]", 2);
+if (!opts.kind) fail("usage: jev ask|permit|mode|count|route|thinking|plan <text> [--json]", 2);
 if (!opts.text) fail(`jev ${opts.kind}: needs the question text`, 2);
 
 const answer = await decide(opts.kind, opts.text);
@@ -177,6 +190,35 @@ function emit(line, payload, code) {
 	if (opts.json) process.stdout.write(`${JSON.stringify(payload)}\n`);
 	else process.stdout.write(`jev: ${line}${reason ? ` — ${reason}` : ""}\n`);
 	process.exit(code);
+}
+
+if (opts.kind === "plan") {
+	// Same per-field checks as mode/count/route/thinking, in one pass. A field that fails is
+	// null in the payload and named in the line, so a caller that overrides jev can see which
+	// judgement it is overturning. One bad field is enough to stop the spawn.
+	const count = Number(answer.count);
+	const mode = String(answer.mode || "").trim().toLowerCase();
+	const route = String(answer.route || "").trim().toLowerCase();
+	const thinking = String(answer.thinking || "").trim().toLowerCase();
+	const bad = [];
+	if (!Number.isInteger(count) || count < 1 || count > 4) bad.push("count");
+	if (!["bare", "sandboxed", "no-net"].includes(mode)) bad.push("mode");
+	if (!["local", "remote"].includes(route)) bad.push("route");
+	if (!["low", "medium", "high"].includes(thinking)) bad.push("thinking");
+	if (low) bad.push("confidence");
+	// A low-confidence answer doubts the whole judgement, not one field of it: every field goes
+	// null, so the caller cannot take the three it likes and ignore the one it does not.
+	const usable = (field) => !low && !bad.includes(field);
+	const payload = {
+		count: usable("count") ? count : null,
+		mode: usable("mode") ? mode : null,
+		route: usable("route") ? route : null,
+		thinking: usable("thinking") ? thinking : null,
+		reason,
+		confidence,
+	};
+	if (bad.length) emit(`unsure how to plan this spawn (${bad.join(", ")} unusable) — ask the user`, payload, 3);
+	emit(`count=${count} mode=${mode} route=${route} thinking=${thinking}`, payload, 0);
 }
 
 if (opts.kind === "mode") {
