@@ -303,6 +303,72 @@ check "  ...its URL is printed" bash -c "printf '%s' '$out' | grep -qF 'https://
 check "  ...nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
 check "  ...no second PR was created" bash -c '! grep -q "pr create" "$FAKE_LOG"'
 
+# --- a worker that was already wiped and closed -------------------------------------------------
+#
+# Closing drops the delegation entry, and the boss publishes after that, so the fallback is the
+# ordinary path for a finished worker, not an edge case: state/delegations.json no longer names it,
+# while reports/<slug>.md under the boss root and a branch carrying its `Agent-Slug:` trailer both
+# still do. `--cwd` names the repo to look in.
+new_closed_case() {
+	new_case "$1"
+	printf '%s' "$REPORT_OK" >"$ROOTDIR/reports/closed.md"
+	cat >"$ROOTDIR/state/delegations.json" <<JSON
+{"someone-else":{"slug":"someone-else","cwd":"$REPO","branch":"feat/other"}}
+JSON
+	: >"$FAKE_LOG"
+}
+
+new_closed_case closed-publishes
+export FAKE_BRANCHES='feat/closed feat/other' FAKE_WORKER_BRANCH=feat/closed FAKE_SLUG=closed FAKE_TRAILERS=''
+run closed --cwd "$REPO"
+if [ "$rc" -eq 0 ]; then pass "a wiped and closed slug publishes via --cwd (exit 0)"; else fail "a wiped and closed slug publishes via --cwd (exit $rc: $err)"; fi
+check "  ...the branch is found by its trailer" bash -c "printf '%s' \"$err\" | grep -q 'found by its Agent-Slug trailer'"
+check "  ...and names the missing delegation entry" bash -c "printf '%s' \"$err\" | grep -q 'unknown worker slug'"
+check "  ...the found branch is pushed" calls '^git .*push .*origin feat/closed'
+check "  ...a PR is opened against main" calls '^gh pr create .*--base main'
+check "  ...the body still carries the Review tier" bash -c "grep -qF 'Review tier: **medium**' '$FAKE_BODY_OUT'"
+check "  ...and the Evidence block from reports/closed.md" bash -c "grep -qF 'test-publish: ok' '$FAKE_BODY_OUT'"
+check "  ...nothing was merged" bash -c '! grep -q "pr merge" "$FAKE_LOG"'
+
+new_closed_case closed-no-branch
+export FAKE_BRANCHES='feat/other' FAKE_TRAILERS=''
+run closed --cwd "$REPO"
+refused "a closed slug no branch carries is refused" "no branch in"
+check "  ...and nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
+
+new_closed_case closed-ambiguous
+export FAKE_BRANCHES='feat/one feat/two' FAKE_WORKER_BRANCH=feat FAKE_SLUG=closed FAKE_TRAILERS=''
+run closed --cwd "$REPO"
+refused "a closed slug with two matching branches is refused, not guessed" "several branches in"
+check "  ...both branches are named" bash -c "printf '%s' \"$err\" | grep -q 'feat/one feat/two'"
+check "  ...and nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
+
+new_closed_case closed-bad-cwd
+export FAKE_BRANCHES='feat/closed' FAKE_WORKER_BRANCH=feat/closed FAKE_SLUG=closed FAKE_TRAILERS=''
+run closed --cwd "$CASE/not-a-dir"
+refused "a --cwd that is not a directory is refused" "is not a directory"
+check "  ...and nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
+
+new_closed_case closed-no-evidence
+printf '**Mission**: something.\n\nReview tier: **medium**\n' >"$ROOTDIR/reports/closed.md"
+export FAKE_BRANCHES='feat/closed' FAKE_WORKER_BRANCH=feat/closed FAKE_SLUG=closed FAKE_TRAILERS=''
+run closed --cwd "$REPO"
+refused "a closed slug's report still needs an Evidence block" "no Evidence block"
+check "  ...and nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
+
+new_closed_case closed-no-tier
+sed '/^Review tier:/d' "$ROOTDIR/reports/closed.md" >"$CASE/r" && mv "$CASE/r" "$ROOTDIR/reports/closed.md"
+export FAKE_BRANCHES='feat/closed' FAKE_WORKER_BRANCH=feat/closed FAKE_SLUG=closed FAKE_TRAILERS=''
+run closed --cwd "$REPO"
+refused "a closed slug's report still needs a Review tier line" "Review tier"
+check "  ...and nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
+
+new_case known-slug-with-cwd
+run worker --cwd "$CASE/nowhere"
+if [ "$rc" -eq 0 ]; then pass "a recorded slug publishes with --cwd given (the entry's cwd wins)"; else fail "a recorded slug publishes with --cwd given (exit $rc: $err)"; fi
+check "  ...and says the entry won" bash -c "printf '%s' \"$err\" | grep -q 'its recorded cwd is used'"
+check "  ...the recorded branch is pushed" calls '^git .*push .*origin feat/worker'
+
 # --- usage -------------------------------------------------------------------------------------
 
 new_case usage

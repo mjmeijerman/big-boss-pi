@@ -58,6 +58,11 @@
 # dropped silently. A close with no wipe line for that slug is refused, because a rule nothing
 # checks is gone (blip 20).
 #
+# The close is the last step of the three, not the second: publish the report while the delegation
+# entry still exists, or after the entry is gone if it has to be (`bin/publish` finds the branch by
+# its Agent-Slug trailer then), then wipe, then close. `delegate wait` prints that order, because
+# that is the moment the boss reads it.
+#
 # A report is a claim until it carries output. So `delegate close` refuses a report with no
 # `## Evidence` block, or one that still has fill-in placeholders left in it: it prints what is
 # missing and how to fix it, and exits nonzero without closing the space. The generated spec
@@ -1237,10 +1242,13 @@ cmd_wait() {
 			say ""
 			if report_needs_decision "$report"; then
 				say "$slug asks the user for a decision. Relay the question, and close the space once it is answered:"
+				say "  $BIN/delegate close $slug"
 			else
-				say "$slug is done. Relay the report, then close the space now:"
+				say "$slug is done. Relay the report, then publish it before the wipe and the close — in that order, because closing drops the delegation entry:"
+				say "  $BIN/publish $slug"
+				say "  $BIN/delegate wipe $slug"
+				say "  $BIN/delegate close $slug"
 			fi
-			say "  $BIN/delegate close $slug"
 			return 0
 		fi
 		sleep 2; waited=$((waited + 2))
