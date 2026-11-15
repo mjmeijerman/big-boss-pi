@@ -67,7 +67,7 @@ local-run "<task>"            # or: ... | local-run
 delegate spawn <slug> --cwd <dir> [--mode bare|sandboxed|no-net] [--thinking LEVEL] [--override-jev --reason TEXT] "<task>"
 delegate wait <slug> [--timeout 600]
 delegate list
-delegate close <slug>
+delegate close <slug> [--nothing "<why>"]   # --nothing: a worker that legitimately landed no commit
 delegate ask "<question>"     # jev first: exit 0 yes, 1 no, 3 ask the user
 delegate wipe <slug> [--skip "<reason>"]   # the five consolidation questions
 delegate sweep                # close every reported worker, keep working ones and open decisions

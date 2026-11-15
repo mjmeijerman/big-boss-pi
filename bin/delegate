@@ -6,6 +6,7 @@
 #   delegate wait <slug> [--timeout SECONDS]
 #   delegate list
 #   delegate close <slug> [--merged PR-URL-OR-NUMBER]
+#   delegate close <slug> --nothing "<why nothing landed>"   (a worker whose change never landed)
 #   delegate ask "<question>" [--json]
 #   delegate stats [--since DURATION] [--json]
 #   delegate sweep
@@ -1268,17 +1269,29 @@ fi
 }
 
 cmd_close() {
-	local slug=${1:-} merged=""
-	[ "$#" -ge 1 ] || die 'usage: delegate close <slug> [--merged <pr-url-or-number>]'
+	local slug=${1:-} merged="" nothing="" nothing_given=""
+	[ "$#" -ge 1 ] || die 'usage: delegate close <slug> [--merged <pr-url-or-number>] [--nothing "<why nothing landed>"]'
 	slug=$1; shift
 	while [ "$#" -gt 0 ]; do
 		case $1 in
 		--merged) merged=${2:-}; shift 2 ;;
+		--nothing)
+			nothing=${2:-}; nothing_given=1
+			if [ "$#" -ge 2 ]; then shift 2; else shift 1; fi
+			;;
 		--*) die "unknown option $1" ;;
-		*) die "close takes one slug: '$1' — usage: delegate close <slug> [--merged <pr-url-or-number>]" ;;
+		*) die "close takes one slug: '$1' — usage: delegate close <slug> [--merged <pr-url-or-number>] [--nothing \"<why nothing landed>\"]" ;;
 		esac
 	done
-	[ -n "$slug" ] || die 'usage: delegate close <slug> [--merged <pr-url-or-number>]'
+	[ -n "$slug" ] || die 'usage: delegate close <slug> [--merged <pr-url-or-number>] [--nothing "<why nothing landed>"]'
+	# --nothing and --merged answer the same question ("where did the work go?") with opposite
+	# findings, so asking both is a mistake, not a combination.
+	if [ -n "$nothing_given" ] && [ -n "$merged" ]; then
+		die "--nothing and --merged cannot be combined: --nothing says no commit landed, --merged names the PR that carried one"
+	fi
+	if [ -n "$nothing_given" ] && [ -z "$nothing" ]; then
+		die "--nothing needs a reason: delegate close $slug --nothing \"<why this worker landed no commit>\""
+	fi
 	[ -f "$DELEGATIONS" ] || die "no such worker: $slug"
 	local space cwd branch meta report
 	meta=$(node -e '
@@ -1312,12 +1325,56 @@ cmd_close() {
 		fi
 	fi
 
+	# --nothing (a worker that legitimately landed no commit): a PR merged before the work finished,
+	# or the change it was sent for turned out to be unnecessary. Without this the report is refused
+	# forever for recording no sha, and the worker is tracked for nothing — so there is one exit, and
+	# it is narrow on purpose: a written reason of real length, an Evidence block, no commit named at
+	# all, and the wipe step. The reason is printed and recorded, so the record says why it landed
+	# nothing instead of silently forgetting the space. Every other close path keeps its checks.
+	if [ -n "$nothing_given" ]; then
+		if [ ! -s "$report" ]; then
+			printf '%s: refusing to close %s with --nothing: %s does not exist, so there is no report that says why nothing landed.\n' "$prog" "$slug" "$report" >&2
+			return 1
+		fi
+		if ! report_has_evidence "$report"; then
+			printf '%s: refusing to close %s with --nothing: %s has no Evidence block, so nothing shows the work was tried.\n' "$prog" "$slug" "$report" >&2
+			printf 'Fix: add a "## Evidence" heading with the exact command you ran and the last 20 lines of its output, then close again:\n' >&2
+			printf '  %s close %s --nothing "<why nothing landed>"\n' "$BIN/delegate" "$slug" >&2
+			return 1
+		fi
+		if [ "${#nothing}" -lt 20 ]; then
+			printf '%s: refusing to close %s with --nothing: the reason is %d characters, and a no-op close needs 20 or more — "%s" does not tell the next reader why the worker landed nothing.\n' \
+				"$prog" "$slug" "${#nothing}" "$nothing" >&2
+			printf 'Fix: say what happened, in one sentence:\n' >&2
+			printf '  %s close %s --nothing "the PR merged before the work finished, so nothing was committed"\n' "$BIN/delegate" "$slug" >&2
+			return 1
+		fi
+		local nosha nosha_msg=""
+		nosha=$(report_commit_sha "$report")
+		if [ -n "$nosha" ]; then
+			if [ -n "$cwd" ] && [ -d "$cwd" ]; then nosha_msg=$(commit_message "$cwd" "$nosha" || true); fi
+			if [ -n "$nosha_msg" ]; then
+				printf '%s: refusing to close %s with --nothing: %s records commit %s, and that commit resolves, so something did land — close it the normal way so the commit and its Agent-Slug trailer are checked.\n' \
+					"$prog" "$slug" "$report" "$nosha" >&2
+				printf 'Fix: drop --nothing and close it on its provenance:\n' >&2
+				printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
+				return 1
+			fi
+			printf '%s: refusing to close %s with --nothing: %s names commit %s, and a --nothing close is for a report that names no commit at all.\n' \
+				"$prog" "$slug" "$report" "$nosha" >&2
+			printf 'Fix: if that commit is the work, record it on the Commit: line and close normally; if nothing landed, remove the Commit line and say why in the --nothing reason:\n' >&2
+			printf '  %s close %s --nothing "<why nothing landed>"\n' "$BIN/delegate" "$slug" >&2
+			return 1
+		fi
+	fi
+
 	# Provenance (Radar blip 79): a report names the commit it stands for, and that commit names the
 # worker in an Agent-Slug trailer. Refused in the same voice as the evidence block: name what is
 # missing, print the exact command that fixes it, leave the space open. Nothing is checked when
 # the worker's cwd is not a git repo — there is no commit to resolve a sha against, and a guard
-# that refuses every report on a plain folder is a guard nobody keeps.
-if [ -n "$cwd" ] && [ -d "$cwd" ] && git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
+# that refuses every report on a plain folder is a guard nobody keeps. A --nothing close has no
+# commit to check by definition, and its own block above has already asked for the rest.
+if [ -z "$nothing_given" ] && [ -n "$cwd" ] && [ -d "$cwd" ] && git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
 	local sha msg
 	sha=$(report_commit_sha "$report")
 	if [ -z "$sha" ]; then
@@ -1349,6 +1406,14 @@ fi
 		printf 'Run the consolidation step first, or record why it does not apply:\n' >&2
 		printf '  %s wipe %s [--skip "<reason>"]\n' "$BIN/delegate" "$slug" >&2
 		return 1
+	fi
+
+	# A --nothing close is an accepted no-op, and an accepted no-op that leaves no trace is
+	# indistinguishable from a worker somebody forgot: print the reason and put it in the log, so
+	# the space going away is explained by the record rather than by its absence.
+	if [ -n "$nothing_given" ]; then
+		printf '%s: closing %s with --nothing: %s\n' "$prog" "$slug" "$nothing" >&2
+		record_decision nothing "$slug" accepted "$nothing" false "$slug"
 	fi
 
 	herdr-app do space.close --id "$space" --confirmed true >/dev/null 2>&1 \
