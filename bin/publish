@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# publish — one command from a finished worker to an open pull request.
+#
+#   bin/publish <slug>
+#
+# The boss used to do this by hand every time: push the worker's branch, retype the mission and
+# the review tier into `gh pr create`, and hope it remembered the evidence block. The retyping is
+# where the tier got lost, so this command builds the body out of the report itself and refuses
+# when the report cannot supply it. One command, and the tier cannot be omitted.
+#
+# What it reads: state/delegations.json for the slug's cwd, branch and report.
+#
+# What it refuses, each with the reason named and a nonzero exit:
+#   - a slug it does not know (never a guess about a typo);
+#   - a report that is missing, or has no Evidence block — the same check `delegate close`
+#     uses, sourced from there so the two commands cannot drift apart;
+#   - a report with no line starting `Review tier:` (the tier is the one thing the PR body must
+#     carry, so a publish with no tier is not a publish);
+#   - a branch with no commit carrying the `Agent-Slug:` trailer (nothing ties the branch to the
+#     worker that wrote the report);
+#   - `gh` not on PATH, and a tree that is not a git repo.
+#
+# What it does, in order: the target repo's own body gate (`make pr-check BODY=<file>`, else
+# `scripts/pr-gate.sh --body <file>`, else skipped with a line saying so) — a red gate stops the
+# publish before anything leaves the machine; an existing PR for the branch prints its URL
+# instead of failing; then the branch is pushed to origin and the PR is opened against trunk.
+#
+# What it never does: merge, push trunk, force-push, or touch the worker's files. Pushing a
+# branch is not landing it — the merge stays the person's.
+#
+# Trunk is read the way `delegate close` reads it: origin's HEAD, else origin/trunk|main|master.
+# A tree with none of those falls back to `main` with a printed note, so a fresh clone with no
+# fetched refs still publishes instead of guessing silently.
+set -euo pipefail
+
+self_root=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)
+BIN=$self_root/bin
+ROOT=${PI_BOSS_ROOT:-${PI_MASTER_ROOT:-$self_root}}
+STATE=$ROOT/state
+DELEGATIONS=$STATE/delegations.json
+prog=publish
+
+# report_has_evidence and fresh_trunk_branch come from bin/delegate: the evidence check is the
+# close's own check, and sourcing keeps one definition of "proved it runs". Sourcing only defines
+# functions (delegate dispatches on BASH_SOURCE), so nothing here starts a worker.
+# shellcheck source=bin/delegate
+. "$BIN/delegate"
+prog=publish
+
+die() {
+	printf '%s: refusing to publish%s: %s\n' "$prog" "${slug:+ $slug}" "$*" >&2
+	exit 1
+}
+note() { printf '%s: %s\n' "$prog" "$*" >&2; }
+
+slug=${1:-}
+case $slug in
+'' | -h | --help | help)
+	printf 'usage: %s <slug>\n' "$prog"
+	[ -n "$slug" ] && exit 0
+	exit 2
+	;;
+esac
+
+# 1. The slug has to be one this workspace started. A typo is refused, not guessed at.
+if ! valid_slug "$slug"; then
+	die "not a worker slug (lowercase letters, digits and dashes)"
+fi
+[ -f "$DELEGATIONS" ] || die "no state/delegations.json at $DELEGATIONS, so no worker is tracked"
+field() {
+	node -e '
+		const fs = require("fs");
+		let j = {};
+		try { j = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch {}
+		const r = j[process.argv[2]];
+		if (!r) process.exit(3);
+		process.stdout.write(String(r[process.argv[3]] || ""));' "$DELEGATIONS" "$slug" "$1"
+}
+if ! cwd=$(field cwd 2>/dev/null); then
+	die "unknown worker slug (not in state/delegations.json)"
+fi
+branch=$(field branch)
+report=$(field report)
+[ -n "$report" ] || report=$ROOT/reports/$slug.md
+
+# 2. The report is the PR body, so it has to exist and prove it ran. Same check as the close.
+[ -f "$report" ] || die "$report does not exist, so there is no report to publish"
+if ! report_has_evidence "$report"; then
+	die "$report has no Evidence block, so the PR body would claim more than the report proves"
+fi
+[ -n "$cwd" ] || die "state/delegations.json records no cwd for this worker"
+
+# 3. The review tier is the one line the update cannot do without.
+tier=$(grep -m1 -E '^Review tier:' "$report" || true)
+[ -n "$tier" ] || die "$report has no line starting 'Review tier:', so the PR body would omit the tier"
+
+# 4. The branch has to carry a commit that names this worker.
+if ! command -v git >/dev/null 2>&1; then
+	die "git is not on PATH"
+fi
+if ! git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
+	die "$cwd is not a git repository"
+fi
+[ -n "$branch" ] || die "state/delegations.json records no branch for this worker (branch '$branch')"
+
+trunk=$(fresh_trunk_branch "$cwd")
+if [ -z "$trunk" ]; then
+	trunk=main
+	note "no origin/HEAD, origin/trunk, origin/main or origin/master in $cwd; publishing against main"
+fi
+# The recorded branch is the boss checkout's branch, and a worker cuts its own: delegations.json
+# therefore says `trunk`/`main` for most workers. A trunk branch is never published, so the
+# branch is looked up by the thing that identifies it — a commit carrying `Agent-Slug: <slug>`.
+# One match is the worker's branch; none or several are refused rather than guessed.
+case $branch in
+"$trunk" | trunk | main | master)
+	found=""
+	recorded=$branch
+	for candidate in $(git -C "$cwd" for-each-ref --format='%(refname:short)' refs/heads/); do
+		if git -C "$cwd" log --format=%B "refs/remotes/origin/$trunk..$candidate" 2>/dev/null |
+			grep -qE "^Agent-Slug:[[:space:]]*${slug}[[:space:]]*$"; then
+			found="$found$candidate"$'\n'
+		fi
+	done
+	found=$(printf '%s' "$found" | grep -E . || true)
+	case $(printf '%s' "$found" | grep -cE . || true) in
+	1)
+		branch=$found
+		note "delegations.json records $recorded for this worker; publishing $branch, found by its Agent-Slug trailer"
+		;;
+	0)
+		die "no branch in $cwd carries a commit with 'Agent-Slug: $slug', so nothing ties a branch to this worker"
+		;;
+	*)
+		die "several branches in $cwd carry 'Agent-Slug: $slug' ($(printf '%s' "$found" | tr '\n' ' ')) — publish one by name rather than guessing"
+		;;
+	esac
+	;;
+esac
+
+# The branch has to exist locally: that is the thing worth pushing. A branch that only exists as
+# a remote-tracking ref would make "no Agent-Slug trailer" the message for a tree that is simply
+# missing the branch, which names the wrong problem.
+if ! git -C "$cwd" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null; then
+	die "branch $branch is not a local branch in $cwd, so there is nothing to push"
+fi
+slugs=$(git -C "$cwd" log --format=%B "refs/remotes/origin/$trunk..$branch" 2>/dev/null || true)
+if [ -z "$slugs" ]; then
+	slugs=$(git -C "$cwd" log --format=%B "$branch" -n 50 2>/dev/null || true)
+fi
+if ! printf '%s\n' "$slugs" | grep -qE '^Agent-Slug:[[:space:]]*[^[:space:]]'; then
+	die "no commit on $branch carries an Agent-Slug trailer, so nothing ties the branch to a worker"
+fi
+
+# 5. gh has to be there before anything is pushed: a push that cannot be followed by a PR leaves
+# the branch uploaded and the person with a loose end.
+command -v gh >/dev/null 2>&1 || die "gh is not on PATH, so the branch would be pushed with no PR to follow it"
+
+# The PR body, built from the report: mission verbatim, the tier, the evidence, and the thrown-away
+# section when the worker wrote one. The body gate and gh both read this file.
+mission=$(grep -m1 -E '^[[:space:]]*(\*\*)?Mission(\*\*)?:' "$report" || true)
+[ -n "$mission" ] || mission='Mission: (the report names no Mission line)'
+section_body() { # <report> <heading text>
+	awk -v want="$2" '
+		{
+			line = $0
+			t = line
+			gsub(/[#*]/, "", t)
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", t)
+			if (!inblock) {
+				if (tolower(t) == tolower(want)) { inblock = 1 }
+				next
+			}
+			if (line ~ /^##[[:space:]]/) exit
+			print
+		}' "$1"
+}
+evidence=$(section_body "$report" "Evidence")
+thrown=$(section_body "$report" "Thrown away")
+
+body=$(mktemp "${TMPDIR:-/tmp}/publish-body.XXXXXX")
+trap 'rm -f "$body"' EXIT
+{
+	printf '%s\n\n' "$mission"
+	printf '%s\n\n' "$tier"
+	printf '## Evidence\n\n%s\n' "$evidence"
+	if [ -n "$thrown" ]; then
+		printf '\n## Thrown away\n\n%s\n' "$thrown"
+	fi
+} >"$body"
+
+# 6. The target repo's own body gate, before anything leaves the machine.
+if [ -f "$cwd/Makefile" ] && grep -qE '^pr-check[[:space:]]*:' "$cwd/Makefile"; then
+	note "body gate: make -C $cwd pr-check"
+	if ! make -C "$cwd" --no-print-directory pr-check BODY="$body"; then
+		die "the body gate (make pr-check) failed, so nothing was pushed"
+	fi
+elif [ -x "$cwd/scripts/pr-gate.sh" ]; then
+	note "body gate: $cwd/scripts/pr-gate.sh --body"
+	if ! (cd "$cwd" && ./scripts/pr-gate.sh --body "$body"); then
+		die "the body gate (scripts/pr-gate.sh) failed, so nothing was pushed"
+	fi
+else
+	note "body gate skipped: $cwd has no 'make pr-check' target and no scripts/pr-gate.sh"
+fi
+
+# 7. An existing PR is an answer, not an error: print it and stop without pushing again.
+# gh failing to answer is not "no PR exists": it is usually a missing login, and pushing first
+# would leave the branch uploaded with no PR behind it.
+if ! existing=$(cd "$cwd" && gh pr list --head "$branch" --state open --json url --jq '.[0].url' 2>/dev/null); then
+	die "gh could not list pull requests for $branch (is it authenticated?), so nothing was pushed"
+fi
+if [ -n "$existing" ]; then
+	note "a pull request for $branch already exists"
+	printf '%s\n' "$existing"
+	exit 0
+fi
+
+# 8. Push the branch only. Never a force, never trunk.
+note "pushing $branch to origin"
+if ! git -C "$cwd" push -u origin "$branch"; then
+	die "git push failed, so no pull request was opened"
+fi
+
+title=$(git -C "$cwd" log -1 --format=%s "$branch" 2>/dev/null || true)
+[ -n "$title" ] || title="Worker $slug"
+note "opening a pull request against $trunk"
+out=$(cd "$cwd" && gh pr create --base "$trunk" --head "$branch" --title "$title" --body-file "$body" 2>&1) || {
+	printf '%s\n' "$out" >&2
+	die "gh pr create failed"
+}
+url=$(printf '%s\n' "$out" | grep -oE 'https?://[^[:space:]]+' | tail -n 1 || true)
+[ -n "$url" ] || url=$out
+printf '%s\n' "$url"

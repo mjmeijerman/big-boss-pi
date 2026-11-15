@@ -186,6 +186,35 @@ report is plain, `keep   <slug> (still working)` when there is no report yet, an
 `delegate list` shows the same three states in its status column: `working`, `DECISION`,
 `reported`.
 
+## Publishing a finished worker
+
+`bin/publish <slug>` is the one command between a reported worker and a pull request. It reads
+`state/delegations.json` for the slug's tree and report, then builds the PR body out of the report
+itself: the Mission line verbatim, the `Review tier:` line, the `## Evidence` block,
+and the `## Thrown away` section when the worker wrote one. The title is the branch HEAD's
+subject. That is why the tier cannot be forgotten — nothing is retyped.
+
+```
+bin/publish <slug>
+```
+
+`delegations.json` records the branch the boss checkout was on when the worker started, and a
+worker cuts its own branch — so for most workers it says `trunk` or `main`. A trunk branch is
+never published: `bin/publish` finds the worker's branch instead, by the commit carrying
+`Agent-Slug: <slug>` on that branch. One match is the branch; none or several are refused rather
+than guessed.
+
+Before anything leaves the machine it runs the target repo's own body gate: `make pr-check
+BODY=<file>` when the Makefile has that target, `scripts/pr-gate.sh --body <file>` when only
+that exists, and it prints a skip when neither does. A red gate stops the publish. A PR that
+already exists for the branch prints its URL instead of failing. Trunk is never pushed, nothing
+is force-pushed, and nothing is merged — the merge stays yours.
+
+It refuses, naming the reason, when the slug is unknown, the report is missing or has no
+Evidence block (the same check `delegate close` uses), the report has no `Review tier:` line,
+the branch carries no `Agent-Slug:` trailer, `gh` is not on PATH, or the tree is not a git
+repo.
+
 ## Review gate
 
 Every change must pass a five-minute comprehension check before it merges: a human reviewer must be able to answer "what does this change do?" in five minutes. If they cannot, the change is too large or too opaque and must be split or clarified.
