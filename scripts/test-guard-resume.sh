@@ -24,6 +24,18 @@
 #  11. fake hc reports a live terminal with no foreground argv -> the guard waits and retries.
 #
 #   bash scripts/test-guard-resume.sh      exit 0 = every case held
+#
+# And the tabs the guard has no business repairing. herdr-core hands the space back with a shell in
+# every parked tab, so "no pi here" once meant "repair it", and a terminal the person had just
+# opened was turned into a fresh pi within five seconds. The classification is kept on disk:
+#
+#  12. a terminal opened while the guard runs -> no pi, no close, no hc send, logged as the person's;
+#  13. a parked tab holding a recovered shell, no entry -> still repaired, as before;
+#  14. the person's tab survives a guard restart -> the class came from disk, not from memory;
+#  15. the guard's own reopened tab loses pi -> reopened, and rate-limited to one a minute;
+#  16. a parked tab the person has turned into their own shell -> left alone, said so in the log;
+#  17. the person's own tab that does carry a resume entry -> resumed, because that is a conversation;
+#  18. a `tab.new` that `ls` has not caught up with -> the tab it lands in is still the guard's own.
 set -uo pipefail
 
 root=$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)
@@ -41,6 +53,7 @@ fail() { printf '  FAIL  %s\n' "$*"; fails=$((fails + 1)); }
 # One space s1 with one tab tab1 named master, whose terminal t1 runs a parked shell. `ls` reads
 # $FAKE/tabs (tab|name|index|terminal|app, one per line) and prints it as JSON, so a fake resume
 # can "start pi" by rewriting that file — the guard has to read the app, not the script's opinion.
+# $FAKE_HIDE_NEW=1 hides the tabs `tab.new` made, the way a real `ls` lags a tab it has just opened.
 cat >"$work/stub/herdr-app" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -52,6 +65,7 @@ ls)
 	sep=""
 	while IFS='|' read -r tab name index terminal app; do
 		[ -n "${tab:-}" ] || continue
+		if [ "${FAKE_HIDE_NEW:-0}" = 1 ] && [ "$name" = extra ]; then continue; fi
 		printf '%s{"id":"%s","name":"%s","terminals":[{"id":"%s","app":"%s"}]}' \
 			"$sep" "$tab" "$name" "$terminal" "$app"
 		sep=","
@@ -101,9 +115,11 @@ exit 0
 STUB
 
 # The fake `hc`: it is the only way the guard can type into a terminal the app does not report.
-# `get <t> --json` answers from $FAKE/hc-fg/<t> (shell | none | pi | other:<cmd>) and only for a
-# terminal listed in $FAKE/hc-known; `send` records the line, makes that terminal pi, and flips the
-# tab to pi so herdr-app reports it too. $FAKE/hc-calls counts both, so a test can see a retry.
+# `get <t> --json` answers from $FAKE/hc-fg/<t> (shell | none | pi | launch | other:<cmd>) and only
+# for a terminal listed in $FAKE/hc-known; `send` records the line, makes that terminal pi, and
+# flips the tab to pi so herdr-app reports it too. $FAKE/hc-calls counts both, so a test can see a
+# retry. `launch` is the recovered shell the guard (or herdr-resume) started: an interactive shell
+# whose argv carries the exec line, which is what tells it apart from the person's own shell.
 cat >"$work/stub/hc" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -118,6 +134,7 @@ get)
 	none) printf '{"state":"live","foreground":{}}\n' ;;
 	shell) printf '{"state":"live","foreground":{"argv":["/bin/bash"],"pid":1},"argv":["/bin/bash"]}\n' ;;
 	pi) printf '{"state":"live","foreground":{"argv":["/home/mark/.local/share/pnpm/pi/cli.js"],"pid":2}}\n' ;;
+	launch) printf '{"state":"live","foreground":{"argv":["sh","-lc","exec /home/mark/big-boss-pi/bin/pi-bare"],"pid":4}}\n' ;;
 	other:*) printf '{"state":"live","foreground":{"argv":["%s"],"pid":3}}\n' "${fg#other:}" ;;
 	esac
 	;;
@@ -238,12 +255,24 @@ session() { # session <name> — a session file that exists
 	printf '%s' "$fake/$1"
 }
 tabs_app() { cut -d'|' -f5 "$fake/tabs" | tr -d '\n'; }
+closed_tabs() {
+	if [ -f "$fake/calls" ]; then grep -c '^do tab.close' "$fake/calls" || true; else echo 0; fi
+}
+# Every hc send, not only the exec line: a person's tab must not be typed into at all.
+hc_sends_any() {
+	if [ -f "$fake/hc-sends" ]; then wc -l <"$fake/hc-sends"; else echo 0; fi
+}
+tab_class_of() {
+	awk -v t="$1" '$2==t {print $3; exit}' "$fake/root/state/tab-classes" 2>/dev/null
+}
 
-# guard_once <space> [resume-script-succeeds] [resume-script-busy] — one poll of the guard, bounded.
+# guard_once <space> [resume-script-succeeds] [resume-script-busy] [hide-new-tabs] — one poll of
+# the guard, bounded.
 guard_once() {
 	timeout 15 env \
 		PI_BOSS_ONCE=1 \
 		FAKE=$fake \
+		FAKE_HIDE_NEW=${4:-0} \
 		PI_BOSS_ROOT=$fake/root \
 		PI_BOSS_SPACE=${1:-boss} \
 		PI_BOSS_GUARD_INTERVAL=300 \
@@ -349,6 +378,129 @@ if [ "$(hc_gets)" -ge 2 ] && [ "$(hc_sends)" = 1 ] && [ "$(opened_tab)" = 0 ] &&
 	pass "foreground has no argv: waited ($(hc_gets) hc get calls) instead of calling it busy, then resumed"
 else
 	fail "expected hc gets then one send (gets $(hc_gets), sends $(hc_sends), tab.new $(opened_tab))"
+	cat "$fake/root/state/guard.log" 2>/dev/null
+fi
+
+# 12. a terminal the person opened while the guard runs: a shell, no resume entry, no pi. That is
+#     not a lost agent, it is their tab. Two polls: the first seeds the parked tabs, the second is a
+#     tab that appeared while the guard was running. No pi is opened in it, nothing is closed, no
+#     key is typed into it, and the log says whose it is.
+setup_case 'tab1|master|1|t1|pi'
+guard_once boss
+printf 'tab2|Terminal 2|2|t2|sh\n' >>"$fake/tabs"
+hc_knows t2
+printf shell >"$fake/hc-fg/t2"
+rm -f "$fake/calls" "$fake/hc-calls" "$fake/hc-sends"
+guard_once boss
+if [ "$(opened_tab)" = 0 ] && [ "$(closed_tabs)" = 0 ] && [ "$(hc_sends_any)" = 0 ] &&
+	! logged 'opened a new pi' && logged "tab Terminal 2 (tab2) is the person's"; then
+	pass "a terminal opened while the guard runs: no pi, no close, no hc send, logged as the person's"
+else
+	fail "expected the person's tab untouched (tab.new $(opened_tab), close $(closed_tabs), hc sends $(hc_sends_any))"
+	cat "$fake/root/state/guard.log" 2>/dev/null
+fi
+
+# 13. a tab that was in the first snapshot with a shell in it and no entry is still a parked tab
+#     (herdr-core handed it back without its pi), and the recovered shell it holds is the guard's
+#     own launch, not the person's: repaired as before.
+setup_case 'tab1|master|1|t1|sh'
+hc_knows t1
+printf launch >"$fake/hc-fg/t1"
+guard_once boss
+if [ "$(opened_tab)" = 1 ] && [ "$(closed_tabs)" = 1 ] && logged 'opened a new pi in tab master'; then
+	pass "parked recovered shell, no entry: still repaired (one tab.new, one tab.close)"
+else
+	fail "expected a repaired parked tab (tab.new $(opened_tab), close $(closed_tabs))"
+	cat "$fake/root/state/guard.log" 2>/dev/null
+fi
+
+# 14. the same person's tab, then the guard restarts. The class has to come from state/tab-classes,
+#     not from what this guard process saw: a restart must not turn their tab into a repair again.
+setup_case 'tab1|master|1|t1|pi'
+guard_once boss
+printf 'tab2|Terminal 2|2|t2|sh\n' >>"$fake/tabs"
+hc_knows t2
+printf shell >"$fake/hc-fg/t2"
+guard_once boss
+rm -f "$fake/calls" "$fake/hc-calls" "$fake/hc-sends"
+guard_once boss
+if [ "$(opened_tab)" = 0 ] && [ "$(closed_tabs)" = 0 ] && [ "$(hc_sends_any)" = 0 ] &&
+	[ "$(tab_class_of tab2)" = person ] && grep -q '^tab2|Terminal 2|2|t2|sh$' "$fake/tabs"; then
+	pass "guard restart: the person's tab kept its class on disk, still untouched ($(tab_class_of tab2))"
+else
+	fail "expected tab2 to stay the person's across a restart (class '$(tab_class_of tab2)', tab.new $(opened_tab), close $(closed_tabs))"
+	cat "$fake/root/state/guard.log" 2>/dev/null
+fi
+
+# 15. the guard's own replacement tab is marked as its own, so a pi that dies in it is reopened —
+#     rate-limited to one a minute, as before.
+setup_case 'tab1|master|1|t1|sh'
+guard_once boss
+new_tab=$(awk -F'|' '$5=="pi"{print $1; exit}' "$fake/tabs")
+if [ "$(opened_tab)" = 1 ] && [ "$(tab_class_of "$new_tab")" = guard ]; then
+	pass "the tab the guard opened is marked as its own ($new_tab)"
+else
+	fail "expected the reopened tab to be classified guard (class '$(tab_class_of "$new_tab")', tab.new $(opened_tab))"
+fi
+sed -i 's/|pi$/|sh/' "$fake/tabs"
+rm -f "$fake/calls"
+guard_once boss
+reopened=$(opened_tab)
+rm -f "$fake/calls"
+guard_once boss
+again=$(opened_tab)
+if [ "$reopened" = 1 ] && [ "$again" = 0 ]; then
+	pass "pi died in the guard's own tab: reopened once ($reopened), then rate-limited ($again)"
+else
+	fail "expected one reopen and then the rate limit (first $(reopened), second $(again))"
+	cat "$fake/root/state/guard.log" 2>/dev/null
+fi
+
+# 16. a parked tab whose terminal now holds the person's own interactive shell: no recovered-launch
+#     argv, so it is theirs. A pi typed there would take their shell away.
+setup_case 'tab1|master|1|t1|sh'
+hc_knows t1
+printf shell >"$fake/hc-fg/t1"
+guard_once boss
+if [ "$(opened_tab)" = 0 ] && [ "$(closed_tabs)" = 0 ] && [ "$(hc_sends_any)" = 0 ] &&
+	logged "left alone: it is the person's tab"; then
+	pass "a parked tab the person turned into their own shell: left alone, and the log says why"
+else
+	fail "expected the person's shell to be left alone (tab.new $(opened_tab), close $(closed_tabs), hc sends $(hc_sends_any))"
+	cat "$fake/root/state/guard.log" 2>/dev/null
+fi
+
+# 17. a tab the person opened, ran pi in and quit: it has a resume entry, so the session is the
+#     reason to touch it, and the guard resumes rather than treating it as theirs and walking past.
+setup_case 'tab1|master|1|t1|pi'
+guard_once boss
+printf 'tab3|Terminal 3|2|t3|sh\n' >>"$fake/tabs"
+hc_knows t3
+printf shell >"$fake/hc-fg/t3"
+entry e17 "{\"terminal\":\"t3\",\"tab\":\"tab3\",\"session_path\":\"$(session s17.jsonl)\",\"argv\":[\"pi\"],\"updated_at\":\"2026-11-15T09:00:00.000Z\"}"
+rm -f "$fake/calls" "$fake/hc-calls" "$fake/hc-sends"
+guard_once boss 1
+if [ "$(opened_tab)" = 0 ] && [ "$(hc_sends_any)" = 0 ] && [ "$(tab_class_of tab3)" = person ] &&
+	logged "resumed terminal \`t3\` in tab Terminal 3"; then
+	pass "the person's tab with a resume entry: resumed from the entry, nothing opened"
+else
+	fail "expected a resume of tab3 (tab.new $(opened_tab), hc sends $(hc_sends_any))"
+	cat "$fake/root/state/guard.log" 2>/dev/null
+fi
+
+# 18. `tab.new` answered with a terminal, and `ls` does not show the tab it landed in yet. A tab
+#     nobody classified is the person's, so without the terminal ledger the guard's own replacement
+#     would be untouchable: remembered, then read as the guard's at the next snapshot.
+setup_case 'tab1|master|1|t1|sh'
+guard_once boss 0 0 1
+new_tab=$(awk -F'|' '$5=="pi"{print $1; exit}' "$fake/tabs")
+remembered=$(grep -c 'tnew' "$fake/root/state/guard-terminals" 2>/dev/null || true)
+rm -f "$fake/calls"
+guard_once boss
+if [ "${remembered:-0}" -ge 1 ] && [ "$(tab_class_of "$new_tab")" = guard ] && [ "$(opened_tab)" = 0 ]; then
+	pass "a tab.new that ls lagged: remembered by terminal, then classified guard, not the person's"
+else
+	fail "expected the new tab to be remembered and then classified guard (remembered ${remembered:-0}, class '$(tab_class_of "$new_tab")')"
 	cat "$fake/root/state/guard.log" 2>/dev/null
 fi
 

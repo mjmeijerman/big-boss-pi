@@ -26,6 +26,15 @@
 # job itself with `hc send` on the entry's own terminal, waits for pi to appear, and only then
 # logs a resume; it never types twice in one boot (restored_boot_id, or state/resumed).
 #
+# Whose tab is it? herdr-core hands the space back with a shell in every parked tab, so "a tab with
+# no pi" is not the same thing as "a tab to repair". A tab is a repair candidate only when it was
+# parked when the guard started, when it carries a resume entry, or when this guard opened it
+# itself. A tab the person opened while the guard runs belongs to the person: no pi in it, no
+# close, no rename — unless it carries a resume entry, because then it did hold pi and there is a
+# conversation to put back. That classification is kept in $STATE/tab-classes so a guard restart does not
+# reread the person's tab as a parked one. A parked tab whose terminal now holds an interactive
+# shell the guard did not start is the person's too: it is left alone and the log says so.
+#
 # A live pi tab is never touched, one repair a minute per tab keeps a pi that exits at once from
 # becoming a spawn loop, every repair is logged with the path it took (resumed terminal tN vs
 # opened a new pi), and the person's space and tab are put back afterwards.
@@ -43,6 +52,14 @@ STATE=$ROOT/state
 LOG=$STATE/guard.log
 SPACE_STATE=$STATE/space.json
 REPAIRS=$STATE/repairs
+# Which tab belongs to whom, one "<space> <tab> parked|guard|person>" per line, and the marker that
+# says the first snapshot after this guard started has already been read as the parked tabs.
+TAB_CLASSES=$STATE/tab-classes
+TAB_SEED=$STATE/tab-classes-seeded
+# Terminals a `tab.new` answered with, kept until a snapshot shows the tab they landed in: `ls` can
+# lag the new tab, and a tab nobody classified is the person's — a pi that dies in the guard's own
+# replacement would then never come back.
+TAB_PENDING=$STATE/guard-terminals
 # Terminals this guard resumed in this boot, one "<boot id> <terminal>" per line. The entry is
 # owned by ~/.pi and is not ours to rewrite, so the guard keeps its own half of "never type twice".
 RESUMED=$STATE/resumed
@@ -174,6 +191,89 @@ stale_tabs() {
 		})'
 }
 
+# tab_of_terminal <space> <terminal> — from a `herdr-app ls` snapshot on stdin, print the id of the
+# tab holding that terminal, or nothing. What `tab.new` answers with is a terminal, and the tab it
+# landed in is what has to be marked as the guard's own.
+tab_of_terminal() {
+	SPACE_ID=$1 TERMINAL_ID=$2 node -e '
+		let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+			let j={};try{j=JSON.parse(d)}catch{process.exit(1)}
+			const sp=(j.spaces||[]).find(s=>s.id===process.env.SPACE_ID);
+			if(!sp)process.exit(1);
+			const hit=(sp.tabs||[]).find(t=>(t.terminals||[]).some(x=>x&&x.id===process.env.TERMINAL_ID));
+			if(!hit)process.exit(1);
+			process.stdout.write(hit.id);
+		})'
+}
+
+# tab_class <space> <tab> — parked, guard, person, or nothing when the tab was never classified.
+tab_class() {
+	[ -f "$TAB_CLASSES" ] || return 0
+	awk -v s="$1" -v t="$2" '$1==s && $2==t {print $3; exit}' "$TAB_CLASSES" 2>/dev/null
+}
+
+# mark_tab_class <space> <tab> <class> — record a tab as parked, the guard's own, or the person's.
+mark_tab_class() {
+	local space=$1 tab=$2 class=$3 tmp=$TAB_CLASSES.tmp
+	: >"$tmp"
+	if [ -f "$TAB_CLASSES" ]; then
+		awk -v s="$space" -v t="$tab" '$1!=s || $2!=t' "$TAB_CLASSES" >>"$tmp"
+	fi
+	printf '%s\t%s\t%s\n' "$space" "$tab" "$class" >>"$tmp"
+	mv "$tmp" "$TAB_CLASSES"
+}
+
+# classify_snapshot <space id> — from a `herdr-app ls` snapshot on stdin, write this space's tabs
+# with the class each one has. A tab nobody has classified yet is parked when this is the first
+# snapshot after the guard started (herdr-core has just handed the parked tabs back) and the
+# person's at any later poll — the person opened it, and a tab the guard did not get from herdr is
+# not its to repair. A tab holding a terminal a `tab.new` answered with is the guard's own, however
+# late `ls` shows it. Prints "<name>\t<tab>" for each tab newly read as the person's, so the run
+# logs it once instead of pretending the tab is still the guard's business.
+classify_snapshot() {
+	local space=$1 seeding=0
+	[ -f "$TAB_SEED" ] || seeding=1
+	CLASSES=$TAB_CLASSES SPACE_ID=$space SEEDING=$seeding PENDING=$TAB_PENDING node -e '
+		const fs=require("fs");
+		const {CLASSES,SPACE_ID,SEEDING,PENDING}=process.env;
+		let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+			let j={};try{j=JSON.parse(d)}catch{process.exit(0)}
+			const sp=(j.spaces||[]).find(s=>s.id===SPACE_ID);
+			if(!sp)process.exit(0);
+			const known=new Map();
+			try{
+				for(const l of fs.readFileSync(CLASSES,"utf8").split("\n")){
+					const p=l.split("\t");
+					if(p.length>=3&&p[0]===SPACE_ID)known.set(p[1],p[2]);
+				}
+			}catch{}
+			const pending=new Map();
+			try{
+				for(const l of fs.readFileSync(PENDING,"utf8").split("\n")){
+					const p=l.split("\t");
+					if(p.length>=2&&p[0]===SPACE_ID)pending.set(p[1],l);
+				}
+			}catch{}
+			const lines=[],person=[];
+			for(const t of (sp.tabs||[])){
+				let cls=known.get(t.id);
+				for(const term of (t.terminals||[])){
+					if(term&&pending.has(term.id)){cls="guard";pending.delete(term.id);}
+				}
+				if(!cls){
+					cls=SEEDING==="1"?"parked":"person";
+					if(cls==="person")person.push([t.name===null||t.name===undefined?"":t.name,t.id].join("\t"));
+				}
+				lines.push([SPACE_ID,t.id,cls].join("\t"));
+			}
+			fs.writeFileSync(CLASSES,lines.length?lines.join("\n")+"\n":"");
+			try{fs.writeFileSync(PENDING,[...pending.values()].join("\n")+(pending.size?"\n":""))}catch{}
+			for(const p of person)process.stdout.write(p+"\n");
+		})'
+	[ "$seeding" = 1 ] && [ -f "$TAB_CLASSES" ] && : >"$TAB_SEED"
+	return 0
+}
+
 # tab_holds_pi <space> <tab> — true when one of that tab's terminals is pi again, read from a
 # fresh `herdr-app ls` snapshot on stdin. What a resume is worth is what the app reports, not
 # what the resume script printed.
@@ -255,6 +355,30 @@ terminal_state() {
 			const base=String(argv[0]).split("/").pop().toLowerCase().replace(/\.exe$/,"");
 			if(SHELLS.has(base))return process.stdout.write("attached");
 			process.stdout.write("busy:"+argv.join(" "));
+		})'
+}
+
+# person_shell <terminal> — true when that terminal holds an interactive shell the guard did not
+# start. A parked or reopened shell carries a launch argv (`exec .../bin/pi-bare`, or the
+# `--session` line herdr typed); one without it is the person's own shell, and a pi typed there
+# would take their session away. Unknown terminals and live terminals with no argv are not the
+# person's on this reading: those are the recovered shells a repair is for.
+person_shell() {
+	local facts
+	facts=$(hc_json "$1") || return 1
+	[ -n "$facts" ] || return 1
+	printf '%s' "$facts" | node -e '
+		const SHELLS=new Set(["sh","bash","zsh","dash","ksh","fish","nu","pwsh","powershell","elvish","xonsh"]);
+		const LAUNCH=/pi-bare|pi-sandboxed|pi-nonet|--session|herdr-resume/;
+		let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+			let j={};try{j=JSON.parse(d)}catch{process.exit(1)}
+			if(j.state!=="live")process.exit(1);
+			const argv=j.foreground&&j.foreground.argv;
+			if(!Array.isArray(argv)||!argv.length)process.exit(1);
+			const base=String(argv[0]).split("/").pop().toLowerCase().replace(/\.exe$/,"");
+			if(!SHELLS.has(base))process.exit(1);
+			if(LAUNCH.test(argv.join(" ")))process.exit(1);
+			process.exit(0);
 		})'
 }
 
@@ -428,7 +552,7 @@ kickoff_later() {
 #      the person with what they had. Same name, same place, and an absolute argv so the holder
 #      can restart it. The boss tab (master) gets the kickoff message again.
 repair_tab() {
-	local space=$1 tab=$2 name=$3 index=$4 terminal=${5:-} boss=0 argv out new_terminal args=() key entry
+	local space=$1 tab=$2 name=$3 index=$4 terminal=${5:-} boss=0 argv out new_terminal new_tab args=() key entry
 	key=$(repair_key "$space" "$name" "$index")
 	repaired_recently "$key" && return 1
 	[ "$name" = master ] && boss=1
@@ -457,6 +581,14 @@ repair_tab() {
 		esac
 		log "could not resume terminal \`$entry_terminal\` in tab $name ($tab); opening a new pi instead: $(printf '%s' "$resumed" | tail -n 2 | tr '\n' ' ')"
 	else
+		# The tab never held pi. It is the guard's to repair only if the person has not made it their
+		# own: an interactive shell without a recovered launch argv is the person's tab, and a pi
+		# typed there would take it away. Rate-limited like a repair, so the line is one a minute.
+		if person_shell "$terminal"; then
+			log "tab $name ($tab) left alone: it is the person's tab (interactive shell on terminal \`$terminal\` that the guard did not start)"
+			mark_repaired "$key"
+			return 1
+		fi
 		log "tab $name ($tab) opened fresh: terminal \`${terminal:-unknown}\` has no entry in $RESUME_DIR, so it never held pi"
 	fi
 
@@ -471,6 +603,17 @@ repair_tab() {
 	fi
 	mark_repaired "$key"
 	log "opened a new pi in tab $name ($tab -> terminal \`$new_terminal\`) with $argv"
+	# The tab the guard opened is the guard's own, and it stays repairable through a restart: a tab
+	# nobody classified is a person's at the next poll, and a pi that died in here has to come back.
+	new_tab=$(herdr-app ls 2>/dev/null | tab_of_terminal "$space" "$new_terminal")
+	if [ -n "$new_tab" ]; then
+		mark_tab_class "$space" "$new_tab" guard
+	else
+		# `ls` had not caught up with the new tab. Keep the terminal it answered with: the next
+		# snapshot reads the tab it landed in as the guard's, not as another terminal of the person's.
+		printf '%s\t%s\n' "$space" "$new_terminal" >>"$TAB_PENDING"
+		tail -n 50 "$TAB_PENDING" >"$TAB_PENDING.tmp" && mv "$TAB_PENDING.tmp" "$TAB_PENDING"
+	fi
 	out=$(herdr-app do tab.close --id "$tab" --confirmed true 2>&1) ||
 		log "could not close the stale tab $name ($tab); it is still open beside \`$new_terminal\`: $out"
 	herdr-app do tab.move --id "$new_terminal" --index "$index" >/dev/null 2>&1
@@ -481,12 +624,24 @@ repair_tab() {
 # repair_stale_tabs <space id> — repair every stale tab of the space, then put the person back
 # on the space and tab they were looking at. A failed restore is one line, never a failed repair.
 repair_stale_tabs() {
-	local space=$1 snapshot=$2 stale tab name index before touched=0
+	local space=$1 snapshot=$2 stale tab name index before touched=0 class
+	# Before anything is repaired: which of these tabs are the guard's to repair at all.
+	classify_snapshot "$space" <<<"$snapshot" |
+		while IFS=$'\t' read -r name tab; do
+			[ -n "$tab" ] || continue
+			log "tab $name ($tab) is the person's: it was opened while the guard runs, so no pi is opened in it, nothing is closed and nothing is renamed"
+		done
 	stale=$(printf '%s' "$snapshot" | stale_tabs "$space") || return 0
 	[ -n "$stale" ] || return 0
 	before=$(screen_state)
 	while IFS=$'\t' read -r tab name index terminal; do
 		[ -n "$tab" ] || continue
+		class=$(tab_class "$space" "$tab")
+		# The person's tab is not stale, it is a tab: never repaired, never closed, never renamed —
+		# unless it carries a resume entry, because then it held pi and the session is waiting.
+		if [ "$class" = person ] && ! resume_entry_for_tab "$space" "$tab" "$terminal" >/dev/null; then
+			continue
+		fi
 		repair_tab "$space" "$tab" "$name" "$index" "$terminal" && touched=1
 	done <<<"$stale"
 	[ "$touched" = 1 ] || return 0
