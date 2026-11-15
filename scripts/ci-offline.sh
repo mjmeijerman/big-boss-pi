@@ -141,7 +141,13 @@ expect "spawn plan, worker count, path blocking and evidence scaffold" 0 "spawn 
 #     real space.
 expect "guard resumes before it reopens a tab" 0 "guard-resume: ok" -- \
 	bash "$root/scripts/test-guard-resume.sh"
-# 5g. The boss's tail in one command (Radar blip 20): publish, wipe and close run in that order,
+# 5g. Warm model: every jev request asks ollama to keep the model resident (keep_alive from
+#     bin/jev-model.mjs), an endpoint that refuses the field with 400 still gets a decision on
+#     one retry, and JEV_KEEP_ALIVE overrides the value. Fake ollama on a loopback port that
+#     records the request bodies; no real model, no real 8-second load.
+expect "keep_alive sent, retried without it on 400, overridable" 0 "jev keep-alive: ok" -- \
+	bash "$root/scripts/tests/test-jev-warm.sh"
+# 5h. The boss's tail in one command (Radar blip 20): publish, wipe and close run in that order,
 #     each keeps its own gate, and a failure stops at the step that failed with the state named. Its
 #     own script because it needs a fake `publish` on PATH and a fake herdr-app at once, and reads
 #     the decisions log and the delegation entry rather than the command's own output.

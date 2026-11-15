@@ -31,12 +31,16 @@
  * 1 no, 3 unsure or model unreachable (ask the user), 2 usage.
  * --json prints {"decision":…,"reason":…} instead of one line.
  *
+ * Every request asks ollama to keep the model resident for KEEP_ALIVE (bin/jev-model.mjs), so
+ * the next spawn does not pay the model load again; an endpoint that refuses the field with 400
+ * still gets one retry without it, because a decision must not die for a warm-up.
+ *
  * Every call is recorded in state/usage.jsonl (see bin/usage.mjs): kind "jev", the
  * subcommand, the model that answered, the latency and whether it answered at all. A caller
  * that has one sets PI_BOSS_CONTEXT (delegate sets the slug), which lands on the line too.
  */
 import process from "node:process";
-import { MODEL, ENDPOINT, TIMEOUT } from "./jev-model.mjs";
+import { MODEL, ENDPOINT, TIMEOUT, KEEP_ALIVE } from "./jev-model.mjs";
 import { logUsage, context } from "./usage.mjs";
 
 // Wall clock for the usage line: a decision model that takes 40s is a fact worth having.
@@ -135,21 +139,9 @@ const PROMPTS = {
 		`A worker will be started for this task:\n${text}\n\nAnswer all four in one JSON object, each by the rule its own question states: how many parallel workers it needs (an integer 1 to 4), which mode (bare, sandboxed or no-net), whether it runs local or remote, and how much thinking effort it needs (low, medium or high).`,
 };
 
-async function decide(kind, text) {
-	const body = {
-		model: MODEL,
-		stream: false,
-		format: "json",
-		options: { temperature: 0.1, num_ctx: 8192 },
-		messages: [
-			{ role: "system", content: `${POLICY}\n\nAnswer with exactly this JSON shape:\n${SHAPES[kind]}` },
-			{ role: "user", content: PROMPTS[kind](text) },
-		],
-	};
-
-	let response;
+async function post(body) {
 	try {
-		response = await fetch(ENDPOINT, {
+		return await fetch(ENDPOINT, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify(body),
@@ -157,6 +149,30 @@ async function decide(kind, text) {
 		});
 	} catch (error) {
 		fail(`decision model unreachable (${ENDPOINT}): ${error.message} — ask the user`, 3, "unreachable");
+	}
+}
+
+async function decide(kind, text) {
+	const body = {
+		model: MODEL,
+		stream: false,
+		format: "json",
+		keep_alive: KEEP_ALIVE,
+		options: { temperature: 0.1, num_ctx: 8192 },
+		messages: [
+			{ role: "system", content: `${POLICY}\n\nAnswer with exactly this JSON shape:\n${SHAPES[kind]}` },
+			{ role: "user", content: PROMPTS[kind](text) },
+		],
+	};
+
+	let response = await post(body);
+	// An endpoint that does not know keep_alive refuses the whole request with 400. One retry
+	// without the field, and say so: the decision matters, the warm-up is the optimisation.
+	if (response.status === 400) {
+		process.stderr.write(`jev: endpoint refused keep_alive=${KEEP_ALIVE} (HTTP 400); retrying without it\n`);
+		const bare = { ...body };
+		delete bare.keep_alive;
+		response = await post(bare);
 	}
 	if (!response.ok) fail(`decision model returned HTTP ${response.status} — ask the user`, 3, "http");
 
