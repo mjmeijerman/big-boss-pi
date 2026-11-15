@@ -11,12 +11,16 @@
  *
  * Exit 0 = the model answered (answer on stdout). Exit 1 = no answer (reason on stderr).
  *
+ * Every request asks ollama to keep the model resident for KEEP_ALIVE (bin/jev-model.mjs), the
+ * same value jev sends, so a local task after an idle gap does not pay the model load again.
+ * An endpoint that refuses the field with 400 gets one retry without it, announced on stderr.
+ *
  * Every invocation is recorded in state/usage.jsonl (see bin/usage.mjs): kind "local-run",
  * model, latency, ok/error, and the task clipped to 200 characters. The answer itself is not
  * logged. PI_BOSS_CONTEXT, when the caller sets it, lands on the line as context.
  */
 import process from "node:process";
-import { MODEL, ENDPOINT, TIMEOUT } from "./jev-model.mjs";
+import { MODEL, ENDPOINT, TIMEOUT, KEEP_ALIVE } from "./jev-model.mjs";
 import { logUsage, context } from "./usage.mjs";
 
 const started = Date.now();
@@ -56,24 +60,38 @@ if (!task && !process.stdin.isTTY) task = (await readStdin()).trim();
 if (!task) fail('usage: local-run "<task>" (or pipe the task on stdin): no task text', 1, "usage");
 taskForLog = task;
 
-let response;
-try {
-	response = await fetch(ENDPOINT, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({
-			model: MODEL,
-			stream: false,
-			options: { temperature: 0.2, num_ctx: 8192 },
-			messages: [
-				{ role: "system", content: SYSTEM },
-				{ role: "user", content: task },
-			],
-		}),
-		signal: AbortSignal.timeout(TIMEOUT),
-	});
-} catch (error) {
-	fail(`local model unreachable (${ENDPOINT}): ${error.message}`, 1, "unreachable");
+async function post(body) {
+	try {
+		return await fetch(ENDPOINT, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+			signal: AbortSignal.timeout(TIMEOUT),
+		});
+	} catch (error) {
+		fail(`local model unreachable (${ENDPOINT}): ${error.message}`, 1, "unreachable");
+	}
+}
+
+const body = {
+	model: MODEL,
+	stream: false,
+	keep_alive: KEEP_ALIVE,
+	options: { temperature: 0.2, num_ctx: 8192 },
+	messages: [
+		{ role: "system", content: SYSTEM },
+		{ role: "user", content: task },
+	],
+};
+
+let response = await post(body);
+// An endpoint that does not know keep_alive refuses the whole request with 400. One retry
+// without the field, and say so: the answer matters, the warm-up is the optimisation.
+if (response.status === 400) {
+	process.stderr.write(`local-run: endpoint refused keep_alive=${KEEP_ALIVE} (HTTP 400); retrying without it\n`);
+	const bare = { ...body };
+	delete bare.keep_alive;
+	response = await post(bare);
 }
 if (!response.ok) fail(`local model returned HTTP ${response.status}`, 1, "http");
 

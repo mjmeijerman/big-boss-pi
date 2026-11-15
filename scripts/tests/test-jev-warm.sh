@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# test-jev-warm.sh — jev asks ollama to keep the model resident, and a refusal of that field
-# never costs a decision.
+# test-jev-warm.sh — jev and local-run ask ollama to keep the model resident, and a refusal of
+# that field never costs a decision or a local answer.
 #
-# Three claims the harness otherwise only asserts in prose:
+# Five claims the harness otherwise only asserts in prose:
 #
-#   A. Every request carries keep_alive, with the value bin/jev-model.mjs names — 30m by
+#   A. Every jev request carries keep_alive, with the value bin/jev-model.mjs names — 30m by
 #      default, so a spawn more than five minutes after the last one does not pay the model
 #      load again.
 #   B. JEV_KEEP_ALIVE overrides that value, without any other change to the request.
 #   C. An endpoint that refuses the field with 400 gets one retry without it, the decision
 #      still comes out, and stderr says the retry happened. A second refusal still fails loud
 #      at exit 3, so the "unreachable" contract is unchanged.
+#   D. bin/local-run sends that same keep_alive, so a local task after an idle gap is warm too.
+#   E. The same 400 retry in bin/local-run: one retry without the field, the answer still on
+#      stdout, exit 0, and the retry announced on stderr.
 #
 # The model is a fake ollama on a loopback port that records every request body, so "the field
 # was sent" and "the retry dropped it" are read from the bytes that left, not from the output.
@@ -186,6 +189,58 @@ if [ "$(count_bodies "$LOG")" = 2 ]; then
 	pass "no third attempt after the retry was refused"
 else
 	fail "persistent 400 made $(count_bodies "$LOG") requests, wanted 2 (one retry, then stop)"
+fi
+stop_model
+
+# --- D. local-run sends the same keep_alive, so a local task is warm too ----------------------
+start_model ok
+out=$(env JEV_ENDPOINT=$ENDPOINT timeout 30 "$bin/local-run" "say ok" 2>&1) && rc=0 || rc=$?
+if [ "$rc" = 0 ] && [ -n "$out" ]; then
+	pass "local-run still answers on stdout (exit 0)"
+else
+	fail "local-run default keep_alive case: exit $rc — $out"
+fi
+got=$(body_field "$LOG" 0 keep_alive)
+if [ "$got" = '"30m"' ] && [ "$(count_bodies "$LOG")" = 1 ]; then
+	pass "local-run carries keep_alive=\"30m\" by default, one request"
+else
+	fail "local-run default keep_alive in the body: $got, $(count_bodies "$LOG") request(s)"
+fi
+stop_model
+
+start_model ok
+out=$(env JEV_ENDPOINT=$ENDPOINT JEV_KEEP_ALIVE=2h timeout 30 "$bin/local-run" "say ok" 2>&1) && rc=0 || rc=$?
+got=$(body_field "$LOG" 0 keep_alive)
+if [ "$got" = '"2h"' ] && [ "$(count_bodies "$LOG")" = 1 ]; then
+	pass "local-run honours JEV_KEEP_ALIVE=2h, one request, no retry"
+else
+	fail "local-run env override: keep_alive $got, $(count_bodies "$LOG") request(s), exit $rc — $out"
+fi
+stop_model
+
+# --- E. a 400 on the field costs local-run a retry, not the answer ----------------------------
+start_model 400-once
+errfile=$work/stderr-local
+out=$(env JEV_ENDPOINT=$ENDPOINT timeout 30 "$bin/local-run" "say ok" 2>"$errfile") && rc=0 || rc=$?
+if [ "$rc" = 0 ] && [ -n "$out" ]; then
+	pass "a 400 on keep_alive still yields a local answer (exit 0)"
+else
+	fail "local-run 400-once answer: exit $rc — $out"
+fi
+if [ "$(count_bodies "$LOG")" = 2 ]; then
+	pass "local-run made exactly one retry"
+else
+	fail "local-run retry count: $(count_bodies "$LOG") requests, wanted 2"
+fi
+if [ "$(body_field "$LOG" 0 keep_alive)" = '"30m"' ] && [ "$(body_field "$LOG" 1 keep_alive)" = absent ]; then
+	pass "the local-run retry dropped keep_alive and kept everything else"
+else
+	fail "local-run retry body: first $(body_field "$LOG" 0 keep_alive), second $(body_field "$LOG" 1 keep_alive)"
+fi
+if grep -qF "local-run: endpoint refused keep_alive=30m (HTTP 400); retrying without it" "$errfile"; then
+	pass "local-run says on stderr that the field was refused and retried"
+else
+	fail "no local-run retry notice on stderr — $(cat "$errfile")"
 fi
 stop_model
 
