@@ -204,6 +204,17 @@ never published: `bin/publish` finds the worker's branch instead, by the commit 
 `Agent-Slug: <slug>` on that branch. One match is the branch; none or several are refused rather
 than guessed.
 
+Closing a worker drops its `delegations.json` entry, so the report outlives the record that points
+at it — publish first, then wipe, then close. A slug that is already closed still publishes with
+`bin/publish <slug> --cwd <repo>`: with no entry to read, the repo comes from `--cwd` (default: the
+git repository containing the current directory) and the branch from the same `Agent-Slug: <slug>`
+trailer, with the same one-match rule. The report is still `reports/<slug>.md` under the boss root,
+so the Evidence and `Review tier:` checks read exactly as they do for a live worker.
+
+```
+bin/publish <slug> --cwd <repo>
+```
+
 Before anything leaves the machine it runs the target repo's own body gate: `make pr-check
 BODY=<file>` when the Makefile has that target, `scripts/pr-gate.sh --body <file>` when only
 that exists, and it prints a skip when neither does. A red gate stops the publish. A PR that

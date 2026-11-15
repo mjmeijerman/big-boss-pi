@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
 # publish — one command from a finished worker to an open pull request.
 #
-#   bin/publish <slug>
+#   bin/publish <slug> [--cwd DIR]
 #
 # The boss used to do this by hand every time: push the worker's branch, retype the mission and
 # the review tier into `gh pr create`, and hope it remembered the evidence block. The retyping is
 # where the tier got lost, so this command builds the body out of the report itself and refuses
 # when the report cannot supply it. One command, and the tier cannot be omitted.
 #
-# What it reads: state/delegations.json for the slug's cwd, branch and report.
+# What it reads: state/delegations.json for the slug's cwd, branch and report. A slug that a wipe
+# and a close already removed from that file still publishes: closing drops the delegation entry,
+# and the boss's next step after that is this one, so removing the entry would otherwise make the
+# report unpublishable exactly when it is due. For such a slug the repo is `--cwd DIR` (default:
+# the git repository containing the current directory) and the branch is found there by its
+# `Agent-Slug: <slug>` trailer — the same one-match rule as a recorded trunk branch. The report is
+# still reports/<slug>.md under the boss root, so the tier and evidence checks never depend on the
+# delegation entry existing.
 #
 # What it refuses, each with the reason named and a nonzero exit:
-#   - a slug it does not know (never a guess about a typo);
+#   - a slug the workspace does not know, when no branch in the repo carries its trailer either
+#     (never a guess about a typo);
 #   - a report that is missing, or has no Evidence block — the same check `delegate close`
 #     uses, sourced from there so the two commands cannot drift apart;
 #   - a report with no line starting `Review tier:` (the tier is the one thing the PR body must
@@ -53,14 +61,37 @@ die() {
 }
 note() { printf '%s: %s\n' "$prog" "$*" >&2; }
 
-slug=${1:-}
-case $slug in
-'' | -h | --help | help)
-	printf 'usage: %s <slug>\n' "$prog"
-	[ -n "$slug" ] && exit 0
+usage() { printf 'usage: %s <slug> [--cwd DIR]\n' "$prog"; }
+slug=""
+lookup_cwd=""
+while [ "$#" -gt 0 ]; do
+	case $1 in
+	-h | --help | help)
+		usage
+		exit 0
+		;;
+	--cwd)
+		[ "$#" -ge 2 ] && [ -n "$2" ] || die "--cwd needs a directory"
+		lookup_cwd=$2
+		shift 2
+		;;
+	--cwd=*)
+		lookup_cwd=${1#--cwd=}
+		[ -n "$lookup_cwd" ] || die "--cwd needs a directory"
+		shift
+		;;
+	-*) die "unknown option $1" ;;
+	*)
+		[ -z "$slug" ] || die "one slug at a time: got '$slug' and '$1'"
+		slug=$1
+		shift
+		;;
+	esac
+done
+if [ -z "$slug" ]; then
+	usage
 	exit 2
-	;;
-esac
+fi
 
 # 1. The slug has to be one this workspace started. A typo is refused, not guessed at.
 if ! valid_slug "$slug"; then
@@ -76,12 +107,26 @@ field() {
 		if (!r) process.exit(3);
 		process.stdout.write(String(r[process.argv[3]] || ""));' "$DELEGATIONS" "$slug" "$1"
 }
-if ! cwd=$(field cwd 2>/dev/null); then
-	die "unknown worker slug (not in state/delegations.json)"
+no_entry=""
+if cwd=$(field cwd 2>/dev/null); then
+	[ -z "$lookup_cwd" ] || note "--cwd is read only for a slug with no delegation entry; $slug is in state/delegations.json, so its recorded cwd is used"
+	branch=$(field branch)
+	report=$(field report)
+	[ -n "$report" ] || report=$ROOT/reports/$slug.md
+else
+	# Wiped and closed: the delegation entry is gone, the branch and the report are not. Refusing
+	# here is what forced a hand-run publish, so the branch is looked up by its trailer instead.
+	no_entry=1
+	branch=""
+	report=$ROOT/reports/$slug.md
+	if [ -n "$lookup_cwd" ]; then
+		cwd=$(cd -- "$lookup_cwd" 2>/dev/null && pwd) || die "--cwd $lookup_cwd is not a directory"
+	else
+		cwd=$(git -C . rev-parse --show-toplevel 2>/dev/null || true)
+		[ -n "$cwd" ] || cwd=$PWD
+	fi
+	note "unknown worker slug (not in state/delegations.json); looking for a branch with 'Agent-Slug: $slug' in $cwd"
 fi
-branch=$(field branch)
-report=$(field report)
-[ -n "$report" ] || report=$ROOT/reports/$slug.md
 
 # 2. The report is the PR body, so it has to exist and prove it ran. Same check as the close.
 [ -f "$report" ] || die "$report does not exist, so there is no report to publish"
@@ -101,7 +146,9 @@ fi
 if ! git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
 	die "$cwd is not a git repository"
 fi
-[ -n "$branch" ] || die "state/delegations.json records no branch for this worker (branch '$branch')"
+if [ -z "$no_entry" ] && [ -z "$branch" ]; then
+	die "state/delegations.json records no branch for this worker (branch '$branch')"
+fi
 
 trunk=$(fresh_trunk_branch "$cwd")
 if [ -z "$trunk" ]; then
@@ -112,10 +159,19 @@ fi
 # therefore says `trunk`/`main` for most workers. A trunk branch is never published, so the
 # branch is looked up by the thing that identifies it — a commit carrying `Agent-Slug: <slug>`.
 # One match is the worker's branch; none or several are refused rather than guessed.
-case $branch in
-"$trunk" | trunk | main | master)
+# A slug with no delegation entry has no recorded branch to fall back on, so the lookup does not
+# wait for a trunk value here: the trailer is the only thing that identifies its branch.
+lookup=""
+recorded=$branch
+if [ -n "$no_entry" ]; then
+	lookup=1
+else
+	case $branch in
+	"$trunk" | trunk | main | master) lookup=1 ;;
+	esac
+fi
+if [ -n "$lookup" ]; then
 	found=""
-	recorded=$branch
 	for candidate in $(git -C "$cwd" for-each-ref --format='%(refname:short)' refs/heads/); do
 		if git -C "$cwd" log --format=%B "refs/remotes/origin/$trunk..$candidate" 2>/dev/null |
 			grep -qE "^Agent-Slug:[[:space:]]*${slug}[[:space:]]*$"; then
@@ -126,7 +182,11 @@ case $branch in
 	case $(printf '%s' "$found" | grep -cE . || true) in
 	1)
 		branch=$found
-		note "delegations.json records $recorded for this worker; publishing $branch, found by its Agent-Slug trailer"
+		if [ -n "$no_entry" ]; then
+			note "$slug is not in state/delegations.json (wiped and closed); publishing $branch, found by its Agent-Slug trailer in $cwd"
+		else
+			note "delegations.json records $recorded for this worker; publishing $branch, found by its Agent-Slug trailer"
+		fi
 		;;
 	0)
 		die "no branch in $cwd carries a commit with 'Agent-Slug: $slug', so nothing ties a branch to this worker"
@@ -135,8 +195,7 @@ case $branch in
 		die "several branches in $cwd carry 'Agent-Slug: $slug' ($(printf '%s' "$found" | tr '\n' ' ')) — publish one by name rather than guessing"
 		;;
 	esac
-	;;
-esac
+fi
 
 # The branch has to exist locally: that is the thing worth pushing. A branch that only exists as
 # a remote-tracking ref would make "no Agent-Slug trailer" the message for a tree that is simply
