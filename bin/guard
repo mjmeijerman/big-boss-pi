@@ -18,6 +18,14 @@
 # can restart it later: the holder's PATH has no pnpm bin dir, so a bare `pi-bare` cannot be
 # restarted. A resume that does not end with pi running falls back to that same reopen.
 #
+# The entry is looked up by terminal id **or** by the tab id the entry recorded: after a host
+# reboot herdr-app reports no terminal for a parked tab, so a terminal-only lookup sees nothing
+# and reopens the tab fresh over a conversation that is still on disk. The newest entry wins and
+# its session file has to exist. And when herdr-resume.mjs declines a terminal — typically
+# "busy (no program)", a live terminal whose foreground has no argv yet — the guard does the same
+# job itself with `hc send` on the entry's own terminal, waits for pi to appear, and only then
+# logs a resume; it never types twice in one boot (restored_boot_id, or state/resumed).
+#
 # A live pi tab is never touched, one repair a minute per tab keeps a pi that exits at once from
 # becoming a spawn loop, every repair is logged with the path it took (resumed terminal tN vs
 # opened a new pi), and the person's space and tab are put back afterwards.
@@ -35,6 +43,11 @@ STATE=$ROOT/state
 LOG=$STATE/guard.log
 SPACE_STATE=$STATE/space.json
 REPAIRS=$STATE/repairs
+# Terminals this guard resumed in this boot, one "<boot id> <terminal>" per line. The entry is
+# owned by ~/.pi and is not ours to rewrite, so the guard keeps its own half of "never type twice".
+RESUMED=$STATE/resumed
+# The kernel's boot id, so a resume is never repeated inside one boot by a restarted guard.
+BOOT=$(tr -d '\n' </proc/sys/kernel/random/boot_id 2>/dev/null || true)
 # The resume map and its script live in ~/.pi. Both are overridable so a test can supply a fake
 # map and a fake script instead of a desktop app and a real session.
 RESUME_SCRIPT=${PI_BOSS_RESUME_SCRIPT:-${HOME:-}/.pi/scripts/herdr-resume.sh}
@@ -176,15 +189,169 @@ tab_holds_pi() {
 		})'
 }
 
-# resume_entry <terminal> — the resume-map file for that terminal, or nothing. Its existence is
-# the only evidence that this terminal ever held pi: a tab that never held pi has no entry and
-# must be opened fresh, not resumed.
-resume_entry() {
-	local file
+# entry_field <file> <dotted path> — one field of a resume entry, or nothing.
+entry_field() { field "$2" <"$1" 2>/dev/null; }
+
+# entry_argv <file> — the entry's launch argv as a JSON array, or nothing when it has none.
+entry_argv() {
+	node -e '
+		let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+			let j={};try{j=JSON.parse(d)}catch{}
+			if(!Array.isArray(j.argv)||!j.argv.length)process.exit(1);
+			process.stdout.write(JSON.stringify(j.argv))})' <"$1" 2>/dev/null
+}
+
+# resume_entry_for_tab <space> <tab> <terminal> — the newest usable resume entry for this tab, or
+# nothing. Matched by terminal id, or by the tab id (and space, when the entry has one) the entry
+# recorded: after a host reboot herdr-app reports no terminal id for a parked tab, so the tab id
+# in the entry is the only key left. A tab with several entries takes the newest `updated_at`; an
+# entry whose session file is gone is not usable, because there is nothing to resume.
+resume_entry_for_tab() {
+	local space=$1 tab=$2 terminal=${3:-}
+	[ -d "$RESUME_DIR" ] || return 1
+	SPACE_ID=$space TAB_ID=$tab TERMINAL_ID=$terminal DIR=$RESUME_DIR node -e '
+		const fs=require("fs"),path=require("path");
+		const {SPACE_ID,TAB_ID,TERMINAL_ID,DIR}=process.env;
+		let names=[];try{names=fs.readdirSync(DIR).filter(n=>n.endsWith(".json"))}catch{process.exit(1)}
+		const hits=[];
+		for(const n of names){
+			let e;try{e=JSON.parse(fs.readFileSync(path.join(DIR,n),"utf8"))}catch{continue}
+			if(typeof e.session_path!=="string"||!e.session_path)continue;
+			if(!fs.existsSync(e.session_path))continue;
+			if(!Array.isArray(e.argv)||!e.argv.length)continue;
+			const byTerminal=TERMINAL_ID&&e.terminal===TERMINAL_ID;
+			const byTab=TAB_ID&&e.tab===TAB_ID&&(!e.space||!SPACE_ID||e.space===SPACE_ID);
+			if(!byTerminal&&!byTab)continue;
+			hits.push({p:path.join(DIR,n),u:String(e.updated_at||"")});
+		}
+		if(!hits.length)process.exit(1);
+		hits.sort((a,b)=>a.u<b.u?1:a.u>b.u?-1:0);
+		process.stdout.write(hits[0].p);'
+}
+
+# hc_json <terminal> — `hc get <terminal> --json`, or nothing when hc is absent or lost it.
+hc_json() {
+	command -v hc >/dev/null 2>&1 || return 1
 	[ -n "$1" ] || return 1
-	file=$RESUME_DIR/$(printf '%s' "$1" | sed 's/[^A-Za-z0-9_.-]/_/g').json
-	[ -f "$file" ] || return 1
-	printf '%s' "$file"
+	hc get "$1" --json 2>/dev/null
+}
+
+# terminal_state <terminal> — what is in that terminal right now, one word:
+#   attached   a shell (or nothing yet) is there: a typed `exec` line will run;
+#   unattached a live terminal whose foreground has no argv yet — not busy, just not reported;
+#   busy:<cmd> something that is not a shell runs there: never type over a person or a pi;
+#   unknown    hc is absent, or does not know the terminal.
+terminal_state() {
+	local facts
+	facts=$(hc_json "$1") || { printf 'unknown'; return 0; }
+	[ -n "$facts" ] || { printf 'unknown'; return 0; }
+	printf '%s' "$facts" | node -e '
+		const SHELLS=new Set(["sh","bash","zsh","dash","ksh","fish","nu","pwsh","powershell","elvish","xonsh"]);
+		let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+			let j={};try{j=JSON.parse(d)}catch{process.stdout.write("unknown");return}
+			if(j.state!=="live")return process.stdout.write("unknown");
+			const argv=j.foreground&&j.foreground.argv;
+			if(!Array.isArray(argv)||!argv.length)return process.stdout.write("unattached");
+			const base=String(argv[0]).split("/").pop().toLowerCase().replace(/\.exe$/,"");
+			if(SHELLS.has(base))return process.stdout.write("attached");
+			process.stdout.write("busy:"+argv.join(" "));
+		})'
+}
+
+# terminal_runs_pi <terminal> — true when hc reports a live program that is not a shell there.
+terminal_runs_pi() {
+	local state
+	state=$(terminal_state "$1")
+	case $state in
+	attached | unattached | unknown | "") return 1 ;;
+	esac
+	return 0
+}
+
+# wait_attached <terminal> — the terminal herdr-core keeps takes a moment to get its shell, and a
+# live terminal whose foreground has no argv yet is *not attached*, not busy: today's lost resume
+# was exactly that reading. Wait for an answer within the bound, and a terminal that still has no
+# foreground after the bound is treated as the recovered shell it is.
+wait_attached() {
+	local terminal=$1 tries=${PI_BOSS_ATTACH_TRIES:-4} gap=${PI_BOSS_ATTACH_GAP:-1} state i
+	for ((i = 0; i < tries; i++)); do
+		state=$(terminal_state "$terminal")
+		case $state in
+		attached | busy:*) printf '%s' "$state"; return 0 ;;
+		unknown) printf 'unknown'; return 0 ;;
+		esac
+		[ "$i" -lt $((tries - 1)) ] && sleep "$gap"
+	done
+	printf 'attached'
+}
+
+# resumed_this_boot <terminal> / mark_resumed <terminal> — the guard's own "typed once" ledger.
+resumed_this_boot() {
+	[ -f "$RESUMED" ] || return 1
+	awk -v b="$BOOT" -v t="$1" '$1==b && $2==t{f=1} END{exit !f}' "$RESUMED"
+}
+
+mark_resumed() {
+	printf '%s %s\n' "$BOOT" "$1" >>"$RESUMED"
+}
+
+# exec_line <argv json> <session path> — the shell line the resume script would type.
+exec_line() {
+	ARGV=$1 SESSION=$2 node -e '
+		const q=w=>/^[A-Za-z0-9_@%+=:,./-]+$/.test(w)?w:"'\''"+String(w).replace(/'"'"'/g,"'"'"'\\'"'"''"'"'")+"'\''";
+		const words=[...JSON.parse(process.env.ARGV),"--session",process.env.SESSION];
+		process.stdout.write("exec "+words.map(q).join(" "))'
+}
+
+# tab_has_pi <space> <tab> — what herdr-app says, from a fresh snapshot.
+tab_has_pi() { herdr-app ls 2>/dev/null | tab_holds_pi "$1" "$2"; }
+
+# resume_via_entry <entry> <space> <tab> <name> — do the script's job here, on the entry's own
+# terminal: `hc send` the same exec line into the recovered shell, then wait for pi. Used when
+# herdr-resume.mjs declined, and when herdr-app has no terminal for the tab but hc knows the one
+# the entry recorded. Returns 0 when pi is running in the tab afterwards, 2 when this boot already
+# restored that session (nothing to do, and typing again would be a second pi), 1 otherwise.
+resume_via_entry() {
+	local entry=$1 space=$2 tab=$3 name=$4 terminal session argv line state i
+	terminal=$(entry_field "$entry" terminal)
+	session=$(entry_field "$entry" session_path)
+	argv=$(entry_argv "$entry") || { log "tab $name ($tab) has an entry $entry with no launch argv; not resuming"; return 1; }
+	[ -n "$terminal" ] && [ -n "$session" ] || { log "tab $name ($tab) entry $entry has no terminal or session path; not resuming"; return 1; }
+		if [ -n "$BOOT" ] && [ "$(entry_field "$entry" restored_boot_id)" = "$BOOT" ]; then
+		log "tab $name ($tab) was already resumed in this boot (entry $entry); not typing a second time"
+		return 2
+	fi
+	if resumed_this_boot "$terminal"; then
+		log "terminal \`$terminal\` in tab $name ($tab) was already resumed in this boot; not typing a second time"
+		return 2
+	fi
+	state=$(wait_attached "$terminal")
+	case $state in
+	busy:*)
+		log "could not resume terminal \`$terminal\` in tab $name ($tab): something else is running there (${state#busy:}); not typing over it"
+		return 1
+		;;
+	unknown)
+		log "could not resume terminal \`$terminal\` in tab $name ($tab): hc does not know that terminal"
+		return 1
+		;;
+	esac
+	command -v hc >/dev/null 2>&1 || { log "could not resume terminal \`$terminal\` in tab $name ($tab): hc is not on PATH"; return 1; }
+	line=$(exec_line "$argv" "$session")
+	if ! hc send "$terminal" "$line" >/dev/null 2>&1; then
+		log "could not resume terminal \`$terminal\` in tab $name ($tab): hc send failed"
+		return 1
+	fi
+	mark_resumed "$terminal"
+	for ((i = 0; i < ${PI_BOSS_RESUME_START_WAIT:-10}; i++)); do
+		if tab_has_pi "$space" "$tab" || terminal_runs_pi "$terminal"; then
+			log "resumed terminal \`$terminal\` in tab $name ($tab) with hc from $entry ($line); the tab keeps its session, nothing was opened or closed"
+			return 0
+		fi
+		sleep 1
+	done
+	log "typed the session into terminal \`$terminal\` in tab $name ($tab) but pi did not start; pi is not running there"
+	return 1
 }
 
 # resume_entries — run ~/.pi's resume script for every entry it has. The script already decides
@@ -252,10 +419,12 @@ kickoff_later() {
 
 # repair_tab <space> <tab> <name> <index> <terminal> — returns 0 only when it repaired the tab.
 # Two paths, in this order:
-#   1. the terminal has a resume entry — run the resume script, then believe what herdr-app says:
-#      pi running again means the tab kept its conversation and nothing is opened or closed;
-#   2. no entry, or the resume did not put pi back — open the replacement first and close the
-#      stale tab after: closing a space's only tab would end the space, and a failed open leaves
+#   1. the tab has a resume entry, by its terminal id or by the tab id in the entry — let the
+#      ~/.pi resume script run, then, when that declined, do the same job here with `hc send` on
+#      the entry's terminal. Either way the end state is pi running on the recorded session, and
+#      nothing is opened or closed;
+#   2. no usable entry, or the resume did not put pi back — open the replacement first and close
+#      the stale tab after: closing a space's only tab would end the space, and a failed open leaves
 #      the person with what they had. Same name, same place, and an absolute argv so the holder
 #      can restart it. The boss tab (master) gets the kickoff message again.
 repair_tab() {
@@ -264,15 +433,29 @@ repair_tab() {
 	repaired_recently "$key" && return 1
 	[ "$name" = master ] && boss=1
 
-	if entry=$(resume_entry "$terminal"); then
-		local resumed
+	if entry=$(resume_entry_for_tab "$space" "$tab" "$terminal"); then
+		local resumed entry_terminal
+		entry_terminal=$(entry_field "$entry" terminal)
 		resumed=$(resume_entries)
 		mark_repaired "$key"
-		if printf '%s' "$(herdr-app ls 2>/dev/null)" | tab_holds_pi "$space" "$tab"; then
-			log "resumed terminal \`$terminal\` in tab $name ($tab) from $entry; the tab keeps its session, nothing was opened or closed"
+		# The script is the component that knows a recovered shell; then the guard checks itself,
+		# by what herdr-app says about the tab and by what hc says about the entry's terminal, so a
+		# pi the script did start is never typed over.
+		if tab_has_pi "$space" "$tab" || terminal_runs_pi "$entry_terminal"; then
+			log "resumed terminal \`$entry_terminal\` in tab $name ($tab) from $entry; the tab keeps its session, nothing was opened or closed"
 			return 0
 		fi
-		log "could not resume terminal \`$terminal\` in tab $name ($tab); opening a new pi instead: $(printf '%s' "$resumed" | tail -n 2 | tr '\n' ' ')"
+		# Declined — often "busy (no program)" on a live terminal that has no argv yet. Do it here.
+		resume_via_entry "$entry" "$space" "$tab" "$name"
+		case $? in
+		0) return 0 ;;
+		2)
+			# Already restored in this boot and pi is gone: the person let it go. Leave the tab be.
+			log "tab $name ($tab) already had its session resumed in this boot; leaving it alone"
+			return 1
+			;;
+		esac
+		log "could not resume terminal \`$entry_terminal\` in tab $name ($tab); opening a new pi instead: $(printf '%s' "$resumed" | tail -n 2 | tr '\n' ' ')"
 	else
 		log "tab $name ($tab) opened fresh: terminal \`${terminal:-unknown}\` has no entry in $RESUME_DIR, so it never held pi"
 	fi
@@ -358,6 +541,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 
 	# Recreate immediately, and put the person on it: that is "open when Herdr starts".
 	ensure select
+
+	# One poll and out: a test drives a repair without waiting for the interval, and a person can
+	# ask for one repair without starting a service.
+	[ "${PI_BOSS_ONCE:-0}" = 1 ] && exit 0
 
 	while sleep "$INTERVAL"; do
 		ensure ""
