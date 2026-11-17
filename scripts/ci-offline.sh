@@ -21,7 +21,8 @@ trap 'rm -rf "$work"' EXIT
 export HOME=$work/home
 export PI_BOSS_ROOT=$work/root
 mkdir -p "$HOME" "$PI_BOSS_ROOT"
-unset PI_MASTER_ROOT JEV_MODEL JEV_TIMEOUT
+unset PI_MASTER_ROOT JEV_MODEL JEV_TIMEOUT JEV_MIN_CONFIDENCE JEV_KEY_FILE TYPESAFE_API_KEY \
+	LOCAL_MODEL LOCAL_TIMEOUT LOCAL_KEEP_ALIVE LOCAL_ENDPOINT
 
 # PATH minus every directory that ships herdr-app, so guard and delegate cannot find it even
 # on a machine (like a laptop) where it is installed.
@@ -59,25 +60,32 @@ expect() {
 }
 
 # 1. The model client: an unreachable model is exit 3 and says so. Exit 3 is the whole point
-#    — it is the code that sends the question to the user instead of answering it.
+#    — it is the code that sends the question to the user instead of answering it. The key here is
+#    a placeholder: with no key at all, jev stops one step earlier and says so, which is its own
+#    case below.
+key=ts-placeholder-not-a-key
 expect "jev ask, model down" 3 "decision model unreachable" -- \
-	env JEV_ENDPOINT=$closed "$bin/jev" ask "ship it?"
+	env TYPESAFE_API_KEY=$key JEV_ENDPOINT=$closed "$bin/jev" ask "ship it?"
 expect "jev route, model down" 3 "decision model unreachable" -- \
-	env JEV_ENDPOINT=$closed "$bin/jev" route "summarise this"
+	env TYPESAFE_API_KEY=$key JEV_ENDPOINT=$closed "$bin/jev" route "summarise this"
 # thinking is the newest decision kind and the one a spawn cannot do without: an unreachable
 # model must stop the spawn, never fall back to a default level.
 expect "jev thinking, model down" 3 "decision model unreachable" -- \
-	env JEV_ENDPOINT=$closed "$bin/jev" thinking "rename a helper"
+	env TYPESAFE_API_KEY=$key JEV_ENDPOINT=$closed "$bin/jev" thinking "rename a helper"
 # plan is the one call a spawn makes: if it can be answered without a model there is no gate left.
 expect "jev plan, model down" 3 "decision model unreachable" -- \
-	env JEV_ENDPOINT=$closed "$bin/jev" plan "rename a helper"
-# local-run reports on stderr and exits 1: no answer is not the same as "ask the user".
+	env TYPESAFE_API_KEY=$key JEV_ENDPOINT=$closed "$bin/jev" plan "rename a helper"
+# No key is not a decision either, and it names the fix rather than the value.
+expect "jev, no key at all" 3 "no API key" -- \
+	env -u TYPESAFE_API_KEY JEV_KEY_FILE=$work/no-such-key.env JEV_ENDPOINT=$closed "$bin/jev" ask "ship it?"
+# local-run reports on stderr and exits 1: no answer is not the same as "ask the user". It has its
+# own endpoint now (bin/local-model.mjs), so JEV_ENDPOINT no longer points it anywhere.
 expect "local-run, model down" 1 "local model unreachable" -- \
-	env JEV_ENDPOINT=$closed "$bin/local-run" "say hi"
+	env LOCAL_ENDPOINT=$closed "$bin/local-run" "say hi"
 expect "jev with no question" 2 "needs the question text" -- \
-	env JEV_ENDPOINT=$closed "$bin/jev" ask ""
+	env TYPESAFE_API_KEY=$key JEV_ENDPOINT=$closed "$bin/jev" ask ""
 expect "jev with no subcommand" 2 "usage: jev" -- \
-	env JEV_ENDPOINT=$closed "$bin/jev"
+	env TYPESAFE_API_KEY=$key JEV_ENDPOINT=$closed "$bin/jev"
 
 # 2. delegate refuses a bad slug before it reaches out to anything. The slug check comes
 #    before the herdr-app check, so a malformed slug must not mention herdr at all.
@@ -141,12 +149,12 @@ expect "spawn plan, worker count, path blocking and evidence scaffold" 0 "spawn 
 #     real space.
 expect "guard resumes before it reopens a tab" 0 "guard-resume: ok" -- \
 	bash "$root/scripts/test-guard-resume.sh"
-# 5g. Warm model: every jev request asks ollama to keep the model resident (keep_alive from
-#     bin/jev-model.mjs), an endpoint that refuses the field with 400 still gets a decision on
-#     one retry, and JEV_KEEP_ALIVE overrides the value. Fake ollama on a loopback port that
-#     records the request bodies; no real model, no real 8-second load.
-expect "keep_alive sent, retried without it on 400, overridable" 0 "jev keep-alive: ok" -- \
-	bash "$root/scripts/tests/test-jev-warm.sh"
+# 5g. Typed decisions: jev asks TypeSafe one question (four for a plan) and acts on the
+#     probability; a low-probability field, an unoffered option, a 401, a timeout, a malformed
+#     body and a missing key are all exit 3, and the API key never reaches stdout or stderr. A
+#     fake System One endpoint on a loopback port, so no key, no network, no real decision model.
+expect "typed decisions, probabilities and a key that stays secret" 0 "jev/typesafe: ok" -- \
+	bash "$root/scripts/tests/test-jev-typesafe.sh"
 # 5h. The boss's tail in one command (Radar blip 20): publish, wipe and close run in that order,
 #     each keeps its own gate, and a failure stops at the step that failed with the state named. Its
 #     own script because it needs a fake `publish` on PATH and a fake herdr-app at once, and reads

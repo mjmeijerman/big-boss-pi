@@ -1,51 +1,56 @@
 #!/usr/bin/env node
 /**
- * jev — the local decision model.
+ * jev — the decision model.
  *
- * Radar Vol. 35, "Beyond frontier models": decision models like Jev, and model routing
- * instead of blanket frontier usage. This is that idea at the smallest useful size: a
- * local qwen model, a fixed policy, one narrow question per call, and an explicit
- * "unsure" that sends the question to the human instead of guessing.
+ * Radar Vol. 35, "Beyond frontier models": decision models like Jev, and model routing instead
+ * of blanket frontier usage. This is that idea at its smallest useful size: one typed question
+ * per call, a calibrated probability, and an explicit "unsure" that sends the question to the
+ * human instead of guessing.
+ *
+ * The model is TypeSafe's Jev (api.typesafe.ai, POST /v1/systemone). It answers typed questions
+ * with a probability for every option, in about 150 ms, so a decision is a number the caller can
+ * read instead of a sentence it has to trust. One POST answers all the questions it is given, so
+ * the four questions a spawn asks are one request, one latency and one usage line.
  *
  *   jev ask "<question>"      yes | no | unsure
- *   jev permit "<request>"    allow a sandbox permission request, or escalate it
+ *   jev permit "<request>"    allow a sandbox permission request, deny it, or escalate it
  *   jev mode "<worker task>"  bare | sandboxed | no-net
  *   jev count "<task>"        1..4 workers
+ *   jev route "<task>"        local | remote
  *   jev thinking "<task>"     low | medium | high — how much effort the worker needs
  *   jev plan "<task>"         count + mode + route + thinking in one call
  *
- * "plan" exists because a spawn asks the same model four times about the same task, and three
- * of those four answers are cheap variations on one judgement. One call answers all of them in
- * one JSON object, so a spawn costs one latency and one usage line instead of four. The rules
- * do not relax: every field is validated by the same check its own subcommand makes, and one
- * unusable field still means "unsure", which stops a spawn rather than guessing at that field
- * while trusting the other three. Exit 0 means all four are usable — the route is read from the
- * payload (a local route is still a refusal, made by the caller) — 3 means unsure or the model
- * is unreachable, 2 usage.
- *
- * "thinking" answers an abstract effort, never a pi level name: which levels the concrete
- * model supports is a fact about that model, not about the task, so the caller does the
- * mapping (bin/delegate reads the model catalogue and picks the nearest supported level).
- *
- * Exit codes: 0 yes, or a valid mode/count/thinking answer (route: 0 local, 1 remote),
- * 1 no, 3 unsure or model unreachable (ask the user), 2 usage.
+ * The rules do not relax with the transport: every answer is checked against the options that
+ * were offered, and against JEV_MIN_CONFIDENCE (bin/jev-model.mjs) on the probability of the
+ * chosen option. A field that fails either check is "unsure" and names the field, which stops a
+ * spawn rather than guessing at that field while trusting the others. Exit 0 means every field
+ * is usable — route is read from the answer (0 local, 1 remote, and a local route is still a
+ * refusal made by the caller) — 3 means unsure, no key or the model is unreachable, 2 usage.
  * --json prints {"decision":…,"reason":…} instead of one line.
  *
- * Every request asks ollama to keep the model resident for KEEP_ALIVE (bin/jev-model.mjs), so
- * the next spawn does not pay the model load again; an endpoint that refuses the field with 400
- * still gets one retry without it, because a decision must not die for a warm-up.
+ * "thinking" answers an abstract effort, never a pi level name: which levels the concrete model
+ * supports is a fact about that model, so the caller does the mapping (bin/delegate reads the
+ * model catalogue and picks the nearest supported level).
  *
- * Every call is recorded in state/usage.jsonl (see bin/usage.mjs): kind "jev", the
- * subcommand, the model that answered, the latency and whether it answered at all. A caller
- * that has one sets PI_BOSS_CONTEXT (delegate sets the slug), which lands on the line too.
+ * The key is a secret: it is read from TYPESAFE_API_KEY, or the TYPESAFE_API_KEY= line of
+ * JEV_KEY_FILE (default ~/.pi/agent/env.secret). It is never printed, never logged, and no error
+ * line repeats it; the key file's own path is the most an error says.
+ *
+ * Every call is recorded in state/usage.jsonl (see bin/usage.mjs): kind "jev", the subcommand,
+ * the model that answered (the concrete id from the response, not the alias), the latency and
+ * whether it answered at all. A caller that has one sets PI_BOSS_CONTEXT (delegate sets the
+ * slug), which lands on the line too.
  */
+import fs from "node:fs";
 import process from "node:process";
-import { MODEL, ENDPOINT, TIMEOUT, KEEP_ALIVE } from "./jev-model.mjs";
+import { ENDPOINT, MODEL, TIMEOUT, MIN_CONFIDENCE, KEY_ENV, KEY_FILE } from "./jev-model.mjs";
 import { logUsage, context } from "./usage.mjs";
 
 // Wall clock for the usage line: a decision model that takes 40s is a fact worth having.
 const started = Date.now();
 let command = "";
+// The concrete model the last response named (e.g. jev-1.14.0), which is what actually answered.
+let answeredBy = "";
 
 // record — one usage line for this call, ok or not. Callers exit straight after.
 function record(ok, errorMsg) {
@@ -53,7 +58,7 @@ function record(ok, errorMsg) {
 	logUsage({
 		kind: "jev",
 		command,
-		model: MODEL,
+		model: answeredBy || MODEL,
 		started,
 		latency_ms: Date.now() - started,
 		ok,
@@ -63,40 +68,11 @@ function record(ok, errorMsg) {
 	});
 }
 
-const POLICY = `You are Jev, a decision model inside a coding-agent harness. You answer one
-narrow question at a time and you answer it in JSON. You are not a chatbot: no prose outside
-the JSON, no alternatives, no hedging beyond the "unsure" option you are given.
-
-Standing policy you must apply:
-- Sandboxing is the default. "bare" is only right when the work needs host access the sandbox
-  refuses: Herdr control sockets, a GUI, docker.
-- Publishing is not a reason for bare: a worker commits and the boss publishes, so publish
-  access never justifies bare mode.
-- A worker that needs a model to run cannot use "no-net": no network means no model.
-  "no-net" is for running untrusted repository scripts, nothing else.
-- Read-only analysis, small edits, tests in a normal repository: "sandboxed".
-- At most 4 parallel workers. Past 4 the human cannot review the output; answer 4 and say why.
-- One worker is right when the task is a single thread of work. Do not inflate the count.
-- A sandbox permission request: yes when it is read-only, or a write inside the directory the
-  worker was given, or a path the sandbox simply did not mount and the task needs. No for
-  credentials, ssh keys, cloud configs, writes outside the worker's directory, destructive
-  commands, or network access to hosts the task does not need.
-- Routing: decide whether the work runs local or remote before it starts. "Local" means
-  summarise, classify, extract, tidy, translate, format, and short mechanical rewrites that
-  need no repo knowledge and no tools. "Remote" means code changes, debugging, design
-  decisions, multi-file reasoning, and anything that needs tools, tests, or repo knowledge.
-  When in doubt, remote.
-- Thinking effort for a worker: pick the lowest effort that still does the task. "low" for
-  mechanical edits, renames, formatting, single-file tweaks. "high" for hard debugging,
-  multi-file design, migrations, security-sensitive work. "medium" otherwise. The effort is
-  abstract on purpose: it says how hard the task is, not which level of which model to use.
-  A task text too thin to judge gets "unsure", not a middle-of-the-road guess.
-- If the question is ambiguous, if answering it would be a guess, or if the safe answer is
-  not clear: answer "unsure". A human will take it. That is a good outcome, not a failure.`;
-
+// fail — the call did not produce a decision. The reason goes to stderr, one line, and never
+// carries the key: only the endpoint and the key file's path are addresses, not secrets.
 function fail(message, code = 3, errorClass = "unreachable") {
-	record(false, message.startsWith("decision model") ? errorClass : "usage");
-	process.stdout.write(`jev: ${message}\n`);
+	record(false, errorClass);
+	process.stderr.write(`jev: ${message}\n`);
 	process.exit(code);
 }
 
@@ -106,169 +82,293 @@ function parseArgs(argv) {
 	for (const arg of argv) {
 		if (arg === "--json") opts.json = true;
 		else if (!opts.kind && ["ask", "permit", "mode", "count", "route", "thinking", "plan"].includes(arg))
-		opts.kind = arg;
+			opts.kind = arg;
 		else rest.push(arg);
 	}
 	opts.text = rest.join(" ").trim();
 	return opts;
 }
 
-const SHAPES = {
-	ask: '{"decision":"yes|no|unsure","confidence":0.0-1.0,"reason":"one sentence"}',
-	permit: '{"decision":"yes|no|unsure","confidence":0.0-1.0,"reason":"one sentence"}',
-	mode: '{"mode":"bare|sandboxed|no-net","confidence":0.0-1.0,"reason":"one sentence"}',
-	count: '{"count":1-4,"confidence":0.0-1.0,"reason":"one sentence"}',
-	route: '{"route":"local|remote","confidence":0.0-1.0,"reason":"one sentence"}',
-	thinking: '{"thinking":"low|medium|high","confidence":0.0-1.0,"reason":"one sentence"}',
-	plan: '{"count":1-4,"mode":"bare|sandboxed|no-net","route":"local|remote","thinking":"low|medium|high","confidence":0.0-1.0,"reason":"one sentence"}',
-};
-
-const PROMPTS = {
-	ask: (text) => `Question: ${text}\n\nShould this go ahead? Answer yes, no, or unsure.`,
-	permit: (text) =>
-		`A sandboxed worker asks for this permission:\n${text}\n\nAllow it, or send it to the human? Answer yes (allow), no (refuse), or unsure (ask the human).`,
-	mode: (text) =>
-		`A worker will be started for this task:\n${text}\n\nWhich mode: bare, sandboxed, or no-net?`,
-	count: (text) =>
-		`Task:\n${text}\n\nHow many parallel workers does this need? Answer an integer 1 to 4.`,
-	route: (text) =>
-		`Task:\n${text}\n\nShould this run local (a small local model, no repo, no tools) or remote (a coding agent with the repo and tools)? Answer local or remote.`,
-	thinking: (text) =>
-		`A worker will be started for this task:\n${text}\n\nHow much thinking effort does it need? Answer low, medium, or high — the effort the task needs, not a model's level name.`,
-	plan: (text) =>
-		`A worker will be started for this task:\n${text}\n\nAnswer all four in one JSON object, each by the rule its own question states: how many parallel workers it needs (an integer 1 to 4), which mode (bare, sandboxed or no-net), whether it runs local or remote, and how much thinking effort it needs (low, medium or high).`,
-};
-
-async function post(body) {
+/** apiKey — the key from the environment, else the TYPESAFE_API_KEY line of the key file. */
+function apiKey() {
+	const fromEnv = String(process.env[KEY_ENV] || "").trim();
+	if (fromEnv) return fromEnv;
+	let text;
 	try {
-		return await fetch(ENDPOINT, {
+		text = fs.readFileSync(KEY_FILE, "utf8");
+	} catch (error) {
+		fail(
+			`no API key: ${KEY_ENV} is unset and the key file is unreadable (${KEY_FILE}: ${error.code || error.message}) — set ${KEY_ENV} or write ${KEY_ENV}=… there`,
+			3,
+			"no-key",
+		);
+	}
+	for (const line of text.split("\n")) {
+		const match = /^\s*(?:export\s+)?TYPESAFE_API_KEY\s*=\s*(.*)$/.exec(line);
+		if (!match) continue;
+		const value = match[1].trim().replace(/^["']|["']$/g, "");
+		if (value) return value;
+	}
+	fail(`no API key: the key file has no ${KEY_ENV}= line (${KEY_FILE}) — add one or set ${KEY_ENV}`, 3, "no-key");
+}
+
+// The options every Choice question offers, with the policy that separates them. TypeSafe reads
+// both the option name and its description, so the description is where the standing rule lives.
+const OPTIONS = {
+	mode: {
+		bare: "Needs host access the sandbox refuses: Herdr control sockets, a GUI, docker. Publishing is never a reason: a worker commits and the boss publishes",
+		sandboxed: "The default. Read-only analysis, small edits, tests in a normal repository",
+		"no-net": "Runs untrusted repository scripts and needs no network. A worker that needs a model cannot use this: no network means no model",
+	},
+	count: {
+		1: "The task is a single thread of work. Do not inflate the count",
+		2: "Two independent pieces of work that can run side by side",
+		3: "Three independent pieces of work",
+		4: "Four or more independent pieces. Four is the review ceiling: past it the human cannot read the output",
+	},
+	route: {
+		local: "Summarise, classify, extract, tidy, translate, format, or a short mechanical rewrite: no repo knowledge, no tools",
+		remote: "Code changes, debugging, design decisions, multi-file reasoning, or anything that needs tools, tests or the repo",
+	},
+	thinking: {
+		low: "Mechanical edits, renames, formatting, single-file tweaks",
+		medium: "Ordinary work that needs some judgement",
+		high: "Hard debugging, multi-file design, migrations, security-sensitive work",
+	},
+};
+
+const INSTRUCTIONS = {
+	mode: "A worker will be started for this task. Which mode should it run in?",
+	count: "How many parallel workers does this task need? Answer with an integer from 1 to 4.",
+	route:
+		"Should this task run local (a small local model on this machine, no repo and no tools) or remote (a coding agent with the repo and tools)? When in doubt, remote.",
+	thinking:
+		"How much thinking effort does this task need? The lowest effort that still does the task, and the effort the task needs, not a model's level name.",
+	plan: {
+		count: "How many parallel workers does this task need? Answer with an integer from 1 to 4.",
+		mode: "Which mode should this worker run in?",
+		route:
+			"Should this task run local (a small local model on this machine, no repo and no tools) or remote (a coding agent with the repo and tools)? When in doubt, remote.",
+		thinking:
+			"How much thinking effort does this task need? The lowest effort that still does the task.",
+	},
+};
+
+const ASK_INSTRUCTIONS = (text) =>
+	`${text}\n\nShould this go ahead? Answer yes when it is safe and wanted, no when it is not. If the question is ambiguous or answering it would be a guess, give a probability near 0.5 and a human will take it.`;
+const PERMIT_INSTRUCTIONS = (text) =>
+	`A sandboxed worker asks for this permission:\n${text}\n\nShould the harness allow it, deny it, or ask the human? Allow when it is read-only, or a write inside the directory the worker was given, or a path the sandbox simply did not mount and the task needs. Deny for credentials, ssh keys, cloud configs, writes outside the worker's directory, destructive commands, or network access to hosts the task does not need. Ask when neither is clear.`;
+
+const choice = (instructions, options) => ({ type: "choice", instructions, criteria: options });
+
+/** questions — the typed questions for one subcommand, as one request body fragment. */
+function questions(kind, text) {
+	if (kind === "ask") {
+		return {
+			decision: {
+				type: "noul",
+				instructions: ASK_INSTRUCTIONS(text),
+				criteria: { true: "The request is safe and wanted", false: "The request should not go ahead" },
+			},
+		};
+	}
+	if (kind === "permit") {
+		return {
+			permission: choice(PERMIT_INSTRUCTIONS(text), {
+				allow: "Read-only, a write inside the worker's own directory, or a needed path the sandbox did not mount",
+				deny: "Credentials, ssh keys, cloud configs, a write outside the worker's directory, a destructive command, or unneeded network",
+				ask: "Neither: a human should decide",
+			}),
+		};
+	}
+	if (kind === "plan") {
+		return {
+			count: choice(INSTRUCTIONS.plan.count, OPTIONS.count),
+			mode: choice(INSTRUCTIONS.plan.mode, OPTIONS.mode),
+			route: choice(INSTRUCTIONS.plan.route, OPTIONS.route),
+			thinking: choice(INSTRUCTIONS.plan.thinking, OPTIONS.thinking),
+		};
+	}
+	return { [kind]: choice(INSTRUCTIONS[kind], OPTIONS[kind]) };
+}
+
+/** request — one POST, every question at once. Returns the answers map or fails. */
+async function request(kind, text) {
+	const key = apiKey();
+	const body = { model: MODEL, state: { task: text }, questions: questions(kind, text) };
+	let response;
+	try {
+		response = await fetch(ENDPOINT, {
 			method: "POST",
-			headers: { "content-type": "application/json" },
+			headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
 			body: JSON.stringify(body),
 			signal: AbortSignal.timeout(TIMEOUT),
 		});
 	} catch (error) {
-		fail(`decision model unreachable (${ENDPOINT}): ${error.message} — ask the user`, 3, "unreachable");
+		const why = error?.name === "TimeoutError" ? `timed out after ${TIMEOUT} ms` : error.message;
+		fail(`decision model unreachable (${ENDPOINT}): ${why} — ask the user`, 3, "unreachable");
 	}
-}
-
-async function decide(kind, text) {
-	const body = {
-		model: MODEL,
-		stream: false,
-		format: "json",
-		keep_alive: KEEP_ALIVE,
-		options: { temperature: 0.1, num_ctx: 8192 },
-		messages: [
-			{ role: "system", content: `${POLICY}\n\nAnswer with exactly this JSON shape:\n${SHAPES[kind]}` },
-			{ role: "user", content: PROMPTS[kind](text) },
-		],
-	};
-
-	let response = await post(body);
-	// An endpoint that does not know keep_alive refuses the whole request with 400. One retry
-	// without the field, and say so: the decision matters, the warm-up is the optimisation.
-	if (response.status === 400) {
-		process.stderr.write(`jev: endpoint refused keep_alive=${KEEP_ALIVE} (HTTP 400); retrying without it\n`);
-		const bare = { ...body };
-		delete bare.keep_alive;
-		response = await post(bare);
+	// A refused key is the one failure a retry cannot fix, and the one worth naming precisely.
+	if (response.status === 401 || response.status === 403) {
+		fail(
+			`decision model refused the API key (HTTP ${response.status}) — check ${KEY_ENV}, or the ${KEY_ENV}= line in ${KEY_FILE}`,
+			3,
+			"auth",
+		);
 	}
 	if (!response.ok) fail(`decision model returned HTTP ${response.status} — ask the user`, 3, "http");
 
-	const payload = await response.json().catch(() => null);
-	const content = payload?.message?.content;
-	if (!content) fail("decision model returned nothing — ask the user", 3, "empty");
-
-	let answer;
+	let payload;
 	try {
-		answer = JSON.parse(content);
+		payload = await response.json();
 	} catch {
-		fail(`decision model answered outside JSON (${String(content).slice(0, 120)}) — ask the user`, 3, "non-json");
+		fail("decision model answered outside JSON — ask the user", 3, "non-json");
 	}
-	return answer;
+	if (payload && typeof payload.model === "string" && payload.model) answeredBy = payload.model;
+	const answers = payload && typeof payload.answers === "object" ? payload.answers : null;
+	if (!answers) fail("decision model returned nothing usable (no answers in the response) — ask the user", 3, "empty");
+	return answers;
+}
+
+/**
+ * pick — one Choice answer as {value, probability}. `probability` is the chosen option's own
+ * probability, which is the number a caller acts on; a missing or non-numeric probability is
+ * null, and a null or unoffered value is unusable — both mean "unsure", never a default.
+ */
+function pick(answers, id, offered) {
+	const answer = answers?.[id];
+	if (!answer || answer.type !== "choice") return { value: "", probability: null };
+	const raw = answer.choice === undefined || answer.choice === null ? "" : String(answer.choice);
+	const value = offered.some((option) => option === raw) ? raw : "";
+	const fromDistribution = answer.probabilities ? answer.probabilities[raw] : undefined;
+	const probability =
+		typeof fromDistribution === "number"
+			? fromDistribution
+			: typeof answer.confidence === "number"
+				? answer.confidence
+				: null;
+	return { value, probability };
+}
+
+/** noul — one Noul answer's probability of yes, 0..1. */
+function noul(answers, id) {
+	const answer = answers?.[id];
+	if (!answer || answer.type !== "noul") return null;
+	return typeof answer.noul === "number" ? answer.noul : null;
+}
+
+const usable = (field) => field.value !== "" && typeof field.probability === "number" && field.probability >= MIN_CONFIDENCE;
+const asNumber = (value) => (typeof value === "number" && Number.isFinite(value) ? Math.round(value * 100) / 100 : null);
+
+/** reasonOf — the probabilities in words, so a decision line carries its own evidence. */
+function reasonOf(fields) {
+	const parts = [];
+	for (const [name, field] of Object.entries(fields)) parts.push(`${name} ${asNumber(field.probability) ?? "?"}`);
+	return parts.join(", ");
+}
+
+function emit(line, payload, code) {
+	// The model answered, whatever the harness makes of the answer: exit 3 for "unsure" is a
+	// decision, not a failure of the decision path.
+	record(true);
+	if (opts.json) process.stdout.write(`${JSON.stringify(payload)}\n`);
+	else process.stdout.write(`jev: ${line}\n`);
+	process.exit(code);
 }
 
 const opts = parseArgs(process.argv.slice(2));
 command = opts.kind;
-if (!opts.kind) fail("usage: jev ask|permit|mode|count|route|thinking|plan <text> [--json]", 2);
-if (!opts.text) fail(`jev ${opts.kind}: needs the question text`, 2);
+if (!opts.kind) fail("usage: jev ask|permit|mode|count|route|thinking|plan <text> [--json]", 2, "usage");
+if (!opts.text) fail(`jev ${opts.kind}: needs the question text`, 2, "usage");
 
-const answer = await decide(opts.kind, opts.text);
-const confidence = typeof answer.confidence === "number" ? answer.confidence : null;
-const reason = typeof answer.reason === "string" ? answer.reason : "";
-const low = confidence !== null && confidence < 0.5;
-
-function emit(line, payload, code) {
-	// The model answered, whatever the harness makes of the answer: exit 3 for "unsure" is a
-	// decision, not a failure of the local path.
-	record(true);
-	if (opts.json) process.stdout.write(`${JSON.stringify(payload)}\n`);
-	else process.stdout.write(`jev: ${line}${reason ? ` — ${reason}` : ""}\n`);
-	process.exit(code);
-}
+const answers = await request(opts.kind, opts.text);
 
 if (opts.kind === "plan") {
-	// Same per-field checks as mode/count/route/thinking, in one pass. A field that fails is
-	// null in the payload and named in the line, so a caller that overrides jev can see which
-	// judgement it is overturning. One bad field is enough to stop the spawn.
-	const count = Number(answer.count);
-	const mode = String(answer.mode || "").trim().toLowerCase();
-	const route = String(answer.route || "").trim().toLowerCase();
-	const thinking = String(answer.thinking || "").trim().toLowerCase();
-	const bad = [];
-	if (!Number.isInteger(count) || count < 1 || count > 4) bad.push("count");
-	if (!["bare", "sandboxed", "no-net"].includes(mode)) bad.push("mode");
-	if (!["local", "remote"].includes(route)) bad.push("route");
-	if (!["low", "medium", "high"].includes(thinking)) bad.push("thinking");
-	if (low) bad.push("confidence");
-	// A low-confidence answer doubts the whole judgement, not one field of it: every field goes
-	// null, so the caller cannot take the three it likes and ignore the one it does not.
-	const usable = (field) => !low && !bad.includes(field);
+	// Four questions, one request, one usage line. Each field is checked against the options it
+	// was offered and against its own probability, and a field that fails is null in the payload
+	// and named in the line, so a caller that overrides jev can see which judgement it overturns.
+	const fields = {
+		count: pick(answers, "count", ["1", "2", "3", "4"]),
+		mode: pick(answers, "mode", ["bare", "sandboxed", "no-net"]),
+		route: pick(answers, "route", ["local", "remote"]),
+		thinking: pick(answers, "thinking", ["low", "medium", "high"]),
+	};
+	const bad = Object.entries(fields)
+		.filter(([, field]) => !usable(field))
+		.map(([name]) => name);
+	const reason = reasonOf(fields);
+	const weakest = Math.min(
+		...Object.values(fields).map((field) => (typeof field.probability === "number" ? field.probability : 0)),
+	);
+	const value = (name) => (bad.includes(name) ? null : fields[name].value);
 	const payload = {
-		count: usable("count") ? count : null,
-		mode: usable("mode") ? mode : null,
-		route: usable("route") ? route : null,
-		thinking: usable("thinking") ? thinking : null,
+		count: value("count") === null ? null : Number(fields.count.value),
+		mode: value("mode"),
+		route: value("route"),
+		thinking: value("thinking"),
 		reason,
-		confidence,
+		confidence: Math.round(weakest * 100) / 100,
 	};
 	if (bad.length) emit(`unsure how to plan this spawn (${bad.join(", ")} unusable) — ask the user`, payload, 3);
-	emit(`count=${count} mode=${mode} route=${route} thinking=${thinking}`, payload, 0);
+	emit(
+		`count=${payload.count} mode=${payload.mode} route=${payload.route} thinking=${payload.thinking}`,
+		payload,
+		0,
+	);
 }
 
 if (opts.kind === "mode") {
-	const mode = String(answer.mode || "").trim().toLowerCase();
-	if (!["bare", "sandboxed", "no-net"].includes(mode) || low)
-		emit("unsure which mode — ask the user", { mode: null, reason, confidence }, 3);
-	emit(mode, { mode, reason, confidence }, 0);
+	const field = pick(answers, "mode", ["bare", "sandboxed", "no-net"]);
+	const payload = { mode: usable(field) ? field.value : null, reason: reasonOf({ mode: field }), confidence: asNumber(field.probability) };
+	if (payload.mode === null) emit("unsure which mode — ask the user", payload, 3);
+	emit(payload.mode, payload, 0);
 }
 
 if (opts.kind === "count") {
-	const count = Number(answer.count);
-	if (!Number.isInteger(count) || count < 1 || count > 4 || low)
-		emit("unsure how many workers — ask the user", { count: null, reason, confidence }, 3);
-	emit(String(count), { count, reason, confidence }, 0);
-}
-
-if (opts.kind === "thinking") {
-	const effort = String(answer.thinking || "").trim().toLowerCase();
-	if (!["low", "medium", "high"].includes(effort) || low)
-		emit("unsure how much thinking this needs — ask the user", { thinking: null, reason, confidence }, 3);
-	emit(effort, { thinking: effort, reason, confidence }, 0);
+	const field = pick(answers, "count", ["1", "2", "3", "4"]);
+	const payload = { count: usable(field) ? Number(field.value) : null, reason: reasonOf({ count: field }), confidence: asNumber(field.probability) };
+	if (payload.count === null) emit("unsure how many workers — ask the user", payload, 3);
+	emit(String(payload.count), payload, 0);
 }
 
 if (opts.kind === "route") {
-	const route = String(answer.route || "").trim().toLowerCase();
-	if (!["local", "remote"].includes(route) || low)
-		emit("unsure which route — ask the user", { route: null, reason, confidence }, 3);
-	if (route === "local") emit("local", { route, reason, confidence }, 0);
-	emit("remote", { route, reason, confidence }, 1);
+	const field = pick(answers, "route", ["local", "remote"]);
+	const payload = { route: usable(field) ? field.value : null, reason: reasonOf({ route: field }), confidence: asNumber(field.probability) };
+	if (payload.route === null) emit("unsure which route — ask the user", payload, 3);
+	if (payload.route === "local") emit("local", payload, 0);
+	emit("remote", payload, 1);
 }
 
-const decision = String(answer.decision || "").trim().toLowerCase();
-if (!["yes", "no", "unsure"].includes(decision) || low)
+if (opts.kind === "thinking") {
+	const field = pick(answers, "thinking", ["low", "medium", "high"]);
+	const payload = {
+		thinking: usable(field) ? field.value : null,
+		reason: reasonOf({ thinking: field }),
+		confidence: asNumber(field.probability),
+	};
+	if (payload.thinking === null) emit("unsure how much thinking this needs — ask the user", payload, 3);
+	emit(payload.thinking, payload, 0);
+}
+
+// permit: one Choice with an explicit "ask", so an unreadable request has somewhere to go that
+// is not a coin flip. A chosen option below the threshold is unsure too, whatever it reads.
+if (opts.kind === "permit") {
+	const field = pick(answers, "permission", ["allow", "deny", "ask"]);
+	const reason = reasonOf({ permission: field });
+	const confidence = asNumber(field.probability);
+	if (!usable(field) || field.value === "ask")
+		emit("unsure — ask the user", { decision: "unsure", reason, confidence }, 3);
+	if (field.value === "allow") emit("yes", { decision: "yes", reason, confidence }, 0);
+	emit("no", { decision: "no", reason, confidence }, 1);
+}
+
+// ask: one Noul, whose number is the probability of yes. A Noul carries no `confidence`, so the
+// threshold is applied to |2p-1| — the documented confidence for a yes/no answer — which is the
+// same number in every case: how far the answer is from a coin flip.
+const probability = noul(answers, "decision");
+const confidence = typeof probability === "number" ? asNumber(Math.abs(2 * probability - 1)) : null;
+const reason = `decision ${asNumber(probability) ?? "?"}`;
+if (typeof probability !== "number" || confidence === null || confidence < MIN_CONFIDENCE)
 	emit("unsure — ask the user", { decision: "unsure", reason, confidence }, 3);
-if (decision === "yes") emit("yes", { decision, reason, confidence }, 0);
-if (decision === "no") emit("no", { decision, reason, confidence }, 1);
-emit("unsure — ask the user", { decision: "unsure", reason, confidence }, 3);
+if (probability > 0.5) emit("yes", { decision: "yes", reason, confidence }, 0);
+emit("no", { decision: "no", reason, confidence }, 1);

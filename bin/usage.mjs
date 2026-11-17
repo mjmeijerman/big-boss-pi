@@ -1,19 +1,22 @@
 /**
- * usage — the one place a local model call gets recorded.
+ * usage — the one place a model call gets recorded.
  *
- * Both halves of the local model write here: bin/jev.mjs (the decision engine, kind "jev")
- * and bin/local-run.mjs (the local worker, kind "local-run"). It is the file that answers
- * "is the local model actually used" without inferring it from the absence of something else.
+ * Both decision paths write here: bin/jev.mjs (the TypeSafe decision model, kind "jev") and
+ * bin/local-run.mjs (the local worker on ollama, kind "local-run"). It is the file that answers
+ * "is the model actually used, and how fast does it answer" without inferring it from the absence
+ * of something else.
  *
  * One JSON object per call, appended to state/usage.jsonl:
  *
  *   ts          ISO timestamp of when the call started
  *   kind        "jev" | "local-run"
- *   command     jev's subcommand (ask, route, mode, count, thinking, permit) or "run"
- *   model       the model id from bin/jev-model.mjs, i.e. what actually answered
+ *   command     jev's subcommand (ask, permit, route, mode, count, thinking, plan) or "run"
+ *   model       the model id that actually answered (jev: from bin/jev-model.mjs and the
+ *               response; local-run: from bin/local-model.mjs)
  *   latency_ms  wall time from before the request to after the answer (or the failure)
  *   ok          did the model answer at all
- *   error       one class word when ok is false: unreachable, http, empty, non-json, no-answer
+ *   error       one class word when ok is false: unreachable, http, auth, no-key, empty,
+ *               non-json, malformed, usage
  *   context     the caller's slug or context when it has one (PI_BOSS_CONTEXT), else null
  *   task        the task text, clipped to 200 characters and redacted
  *
