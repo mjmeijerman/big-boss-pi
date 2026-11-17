@@ -48,7 +48,7 @@ Before any work starts, ask Jev the route: `jev route "<task>"`. Exit 0 = local,
 - **local** — summarise, classify, extract, tidy, translate, format, short mechanical rewrites
   that need no repo knowledge and no tools. Run it as a subprocess:
   `bin/local-run "<task>"`, or pipe the text in. Answer on stdout, no space, spec, report
-  or `decisions.jsonl` line. Same local model as `jev`.
+  or `decisions.jsonl` line. The local ollama model, not the one jev decides on.
 - **remote** — code changes, debugging, design decisions, multi-file reasoning, anything that
   needs tools, tests or repo knowledge. That is `delegate spawn`.
 - **unsure** — ask the user. When in doubt, remote: a wasted space costs less than a wrong
@@ -123,7 +123,8 @@ then close once it is answered. Every other report is relayed and its space clos
 | `bin/jev` | the decision model wrapper |
 | `bin/delegate` | spawn / wait / list / close / sweep workers, gated by Jev |
 | `bin/local-run` | run one local task on the local model, headless, answer on stdout |
-| `bin/jev-model.mjs` | the one place that names the local model and endpoint |
+| `bin/jev-model.mjs` | TypeSafe endpoint, model, timeout, confidence threshold |
+| `bin/local-model.mjs` | the same four for `bin/local-run`'s ollama model |
 | `bin/guard` | keeps the big-boss-pi space alive and focused at Herdr start |
 | `bin/pi-bare`, `bin/pi-sandboxed`, `bin/pi-nonet` | the three worker modes |
 | `bin/finish-rename.sh` | opt-in: close the old `pi-master` space, print how to delete the old tree |

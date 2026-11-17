@@ -50,34 +50,41 @@ SPEC_CEILING=3000
 # ---------------------------------------------------------------------------------------------
 # A. `jev plan`: one call, four answers, same validation.
 #
-# A fake ollama reads the canned answer from a file and answers in ollama's shape, on a port the
-# kernel picks. That is what makes the model's disagreement testable: the answer below is the
-# fixture, and every case is about what jev does with an answer, not about what a model would say.
+# A fake System One endpoint reads the canned answers from a file and answers in TypeSafe's shape,
+# on a port the kernel picks. That is what makes the model's disagreement testable: the fixture is
+# a choice and a probability per question ({"count":["2",0.9],…}), and every case is about what
+# jev does with an answer, not about what a model would say. The key is a placeholder the fake
+# accepts and jev never prints.
 # ---------------------------------------------------------------------------------------------
 port_file=$work/port
 answer_file=$work/answer.json
-# A fake ollama: the canned answer comes from a file, so the model's disagreement is the fixture
-# and every case is about what jev does with an answer, not about what a model would say.
-cat >"$work/fake-ollama.mjs" <<'JS'
+export TYPESAFE_API_KEY=ts-test-placeholder-key
+cat >"$work/fake-typesafe.mjs" <<'JS'
 import fs from "node:fs";
 import http from "node:http";
 const [answerFile, portFile] = process.argv.slice(2);
 const server = http.createServer((req, res) => {
 	req.resume();
 	req.on("end", () => {
-		const answer = fs.readFileSync(answerFile, "utf8");
+		// The fixture is {"question":["choice",probability]}; TypeSafe answers each question with the
+		// chosen option and a distribution, and jev reads the chosen option's own probability.
+		const fixture = JSON.parse(fs.readFileSync(answerFile, "utf8"));
+		const answers = {};
+		for (const [id, [choice, probability]] of Object.entries(fixture)) {
+			answers[id] = { type: "choice", choice, confidence: probability, probabilities: { [choice]: probability } };
+		}
 		res.writeHead(200, { "content-type": "application/json" });
-		res.end(JSON.stringify({ message: { content: answer } }));
+		res.end(JSON.stringify({ model: "jev-test-1.14.0", answers, usage: { input_tokens: 10, output_tokens: 5 } }));
 	});
 });
 server.listen(0, "127.0.0.1", () => fs.writeFileSync(portFile, String(server.address().port)));
 JS
-node "$work/fake-ollama.mjs" "$answer_file" "$port_file" &
+node "$work/fake-typesafe.mjs" "$answer_file" "$port_file" &
 model_pid=$!
 trap 'kill "$model_pid" 2>/dev/null; rm -rf "$work"' EXIT
 for _ in $(seq 1 100); do [ -s "$port_file" ] && break; sleep 0.05; done
 [ -s "$port_file" ] || { printf 'fake model never started\n' >&2; exit 1; }
-export JEV_ENDPOINT=http://127.0.0.1:$(cat "$port_file")/api/chat
+export JEV_ENDPOINT=http://127.0.0.1:$(cat "$port_file")/v1/systemone
 export JEV_TIMEOUT=10000
 usage=$PI_BOSS_ROOT/state/usage.jsonl
 
@@ -118,31 +125,31 @@ plan_case() {
 }
 
 plan_case "plan, all four answers" \
-	'{"count":2,"mode":"sandboxed","route":"remote","thinking":"medium","confidence":0.9,"reason":"two files"}' \
+	'{"count":["2",0.9],"mode":["sandboxed",0.9],"route":["remote",0.9],"thinking":["medium",0.8]}' \
 	0 - 'count=2' 'mode="sandboxed"' 'route="remote"' 'thinking="medium"'
 # One unusable field stops the spawn and names the field: a plan that guessed at the count while
 # trusting the other three is the failure this check exists for.
 plan_case "plan, count out of range is unsure" \
-	'{"count":9,"mode":"sandboxed","route":"remote","thinking":"low","confidence":0.9,"reason":"lots"}' \
+	'{"count":["9",0.9],"mode":["sandboxed",0.9],"route":["remote",0.9],"thinking":["low",0.9]}' \
 	3 - 'count=null' 'mode="sandboxed"'
-# In words, not only in JSON: the line a person reads names what was unusable.
-printf '%s' '{"count":1,"mode":"sandboxed","route":"remote","thinking":"low","confidence":0.1,"reason":"unsure"}' >"$answer_file"
+# A field under the threshold is the same refusal, on that field only, and it is named in words.
+plan_case "plan, a low-probability field is unsure" \
+	'{"count":["1",0.2],"mode":["bare",0.9],"route":["remote",0.9],"thinking":["high",0.9]}' \
+	3 - 'count=null' 'mode="bare"' 'thinking="high"'
+printf '%s' '{"count":["1",0.2],"mode":["bare",0.9],"route":["remote",0.9],"thinking":["high",0.9]}' >"$answer_file"
 out=$(timeout 30 "$bin/jev" plan "rename one helper" 2>&1)
 rc=$?
-if [ "$rc" = 3 ] && printf '%s' "$out" | grep -qF "unsure how to plan this spawn (confidence unusable)"; then
+if [ "$rc" = 3 ] && printf '%s' "$out" | grep -qF "unsure how to plan this spawn (count unusable)"; then
 	pass "plan, unsure says which field was unusable, in words"
 else
 	fail "plan, unsure wording: exit $rc — $out"
 fi
-plan_case "plan, low confidence is unsure" \
-	'{"count":1,"mode":"bare","route":"remote","thinking":"high","confidence":0.2,"reason":"not sure"}' \
-	3 - 'count=null' 'mode=null' 'thinking=null'
 plan_case "plan, a route jev does not name is unsure" \
-	'{"count":1,"mode":"sandboxed","route":"both","thinking":"low","confidence":0.9,"reason":"eh"}' \
+	'{"count":["1",0.9],"mode":["sandboxed",0.9],"route":["both",0.9],"thinking":["low",0.9]}' \
 	3 - 'route=null'
 
 # The dead model is not a default answer: exit 3, and the word the caller greps for.
-out=$(env JEV_ENDPOINT=http://127.0.0.1:9/api/chat timeout 30 "$bin/jev" plan "do a thing" 2>&1)
+out=$(env JEV_ENDPOINT=http://127.0.0.1:9/v1/systemone timeout 30 "$bin/jev" plan "do a thing" 2>&1)
 rc=$?
 if [ "$rc" = 3 ] && printf '%s' "$out" | grep -qF "decision model unreachable"; then
 	pass "plan, model down is exit 3 and says unreachable"
@@ -152,7 +159,7 @@ fi
 
 # One call, one usage line: that is the spawn-speed claim, and the file is where it is visible.
 : >"$usage"
-printf '%s' '{"count":1,"mode":"sandboxed","route":"remote","thinking":"low","confidence":0.9,"reason":"one file"}' >"$answer_file"
+printf '%s' '{"count":["1",0.9],"mode":["sandboxed",0.9],"route":["remote",0.9],"thinking":["low",0.9]}' >"$answer_file"
 timeout 30 "$bin/jev" plan "rename one helper" >/dev/null 2>&1
 lines=$(grep -c '"command":"plan"' "$usage" 2>/dev/null || true)
 if [ "${lines:-0}" = 1 ] && [ "$(wc -l <"$usage")" = 1 ]; then

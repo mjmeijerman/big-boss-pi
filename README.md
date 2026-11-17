@@ -12,8 +12,8 @@ copy: read-only during the transition, deleted only when the user says so.
 | piece | path | why there |
 |---|---|---|
 | The rules every agent here loads | `/home/mark/big-boss-pi/AGENTS.md` | Pi loads `AGENTS.md` from the working directory and every parent, on every start, with no project trust needed. New or reloaded agents therefore start with the same knowledge |
-| Decision model | `bin/jev` → `~/.local/bin/jev` | local qwen3.8:27b on ollama; decides worker count, mode, route, thinking effort, and permissions |
-| Local worker | `bin/local-run` | runs a local task on the same model, headless: prompt in, answer on stdout, no space and no spec; records one line in `state/usage.jsonl` |
+| Decision model | `bin/jev` → `~/.local/bin/jev` | TypeSafe's Jev on api.typesafe.ai, one typed request with a calibrated probability per question; decides worker count, mode, route, thinking effort, and permissions |
+| Local worker | `bin/local-run` | runs a local task on the ollama model (`bin/local-model.mjs`), headless: prompt in, answer on stdout, no space and no spec, no network; records one line in `state/usage.jsonl` |
 | Delegation | `bin/delegate` → `~/.local/bin/delegate` | one jev call for mode, count, route and thinking effort, one Herdr space per worker jev asked for, the spec, where the report lands, and every decision in `state/decisions.jsonl`; `delegate sweep` closes the workers that finished |
 | Worker modes | `bin/pi-bare`, `bin/pi-sandboxed`, `bin/pi-nonet` | `delegate` picks one from Jev's answer |
 | Never-closable space | `bin/guard` → `~/.local/bin/big-boss-pi-guard` + `~/.config/systemd/user/big-boss-pi-guard.service` | polls `herdr-app ls`; recreates the `big-boss-pi` space if it disappears, selects it once when Herdr starts, resumes a tab whose terminal is no longer pi from its resume entry — found by terminal id **or** by the tab id the entry recorded, newest `updated_at` first, session file required — first through `~/.pi/scripts/herdr-resume.sh` and then, when that declines, with its own `hc send` on the entry's terminal, and reopens it with an absolute argv only when there is no usable entry or the resume did not start pi, at most once a minute per tab and logged in `state/guard.log` with the path it took. Only tabs it is allowed to repair: the parked tabs it saw when it started, and the ones it opened itself — a tab the person opens while it runs is theirs, kept in `state/tab-classes` so a restart does not take it either. It never touches a space named `pi-master` |
@@ -49,8 +49,25 @@ markdown notes.txt | bin/local-run                       # the answer on stdout
 jev route "add retries to the fetch client"              # → remote (exit 1)
 ```
 
-## Is the local model actually used?
+## The decision model: one key, one threshold
 
+`bin/jev` asks TypeSafe's Jev at `https://api.typesafe.ai/v1/systemone` — one typed request per
+question, four for a `plan`, each answered with the probability of every option. **It needs
+network now**; `bin/local-run` does not, it is still the ollama model on this machine.
+
+- The key: `TYPESAFE_API_KEY`, or the `TYPESAFE_API_KEY=` line of `JEV_KEY_FILE` (default
+  `~/.pi/agent/env.secret`) when the variable is unset. It is never printed, never logged, never
+  in a URL. A missing key, a 401, a 403, a timeout and a malformed answer are all exit 3 with one
+  line on stderr that names the cause and not the key.
+- The threshold: `JEV_MIN_CONFIDENCE`, default `0.5`. A Choice acts when the chosen option's
+  probability reaches it; a Noul when `|2p−1|` does, which is p outside 0.25..0.75. `0.6` is the
+  stricter reading, and it stopped four of eight ordinary tasks as unsure when measured, all on
+  count or thinking — the two questions with four and three neighbours.
+- The knobs, all env-overridable: `JEV_ENDPOINT`, `JEV_MODEL` (default `jev-latest`), `JEV_TIMEOUT`
+  (20000 ms). The local half has its own: `LOCAL_ENDPOINT`, `LOCAL_MODEL`, `LOCAL_TIMEOUT`,
+  `LOCAL_KEEP_ALIVE`.
+
+## Is the local model actually used?
 `delegate stats` answers that in one line instead of by inference:
 
 ```
@@ -74,7 +91,7 @@ in `jev` so `overridden` can be checked rather than trusted: it is true only on 
 decision `--override-jev` actually overturned. Older rows put that flag on all four lines of
 an overridden spawn, so `delegate stats` counts them as legacy instead of re-reading them.
 
-`state/usage.jsonl` is what the local model did, one line per call from `bin/jev` or
+`state/usage.jsonl` is what the models did, one line per call from `bin/jev` or
 `bin/local-run`: timestamp, kind, subcommand, model id, latency, whether it answered, the
 error class when it did not, and the caller's slug or context. **Not** logged: environment
 variables, credentials, endpoints, and the whole task text — only the first 200 characters,
@@ -354,7 +371,7 @@ delegate stats                                  # is the local model used, and h
 delegate sweep                                  # close the ones that reported, keep the rest
 tail -f ~/big-boss-pi/reports/*.md              # what workers reported
 tail -2 ~/big-boss-pi/state/decisions.jsonl     # what jev decided
-tail -2 ~/big-boss-pi/state/usage.jsonl         # what the local model answered
+tail -2 ~/big-boss-pi/state/usage.jsonl         # what the models answered, and how fast
 ```
 
 ## Changing the rules

@@ -4,23 +4,25 @@
  *
  * The other half of routing (jev route): a task jev calls "local" runs here instead of in a
  * worker space. One prompt in, the answer on stdout, no Herdr space, no state file, no
- * decisions.jsonl line, no spec, no report. Same model and endpoint as bin/jev.mjs.
+ * decisions.jsonl line, no spec, no report. Its own model and endpoint (bin/local-model.mjs):
+ * jev is a remote decision model now, and this half still runs on the local ollama model, with
+ * no network and no key.
  *
  *   local-run "summarise reports/x.md in three bullets"
  *   cat task.txt | local-run
  *
  * Exit 0 = the model answered (answer on stdout). Exit 1 = no answer (reason on stderr).
  *
- * Every request asks ollama to keep the model resident for KEEP_ALIVE (bin/jev-model.mjs), the
- * same value jev sends, so a local task after an idle gap does not pay the model load again.
- * An endpoint that refuses the field with 400 gets one retry without it, announced on stderr.
+ * Every request asks ollama to keep the model resident for KEEP_ALIVE (bin/local-model.mjs), so a
+ * local task after an idle gap does not pay the model load again. An endpoint that refuses the
+ * field with 400 gets one retry without it, announced on stderr.
  *
  * Every invocation is recorded in state/usage.jsonl (see bin/usage.mjs): kind "local-run",
  * model, latency, ok/error, and the task clipped to 200 characters. The answer itself is not
  * logged. PI_BOSS_CONTEXT, when the caller sets it, lands on the line as context.
  */
 import process from "node:process";
-import { MODEL, ENDPOINT, TIMEOUT, KEEP_ALIVE } from "./jev-model.mjs";
+import { MODEL, ENDPOINT, TIMEOUT, KEEP_ALIVE } from "./local-model.mjs";
 import { logUsage, context } from "./usage.mjs";
 
 const started = Date.now();
