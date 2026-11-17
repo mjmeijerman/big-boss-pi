@@ -5,9 +5,9 @@
 # Four behaviours, each one a claim the harness makes in prose and would otherwise never check:
 #
 #   A. `jev plan` answers count, mode, route and thinking from one model call, validates each
-#      field the way its own subcommand does, and is unsure or unreachable rather than guessing.
-#      The model is a fake ollama on a loopback port, so no real model is needed and the answer
-#      is the test's, not the machine's.
+#      field the way its own subcommand does, gives a weak field its conservative default and
+#      names it, and stays unsure on an answer it was not offered. The model is a fake ollama on
+#      a loopback port, so no real model is needed and the answer is the test's, not the machine's.
 #   B. `delegate spawn` starts one space per worker jev asked for — the given slug, then SLUG-2
 #      .. SLUG-N, each with its own spec and report — and refuses instead of collapsing when the
 #      live ceiling would be crossed. Stub herdr-app, stub hc, stub jev, stub runner: no desktop
@@ -22,7 +22,8 @@
 #      reads the repo, so a template that grows back into a wall of prose is a slowdown nothing
 #      would notice. The fixture paths are folded to one character, so the number is about the
 #      template and not about where mktemp put the throwaway tree.
-#   F. An unsure plan stops the spawn before a spec, a space or a default count exists.
+#   F. A plan that could not be decided: a weak field spawns on its default and says so, a dead
+#      model refuses without a flag and spawns with one, and the flag without a reason refuses.
 #
 #   bash scripts/test-spawn-speed.sh      exit 0 = every case held
 set -uo pipefail
@@ -95,7 +96,8 @@ plan_case() {
 	local out rc bad="" kv key val got
 	: >"$usage"
 	printf '%s' "$answer" >"$answer_file"
-	out=$(timeout 30 "$bin/jev" plan "rename one helper" --json 2>&1) && rc=0 || rc=$?
+	# stderr apart from stdout: a defaulted field is named there, and stdout is the JSON.
+	out=$(timeout 30 "$bin/jev" plan "rename one helper" --json 2>"$work/stderr-plan-case") && rc=0 || rc=$?
 	if [ "$rc" != "$want" ]; then
 		fail "$name: exit $rc, wanted $want — $out"
 		return
@@ -132,17 +134,27 @@ plan_case "plan, all four answers" \
 plan_case "plan, count out of range is unsure" \
 	'{"count":["9",0.9],"mode":["sandboxed",0.9],"route":["remote",0.9],"thinking":["low",0.9]}' \
 	3 - 'count=null' 'mode="sandboxed"'
-# A field under the threshold is the same refusal, on that field only, and it is named in words.
-plan_case "plan, a low-probability field is unsure" \
-	'{"count":["1",0.2],"mode":["bare",0.9],"route":["remote",0.9],"thinking":["high",0.9]}' \
-	3 - 'count=null' 'mode="bare"' 'thinking="high"'
-printf '%s' '{"count":["1",0.2],"mode":["bare",0.9],"route":["remote",0.9],"thinking":["high",0.9]}' >"$answer_file"
+# A field jev answered weakly is not a refusal: it takes the conservative value for that field
+# (one worker, the sandbox, remote, medium), the plan still exits 0, and the payload names it.
+plan_case "plan, a weak count takes the default and still exits 0" \
+	'{"count":["2",0.2],"mode":["sandboxed",0.9],"route":["remote",0.9],"thinking":["high",0.9]}' \
+	0 - 'count=1' 'answered.count="2"' 'defaults=["count"]'
+printf '%s' '{"count":["2",0.2],"mode":["sandboxed",0.9],"route":["remote",0.9],"thinking":["high",0.9]}' >"$answer_file"
+out=$("$bin/jev" plan "rename one helper" --json 2>"$work/stderr-plan")
+err=$(cat "$work/stderr-plan")
+if printf '%s' "$err" | grep -qF "jev: defaulted count 0.2"; then
+	pass "plan, the default line on stderr names the field and its probability"
+else
+	fail "plan, no default line on stderr: $err"
+fi
+# An answer jev was not offered is a broken answer, not a weak one: exit 3, and it is named.
+printf '%s' '{"count":["9",0.9],"mode":["bare",0.9],"route":["remote",0.9],"thinking":["high",0.9]}' >"$answer_file"
 out=$(timeout 30 "$bin/jev" plan "rename one helper" 2>&1)
 rc=$?
 if [ "$rc" = 3 ] && printf '%s' "$out" | grep -qF "unsure how to plan this spawn (count unusable)"; then
-	pass "plan, unsure says which field was unusable, in words"
+	pass "plan, an unusable field says which field it was, in words"
 else
-	fail "plan, unsure wording: exit $rc — $out"
+	fail "plan, unusable wording: exit $rc — $out"
 fi
 plan_case "plan, a route jev does not name is unsure" \
 	'{"count":["1",0.9],"mode":["sandboxed",0.9],"route":["both",0.9],"thinking":["low",0.9]}' \
@@ -460,22 +472,81 @@ else
 	fi
 fi
 
-# F. An unsure plan stops the spawn before anything exists: no spec, no space, no default count.
+# F. A plan that could not be decided. A weak field spawns on the conservative default and says
+#    which field it was; a dead model still refuses without the flag and spawns on the same
+#    defaults with it; the flag without a reason still refuses. The stub jev writes the payload,
+#    so each case is about what delegate does with a plan, not about what a model would say.
 cat >"$PI_BOSS_ROOT/bin/jev" <<'STUB'
 #!/usr/bin/env bash
-printf '{"count":null,"mode":null,"route":null,"thinking":null,"reason":"the task is too thin","confidence":0.2}\n'
-printf 'jev: unsure how to plan this spawn (confidence unusable) — ask the user\n' >&2
-exit 3
+case ${JEV_STUB_MODE:-dead} in
+weak)
+	printf '{"count":1,"mode":"sandboxed","route":"remote","thinking":"medium","defaults":["count"],"answered":{"count":"2"},"reason":"count 0.35, mode 0.9, route 0.9, thinking 0.8","confidence":0.35}\n'
+	exit 0
+	;;
+*)
+	printf 'jev: decision model unreachable (http://127.0.0.1:9/v1/systemone): fetch failed — ask the user\n' >&2
+	exit 3
+	;;
+esac
 STUB
 chmod +x "$PI_BOSS_ROOT/bin/jev"
-rm -f "$PI_BOSS_ROOT/state/delegations.json"
-spawn unsure-task --cwd "$area" "make it better"
-if [ "$SPAWN_RC" = 1 ] && printf '%s' "$spawn_out" | grep -qF "jev plan is unsure" &&
-	[ ! -f "$PI_BOSS_ROOT/specs/unsure-task.md" ] && [ ! -f "$PI_BOSS_ROOT/state/delegations.json" ]; then
-	pass "an unsure plan stops the spawn and creates nothing"
+rm -f "$PI_BOSS_ROOT/state/delegations.json" "$PI_BOSS_ROOT/specs/dead-plan.md" "$PI_BOSS_ROOT/specs/weak-plan.md"
+export JEV_STUB_MODE=dead
+spawn dead-plan --cwd "$area" "make it better"
+if [ "$SPAWN_RC" = 1 ] && printf '%s' "$spawn_out" | grep -qF "jev is unreachable or broken" &&
+	[ ! -f "$PI_BOSS_ROOT/specs/dead-plan.md" ] && [ ! -f "$PI_BOSS_ROOT/state/delegations.json" ]; then
+	pass "a dead model stops the spawn and creates nothing"
 else
-	fail "unsure plan: exit $SPAWN_RC — $spawn_out"
+	fail "dead model: exit $SPAWN_RC — $spawn_out"
 fi
+# The flag without a reason is still a refusal, and the message names what is missing.
+spawn dead-plan --cwd "$area" --override-jev "make it better"
+if [ "$SPAWN_RC" = 1 ] && printf '%s' "$spawn_out" | grep -qF "needs a non-empty --reason" &&
+	[ ! -f "$PI_BOSS_ROOT/specs/dead-plan.md" ]; then
+	pass "--override-jev without --reason still refuses"
+else
+	fail "override without a reason: exit $SPAWN_RC — $spawn_out"
+fi
+# With the flag and a reason the spawn goes through on the same defaults, and says so once.
+rm -f "$PI_BOSS_ROOT/state/decisions.jsonl"
+spawn dead-plan --cwd "$area" --override-jev --reason "the model is down and one worker is enough" "make it better"
+if [ "$SPAWN_RC" = 0 ] &&
+	printf '%s' "$spawn_out" | grep -qF "all four fields took their conservative default; using count=1 mode=sandboxed route=remote thinking=medium" &&
+	[ -f "$PI_BOSS_ROOT/specs/dead-plan.md" ]; then
+	pass "a dead model spawns on the defaults when --override-jev carries a reason"
+else
+	fail "dead model with override: exit $SPAWN_RC — $spawn_out"
+fi
+rows=$(grep -cF '"defaults":["count","mode","route","thinking"]' "$PI_BOSS_ROOT/state/decisions.jsonl" 2>/dev/null || true)
+if [ "${rows:-0}" = 4 ]; then
+	pass "all four decision rows name the four defaulted fields"
+else
+	fail "${rows:-0} of 4 decision rows carry the defaulted field names"
+fi
+if grep -qF 'Mode: `sandboxed` (defaulted)' "$PI_BOSS_ROOT/specs/dead-plan.md"; then
+	pass "the spec header says the mode was defaulted, not chosen by jev"
+else
+	fail "the spec header still claims jev chose the mode"
+fi
+# A weak answer is not a dead model: the spawn continues with no flag, and only the weak field is
+# named. jev's own answer stays on the row, so the log does not record the default as jev's.
+rm -f "$PI_BOSS_ROOT/state/decisions.jsonl" "$PI_BOSS_ROOT/state/delegations.json" "$PI_BOSS_ROOT/specs/weak-plan.md"
+export JEV_STUB_MODE=weak
+spawn weak-plan --cwd "$area" "make it better"
+if [ "$SPAWN_RC" = 0 ] &&
+	printf '%s' "$spawn_out" | grep -qF "jev defaulted count 0.35; using count=1 mode=sandboxed route=remote thinking=medium" &&
+	[ -f "$PI_BOSS_ROOT/specs/weak-plan.md" ]; then
+	pass "a weak count spawns on the default, without a flag, and says which field defaulted"
+else
+	fail "weak count: exit $SPAWN_RC — $spawn_out"
+fi
+if grep '"command":"count"' "$PI_BOSS_ROOT/state/decisions.jsonl" 2>/dev/null |
+	grep -q '"decision":"1".*"jev":"2".*"defaults":\["count"\]'; then
+	pass "the count row records jev's 2, the default 1, and the defaulted field"
+else
+	fail "count row: $(grep '"command":"count"' "$PI_BOSS_ROOT/state/decisions.jsonl" 2>/dev/null | tail -1)"
+fi
+unset JEV_STUB_MODE
 
 printf '\n%s\n' "$([ "$fails" = 0 ] && echo "spawn speed: ok" || echo "spawn speed: $fails failure(s)")"
 [ "$fails" = 0 ]

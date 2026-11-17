@@ -113,9 +113,10 @@ and the thinking effort together, for the exact task text — and records them a
 decision lines it always did. A `--mode` or `--thinking` from the caller is
 accepted only when it matches Jev's answer. A different one aborts the spawn and prints Jev's
 answer and its reason; overturning it needs `--override-jev --reason '<why>'`, and the
-override is recorded. A `local` route aborts the same way, pointing at `bin/local-run`. If Jev
-is unreachable or answers "unsure", the spawn stops instead of guessing, because that call
-belongs to the user.
+override is recorded. A `local` route aborts the same way, pointing at `bin/local-run`. A field
+Jev answers only weakly takes the conservative default (count 1, mode sandboxed, route remote,
+thinking medium), the spawn says which field defaulted and the decision line records it; an
+unoffered answer or a dead model still stops the spawn unless `--override-jev` carries a reason.
 
 Jev's count is started, not noted. A count of three is three spaces — `SLUG`, `SLUG-2`,
 `SLUG-3` — each with its own spec, its own report path and the same mode and thinking level;

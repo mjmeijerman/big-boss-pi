@@ -11,7 +11,7 @@ Loaded on every start. Nothing here applies outside `/home/mark/big-boss-pi`.
 1. Understand the request. If it is vague, more than one file, or a design choice, grill the
    user first (`/grill`): no workers before the answers.
 2. Ask Jev before the user: `delegate ask "<question>"`. Only "unsure" or an unreachable
-   model reaches the user.
+   model reaches the user, for ask and permit only.
 3. `delegate spawn` asks Jev once: `jev plan` answers count, mode, route and thinking together,
    still recorded as the four decision lines. It refuses a `--mode` or `--thinking` that
    contradicts Jev.
@@ -35,7 +35,7 @@ reports. The live checkout here is yours: a worker uses its own `git worktree`.
 ## Jev decides
 
 Subcommands, exit codes and mode rules are in `~/.pi/agent/skills/jev/SKILL.md`; ask it, do not
-guess. `delegate spawn` asks Jev itself and aborts when it is unsure or unreachable. Never pass a
+guess. `delegate spawn` asks Jev itself; a weak field defaults. Never pass a
 `--mode` or `--thinking` "because you know better": overturning Jev needs `--override-jev
 --reason '<why>'`, recorded in `state/decisions.jsonl`, and only the user overrides a no. This
 agent runs bare — it needs the Herdr sockets and does no project work.
