@@ -114,15 +114,19 @@
 # Every spawn asks Jev, unconditionally, for the count, the mode, the route (local or remote) and
 # the thinking effort — in one call (`jev plan`), because four questions about the same task are
 # one judgement and four latencies. One call, one usage line, and the same gates: every field is
-# validated the way its own subcommand validates it, and an unusable field or a dead model aborts
-# the spawn instead of guessing. The four answers are still recorded as four decision lines
-# (count, mode, route, thinking), each carrying jev's own answer. Routing is a refusal, not a
+# validated the way its own subcommand validates it, and an option Jev was not offered or a dead
+# model aborts the spawn instead of guessing. A field Jev answered only weakly is not a refusal:
+# it takes the conservative default (count 1, mode sandboxed, route remote, thinking medium), the
+# spawn says which field defaulted, and the four decision lines carry the field names in
+# `defaults`. The four answers are still recorded as four decision lines (count, mode, route,
+# thinking), each carrying jev's own answer. Routing is a refusal, not a
 # warning: a task Jev calls "local" stops the spawn and prints the cheaper bin/local-run command
 # to run instead. A caller's --mode or --thinking is accepted only when it matches Jev's answer
 # for that exact task text; otherwise the spawn aborts and prints Jev's answer. Overriding Jev — a
 # mode, a thinking level or a local route — needs --override-jev with a non-empty --reason, and the
-# override is recorded. If Jev is unreachable or unsure, the spawn aborts instead of guessing:
-# that decision belongs to the user. An "unsure" route is recorded and the spawn continues.
+# override is recorded. A dead model is still a refusal — unless --override-jev carried a reason,
+# which is the promise those refusal messages make and which makes every field take the same
+# default, recorded as defaulted. An "unsure" route is recorded and the spawn continues.
 #
 # Jev's count is honoured, not noted. A task that needs three workers starts three spaces,
 # `SLUG`, `SLUG-2`, `SLUG-3`, each with its own spec and report file, the same task text plus its
@@ -602,25 +606,60 @@ patch_already_in_trunk() {
 	return 1
 }
 
-# plan_jev <task text> [context] -- sets JEV_COUNT, JEV_MODE, JEV_ROUTE, JEV_THINKING,
-# JEV_REASON from ONE `jev plan` call, and dies if Jev will not answer for any of them.
+# plan_jev <task text> [context] [override-jev 1|0] [reason-given 1|0] -- sets JEV_COUNT,
+# JEV_MODE, JEV_ROUTE, JEV_THINKING, JEV_REASON, JEV_DEFAULTS, JEV_DEFAULTS_NOTE and the
+# JEV_ANSWER_* values from ONE `jev plan` call.
 #
 # One call instead of four: the four questions are one judgement about one task, and asking the
 # local model four times costs four latencies (~20-60s of spawn) for answers that agree with each
-# other anyway. The gates are unchanged — an unusable field, a low-confidence answer, or a dead
-# model is still a refusal, never a default — and the decision lines written by the caller are
-# still four, each carrying jev's own answer. The context lands on Jev's one usage line in
-# state/usage.jsonl, so the call can be tied to the worker or question that caused it.
+# other anyway. Two of the gates changed, and the rest did not. A field Jev answered weakly is no
+# longer a refusal: bin/jev hands back the conservative value for it (count 1, mode sandboxed,
+# route remote, thinking medium) and names it in `defaults`, so the spawn continues with one
+# worker and says which field defaulted — a weak count costs a worker, not the harness. A field
+# Jev answered with an option it was not offered, or a malformed response, a refused key and a
+# dead model, have no answer to work with at all: those still refuse, unless --override-jev came
+# with a non-empty --reason, which is exactly what the refusal message promises. With that flag
+# and reason every field takes the same default and the spawn continues.
+#
+# JEV_DEFAULTS is the space-separated names of the defaulted fields (empty when none) and
+# JEV_ANSWER_* is what Jev itself answered for such a field, empty when it answered nothing, so
+# the caller can write jev's answer and the defaulting down separately instead of recording the
+# default as jev's own. The decision lines written by the caller are still four. The context lands
+# on Jev's one usage line in state/usage.jsonl, so the call can be tied to the worker or question
+# that caused it.
 plan_jev() {
-	local text=$1 ctx=${2:-} out rc
-	out=$(PI_BOSS_CONTEXT="$ctx" "$BIN/jev" plan "$text" --json 2>&1) && rc=0 || rc=$?
+	local text=$1 ctx=${2:-} override=${3:-0} reason_given=${4:-0} out rc errf err why
+	errf=$(mktemp)
+	# stderr apart from stdout: the defaulted fields and their probabilities are named there, and
+	# stdout is the JSON the caller parses.
+	out=$(PI_BOSS_CONTEXT="$ctx" "$BIN/jev" plan "$text" --json 2>"$errf") && rc=0 || rc=$?
+	err=$(cat "$errf" 2>/dev/null)
+	rm -f "$errf"
+	JEV_COUNT="" JEV_MODE="" JEV_ROUTE="" JEV_THINKING="" JEV_REASON="" JEV_DEFAULTS="" JEV_DEFAULTS_NOTE=""
+	JEV_ANSWER_COUNT="" JEV_ANSWER_MODE="" JEV_ANSWER_ROUTE="" JEV_ANSWER_THINKING=""
 	if [ "$rc" -ne 0 ]; then
-		case $out in
-		*unreachable* | *"returned nothing"* | *"HTTP "* | *"outside JSON"*)
-			die "jev is unreachable or broken — refusing to guess. jev said: $out" ;;
+		case $err in
+		*unreachable* | *"returned nothing"* | *"HTTP "* | *"outside JSON"* | *"no API key"*) why=unreachable ;;
+		*) why=unsure ;;
+		esac
+		if [ "$override" = 1 ] && [ "$reason_given" != 1 ]; then
+			die "--override-jev needs a non-empty --reason: an override without a reason is a guess. jev said: $err"
+		fi
+		if [ "$override" = 1 ]; then
+			# The bypass the refusal message promises. Same four values bin/jev's DEFAULTS holds.
+			JEV_COUNT=1 JEV_MODE=sandboxed JEV_ROUTE=remote JEV_THINKING=medium
+			JEV_REASON="jev was $why"
+			JEV_DEFAULTS="count mode route thinking"
+			JEV_DEFAULTS_NOTE="jev was $why, so all four fields took their conservative default"
+			return 0
+		fi
+		case $why in
+		unreachable)
+			die "jev is unreachable or broken — refusing to guess. jev said: $err
+Re-run with --override-jev --reason '<why these defaults are good enough>' to spawn on the defaults anyway (count 1, mode sandboxed, route remote, thinking medium)." ;;
 		*)
-			die "jev plan is unsure, so the spawn stops here. jev said: $out
-Ask the user about the field it named. Only then re-run with --override-jev --reason '<why>'." ;;
+			die "jev plan is unsure, so the spawn stops here. jev said: $err
+Re-run with --override-jev --reason '<why these defaults are good enough>' to spawn on the defaults anyway (count 1, mode sandboxed, route remote, thinking medium)." ;;
 		esac
 	fi
 	JEV_COUNT=$(printf '%s' "$out" | json_field count)
@@ -628,8 +667,36 @@ Ask the user about the field it named. Only then re-run with --override-jev --re
 	JEV_ROUTE=$(printf '%s' "$out" | json_field route)
 	JEV_THINKING=$(printf '%s' "$out" | json_field thinking)
 	JEV_REASON=$(printf '%s' "$out" | json_field reason)
+	JEV_ANSWER_COUNT=$(printf '%s' "$out" | json_field answered.count)
+	JEV_ANSWER_MODE=$(printf '%s' "$out" | json_field answered.mode)
+	JEV_ANSWER_ROUTE=$(printf '%s' "$out" | json_field answered.route)
+	JEV_ANSWER_THINKING=$(printf '%s' "$out" | json_field answered.thinking)
+	# The field names are ours, not the model's: anything else in the payload is dropped, so the
+	# names cannot reach a decision row or the note as arbitrary text.
+	JEV_DEFAULTS=$(printf '%s' "$out" | json_field defaults | tr ',' '\n' | grep -xE 'count|mode|route|thinking' | paste -sd' ' - || true)
 	[ -n "$JEV_COUNT" ] && [ -n "$JEV_MODE" ] && [ -n "$JEV_ROUTE" ] && [ -n "$JEV_THINKING" ] \
 		|| die "jev plan gave no usable answer: $out"
+	if [ -n "$JEV_DEFAULTS" ]; then
+		# One note, naming each defaulted field with the probability that made it weak.
+		local named="" name prob
+		for name in $JEV_DEFAULTS; do
+			prob=$(printf '%s' "$JEV_REASON" | tr ',' '\n' | sed -n "s/^ *$name //p")
+			named="${named:+$named, }$name ${prob:-?}"
+		done
+		JEV_DEFAULTS_NOTE="jev defaulted $named"
+	fi
+}
+
+# defaults_json <space-separated field names> -- the `defaults` extra for the decision rows, or
+# nothing when no field defaulted. The names are already restricted to the four by plan_jev.
+defaults_json() {
+	local names=$1 out="" sep="" name
+	[ -n "$names" ] || return 0
+	for name in $names; do
+		out="$out$sep\"$name\""
+		sep=,
+	done
+	printf '{"defaults":[%s]}' "$out"
 }
 
 # record_decision <command> <task> <decision> <reason> <overridden true|false> <slug|-> [jev] [extra-json]
@@ -903,8 +970,9 @@ cmd_spawn() {
 	local jev_count jev_mode jev_route jev_effort plan_reason overridden=false
 	local count_reason mode_reason route_reason thinking_reason
 	local mode_overridden=false thinking_overridden=false route_overridden=false
-	local task_ctx="spawn:$slug"
-	plan_jev "$task" "$task_ctx"
+	local task_ctx="spawn:$slug" reason_given=0
+	if [ -n "${reason// /}" ]; then reason_given=1; fi
+	plan_jev "$task" "$task_ctx" "$override_jev" "$reason_given"
 	jev_count=$JEV_COUNT
 	jev_mode=$JEV_MODE
 	jev_route=$JEV_ROUTE
@@ -923,15 +991,40 @@ cmd_spawn() {
 	[ -n "$jev_level" ] || die "could not map jev's thinking effort '$jev_effort' to a level: $thinking_map"
 	jev_effort_level=$jev_level
 
+	# The fields that defaulted, and jev's own answer for them: the row says what jev said and
+	# `defaults` says why the decision differs from it. A field with no answer at all (a dead
+	# model) leaves `jev` empty, which `delegate stats` already counts as unknown rather than as
+	# agreement. The note is the one line that says which field defaulted, and to what.
+	local defaults_extra="" field
+	local ev_count_answer=$jev_count ev_mode_answer=$jev_mode ev_route_answer=$jev_route
+	local ev_thinking_answer=$jev_effort_level
+	if [ -n "$JEV_DEFAULTS" ]; then
+		defaults_extra=$(defaults_json "$JEV_DEFAULTS")
+		for field in $JEV_DEFAULTS; do
+			case $field in
+			count) ev_count_answer=$JEV_ANSWER_COUNT ;;
+			mode) ev_mode_answer=$JEV_ANSWER_MODE ;;
+			route) ev_route_answer=$JEV_ANSWER_ROUTE ;;
+			thinking)
+				ev_thinking_answer=""
+				if [ -n "$JEV_ANSWER_THINKING" ]; then
+					ev_thinking_answer=$(worker_thinking_level "$JEV_ANSWER_THINKING" | json_field level)
+				fi
+				;;
+			esac
+		done
+		printf '%s: note: %s; using count=%s mode=%s route=%s thinking=%s.\n' \
+			"$prog" "$JEV_DEFAULTS_NOTE" "$jev_count" "$jev_mode" "$jev_route" "$jev_effort" >&2
+	fi
+
 	# 2. A caller's mode and thinking level must agree with Jev for this exact task text, and a
 	#    task Jev calls local refuses: local work needs no space, no spec and no agent.
 	#    Jev's answer is recorded either way: a refusal is a decision too, and the audit line
 	#    says why nothing spawned. An override without a reason is a guess, so it refuses too.
-	local refusal="" refuse_mode=0 refuse_thinking=0 refuse_route=0 reason_given=0
+	local refusal="" refuse_mode=0 refuse_thinking=0 refuse_route=0
 	if [ -n "$mode" ] && [ "$mode" != "$jev_mode" ]; then refuse_mode=1; fi
 	if [ -n "$thinking" ] && [ "$thinking" != "$jev_level" ]; then refuse_thinking=1; fi
 	if [ "$jev_route" = local ]; then refuse_route=1; fi
-	if [ -n "${reason// /}" ]; then reason_given=1; fi
 
 	if [ "$override_jev" = 1 ] && [ "$reason_given" = 0 ]; then
 		refusal="--override-jev needs a non-empty --reason: an override without a reason is a guess"
@@ -957,10 +1050,10 @@ Forcing a remote worker needs --override-jev --reason '<why this cannot run loca
 	fi
 
 	if [ -n "$refusal" ]; then
-		record_decision mode "$task" "$jev_mode" "$mode_reason" false "-" "$jev_mode"
-		record_decision count "$task" "$jev_count" "$count_reason" false "-" "$jev_count"
-		record_decision route "$task" "$jev_route" "$route_reason" false "-" "$jev_route"
-		record_decision thinking "$task" "$jev_level" "$thinking_reason (jev effort $jev_effort → $jev_level)" false "-" "$jev_level"
+		record_decision mode "$task" "$jev_mode" "$mode_reason" false "-" "$ev_mode_answer" "$defaults_extra"
+		record_decision count "$task" "$jev_count" "$count_reason" false "-" "$ev_count_answer" "$defaults_extra"
+		record_decision route "$task" "$jev_route" "$route_reason" false "-" "$ev_route_answer" "$defaults_extra"
+		record_decision thinking "$task" "$jev_level" "$thinking_reason (jev effort $jev_effort → $jev_level)" false "-" "$ev_thinking_answer" "$defaults_extra"
 		die "$refusal"
 	fi
 
@@ -977,11 +1070,12 @@ Forcing a remote worker needs --override-jev --reason '<why this cannot run loca
 	fi
 
 	# 4. Record all four decisions before doing any work. `overridden` sits on the line whose
-	#    decision was actually overturned, and `jev` carries jev's own answer on every line.
-	record_decision mode "$task" "$mode" "$mode_reason" "$mode_overridden" "$slug" "$jev_mode"
-	record_decision count "$task" "$jev_count" "$count_reason" false "$slug" "$jev_count"
-	record_decision route "$task" "$jev_route" "$route_reason" "$route_overridden" "$slug" "$jev_route"
-	record_decision thinking "$task" "$jev_level" "$thinking_reason (jev effort $jev_effort → $jev_level)" "$thinking_overridden" "$slug" "$jev_effort_level"
+	#    decision was actually overturned, `jev` carries jev's own answer on every line, and
+	#    `defaults` names the fields jev was not sure enough about to decide.
+	record_decision mode "$task" "$mode" "$mode_reason" "$mode_overridden" "$slug" "$ev_mode_answer" "$defaults_extra"
+	record_decision count "$task" "$jev_count" "$count_reason" false "$slug" "$ev_count_answer" "$defaults_extra"
+	record_decision route "$task" "$jev_route" "$route_reason" "$route_overridden" "$slug" "$ev_route_answer" "$defaults_extra"
+	record_decision thinking "$task" "$jev_level" "$thinking_reason (jev effort $jev_effort → $jev_level)" "$thinking_overridden" "$slug" "$ev_thinking_answer" "$defaults_extra"
 
 	# The review ceiling is 4 workers (blip 21) and 8 live spaces is the hard stop. Jev's count is
 	# honoured or the spawn refuses: starting one worker for a three-worker task is a decision
@@ -1050,6 +1144,16 @@ Forcing a second worker in the same area needs --override-jev --reason '<why the
 	# overridden is the word "false" when nothing was overridden: test it, do not test for a value.
 	local overridden_note=""
 	if [ "$overridden" = true ]; then overridden_note=", overridden: $reason"; fi
+	# A defaulted field is not jev's choice, and the spec header says so: the worker reads what it
+	# was given, and "(jev)" over a value jev never chose is a claim that is not true.
+	local mode_src="jev" route_src="jev" thinking_src="jev" dfield
+	for dfield in $JEV_DEFAULTS; do
+		case $dfield in
+		mode) mode_src="defaulted" ;;
+		route) route_src="defaulted" ;;
+		thinking) thinking_src="defaulted" ;;
+		esac
+	done
 	# Acceptance mode rewrites the task section and adds one rule block. Everything else — the
 	# mission line, the worktree rule, the report shape — is the same worker, so it is the same
 	# template rather than a second one that drifts.
@@ -1110,7 +1214,7 @@ $position"
 You are the genie. Prove it runs.
 
 - Work in: \`$cwd\`. Report file: \`$report\`.
-- Mode: \`$mode\` (jev$overridden_note), route: $jev_route (jev), thinking: \`$jev_level\` (jev: $jev_effort)
+- Mode: \`$mode\` ($mode_src$overridden_note), route: $jev_route ($route_src), thinking: \`$jev_level\` ($thinking_src: $jev_effort)
 - Mission: who is better off and what shows it, in one line. Effort counts are cost, not progress.
 - Iteration: expect two or more cycles; you may throw this away.
 - Spec history: read the newest \`specs/archive/\` spec for this area first; it is the previous

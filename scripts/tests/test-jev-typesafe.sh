@@ -8,9 +8,11 @@
 #
 #   A. Happy plan: four confident answers in ONE request, exit 0, four usable fields, the response's
 #      own model id on the one usage line, and the key nowhere in the output.
-#   B. A field whose probability is under the threshold is unsure: exit 3, the field is named and
-#      null, the other three survive. JEV_MIN_CONFIDENCE moves the threshold.
-#   C. An answer outside the offered options is unusable, not passed through.
+#   B. A field whose probability is under the threshold takes the conservative default: exit 0,
+#      the field is the default value, the default line on stderr names the field and its
+#      probability, "defaults" names it in --json, and the other three keep jev's own answers. All
+#      four weak at once default together. JEV_MIN_CONFIDENCE moves the threshold.
+#   C. An answer outside the offered options is unusable, not passed through: exit 3.
 #   D. 401 is exit 3 and names the key, not the key's value.
 #   E. A timeout is exit 3 "unreachable" — the contract bin/delegate reads.
 #   F. A malformed body is exit 3, never a default answer.
@@ -213,26 +215,43 @@ else
 	fail "usage lines after one plan: $(wc -l <"$usage")"
 fi
 
-# --- B. a low-probability field is unsure, and only that field ---------------------------------
+# --- B. a weak field takes the conservative default; the plan still succeeds --------------------
 : >"$usage"
-answer_choices 2 0.9 sandboxed 0.95 remote 0.9 medium 0.45 >"$answers_file"
-out=$(timeout 30 "$bin/jev" plan "rename one helper" 2>&1) && rc=0 || rc=$?
-if [ "$rc" = 3 ] && printf '%s' "$out" | grep -qF "unsure how to plan this spawn (thinking unusable)"; then
-	pass "plan, a 0.45 field is unsure, named in words (exit 3)"
+answer_choices 2 0.35 sandboxed 0.95 remote 0.9 medium 0.9 >"$answers_file"
+out=$(timeout 30 "$bin/jev" plan "rename one helper" --json 2>"$work/stderr-plan") && rc=0 || rc=$?
+err=$(cat "$work/stderr-plan")
+if [ "$rc" = 0 ] && [ "$(payload_field "$out" count)" = 1 ] && [ "$(payload_field "$out" mode)" = '"sandboxed"' ] &&
+	[ "$(payload_field "$out" thinking)" = '"medium"' ]; then
+	pass "plan, a 0.35 count is exit 0 with count 1, and the other fields keep jev's answer"
 else
-	fail "plan low-probability field: exit $rc — $out"
+	fail "plan low-probability count: exit $rc — $out"
 fi
-out=$(timeout 30 "$bin/jev" plan "rename one helper" --json 2>&1) && rc=0 || rc=$?
-if [ "$(payload_field "$out" thinking)" = null ] && [ "$(payload_field "$out" count)" = 2 ] && [ "$(payload_field "$out" mode)" = '"sandboxed"' ]; then
-	pass "the unsure field is null, the other three survive"
+if [ "$(payload_field "$out" defaults)" = '["count"]' ] && [ "$(payload_field "$out" answered.count)" = '"2"' ]; then
+	pass 'the payload names the defaulted field and keeps the answer it replaced: "defaults":["count"], answered.count "2"'
 else
-	fail "per-field unsure: $(payload_field "$out" count) $(payload_field "$out" mode) $(payload_field "$out" thinking)"
+	fail "defaults payload: $(payload_field "$out" defaults) / answered $(payload_field "$out" answered.count) — $out"
 fi
-out=$(env JEV_MIN_CONFIDENCE=0.4 timeout 30 "$bin/jev" plan "rename one helper" --json 2>&1) && rc=0 || rc=$?
-if [ "$rc" = 0 ] && [ "$(payload_field "$out" thinking)" = '"medium"' ]; then
-	pass "JEV_MIN_CONFIDENCE=0.4 acts on the same answer"
+if printf '%s' "$err" | grep -qF "jev: defaulted count 0.35"; then
+	pass "stderr names the defaulted field and its probability"
+else
+	fail "no default line on stderr: $err"
+fi
+# The same answer at a lower threshold is decisive: nothing defaults and the count is jev's own.
+out=$(env JEV_MIN_CONFIDENCE=0.3 timeout 30 "$bin/jev" plan "rename one helper" --json 2>/dev/null) && rc=0 || rc=$?
+if [ "$rc" = 0 ] && [ "$(payload_field "$out" count)" = 2 ] && [ "$(payload_field "$out" defaults)" = '[]' ]; then
+	pass "JEV_MIN_CONFIDENCE=0.3 acts on the same answer, and nothing defaults"
 else
 	fail "JEV_MIN_CONFIDENCE override: exit $rc — $out"
+fi
+# All four weak: every field takes its default, the plan still succeeds, and each is named.
+answer_choices 3 0.2 bare 0.3 local 0.25 high 0.3 >"$answers_file"
+out=$(timeout 30 "$bin/jev" plan "rename one helper" --json 2>/dev/null) && rc=0 || rc=$?
+if [ "$rc" = 0 ] && [ "$(payload_field "$out" count)" = 1 ] && [ "$(payload_field "$out" mode)" = '"sandboxed"' ] &&
+	[ "$(payload_field "$out" route)" = '"remote"' ] && [ "$(payload_field "$out" thinking)" = '"medium"' ] &&
+	[ "$(payload_field "$out" defaults)" = '["count","mode","route","thinking"]' ]; then
+	pass "all four weak default together to 1, sandboxed, remote, medium (exit 0)"
+else
+	fail "all four default: exit $rc — $out"
 fi
 
 # --- C. an answer outside the offered options is unusable --------------------------------------

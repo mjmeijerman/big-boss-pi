@@ -22,11 +22,16 @@
  *
  * The rules do not relax with the transport: every answer is checked against the options that
  * were offered, and against JEV_MIN_CONFIDENCE (bin/jev-model.mjs) on the probability of the
- * chosen option. A field that fails either check is "unsure" and names the field, which stops a
- * spawn rather than guessing at that field while trusting the others. Exit 0 means every field
- * is usable — route is read from the answer (0 local, 1 remote, and a local route is still a
- * refusal made by the caller) — 3 means unsure, no key or the model is unreachable, 2 usage.
- * --json prints {"decision":…,"reason":…} instead of one line.
+ * chosen option. The two checks fail differently on purpose. An option we did not offer is a
+ * broken answer, not a weak one: exit 3, and the field is named. An offered option below the
+ * threshold is a weak answer, so plan takes the conservative default for that field (DEFAULTS
+ * below), names the field and its probability on stderr, and still exits 0 — a weak count should
+ * cost one worker, not the spawn. Every other subcommand keeps the stricter reading: ask, permit,
+ * mode, count, route and thinking are exit 3 at low confidence, because a default there would
+ * answer a question nobody asked. Route is read from the answer (0 local, 1 remote, and a local
+ * route is still a refusal made by the caller); 3 means unsure, no key or the model is
+ * unreachable; 2 usage. --json prints {"decision":…,"reason":…,"defaults":[…]} instead of one
+ * line.
  *
  * "thinking" answers an abstract effort, never a pi level name: which levels the concrete model
  * supports is a fact about that model, so the caller does the mapping (bin/delegate reads the
@@ -137,6 +142,13 @@ const OPTIONS = {
 	},
 };
 
+// Radar Vol. 35, blip 62 (decision models): the probability is recorded so a weak answer can be
+// seen as weak, and this is what a weak one does. A plan field jev is not sure about takes the
+// conservative value on the line for it — one worker, the sandbox, the remote route, medium
+// effort — the plan continues, and the caller is told which field defaulted. Stopping a spawn on
+// "probably one worker" is a queue, not a gate; the caller can still overrule the whole call.
+const DEFAULTS = { count: 1, mode: "sandboxed", route: "remote", thinking: "medium" };
+
 const INSTRUCTIONS = {
 	mode: "A worker will be started for this task. Which mode should it run in?",
 	count: "How many parallel workers does this task need? Answer with an integer from 1 to 4.",
@@ -231,13 +243,14 @@ async function request(kind, text) {
 }
 
 /**
- * pick — one Choice answer as {value, probability}. `probability` is the chosen option's own
+ * pick — one Choice answer as {value, probability, raw}. `probability` is the chosen option's own
  * probability, which is the number a caller acts on; a missing or non-numeric probability is
- * null, and a null or unoffered value is unusable — both mean "unsure", never a default.
+ * null. `value` is empty when jev answered something we did not offer (`raw` keeps what it said),
+ * and that is a broken answer rather than a weak one: see the plan branch below.
  */
 function pick(answers, id, offered) {
 	const answer = answers?.[id];
-	if (!answer || answer.type !== "choice") return { value: "", probability: null };
+	if (!answer || answer.type !== "choice") return { value: "", probability: null, raw: "" };
 	const raw = answer.choice === undefined || answer.choice === null ? "" : String(answer.choice);
 	const value = offered.some((option) => option === raw) ? raw : "";
 	const fromDistribution = answer.probabilities ? answer.probabilities[raw] : undefined;
@@ -247,7 +260,7 @@ function pick(answers, id, offered) {
 			: typeof answer.confidence === "number"
 				? answer.confidence
 				: null;
-	return { value, probability };
+	return { value, probability, raw };
 }
 
 /** noul — one Noul answer's probability of yes, 0..1. */
@@ -285,31 +298,65 @@ const answers = await request(opts.kind, opts.text);
 
 if (opts.kind === "plan") {
 	// Four questions, one request, one usage line. Each field is checked against the options it
-	// was offered and against its own probability, and a field that fails is null in the payload
-	// and named in the line, so a caller that overrides jev can see which judgement it overturns.
+	// was offered and against its own probability, and the two failures are not the same failure:
+	// an option we did not offer is a broken answer and stops the plan (exit 3, the field null and
+	// named), while an offered option that is only weakly probable takes DEFAULTS[field] and the
+	// plan still succeeds. That is the whole point of a probability: one weak count costs one
+	// worker, not a spawn, and the caller is told exactly which field it was.
 	const fields = {
 		count: pick(answers, "count", ["1", "2", "3", "4"]),
 		mode: pick(answers, "mode", ["bare", "sandboxed", "no-net"]),
 		route: pick(answers, "route", ["local", "remote"]),
 		thinking: pick(answers, "thinking", ["low", "medium", "high"]),
 	};
-	const bad = Object.entries(fields)
-		.filter(([, field]) => !usable(field))
-		.map(([name]) => name);
 	const reason = reasonOf(fields);
 	const weakest = Math.min(
 		...Object.values(fields).map((field) => (typeof field.probability === "number" ? field.probability : 0)),
 	);
-	const value = (name) => (bad.includes(name) ? null : fields[name].value);
+	const confidence = Math.round(weakest * 100) / 100;
+	// Unoffered, or no answer at all: the options are the contract, so this is not a weak answer.
+	// The field is null and named; the fields that did answer keep their answers, because a
+	// refusal should carry what was usable as well as what was not.
+	const bad = Object.entries(fields)
+		.filter(([, field]) => field.value === "")
+		.map(([name]) => name);
+	const raw = (name) => (bad.includes(name) ? null : name === "count" ? Number(fields.count.value) : fields[name].value);
+	if (bad.length)
+		emit(`unsure how to plan this spawn (${bad.join(", ")} unusable) — ask the user`, {
+			count: raw("count"),
+			mode: raw("mode"),
+			route: raw("route"),
+			thinking: raw("thinking"),
+			defaults: [],
+			reason,
+			confidence,
+		}, 3);
+	const defaults = Object.entries(fields)
+		.filter(([, field]) => !(typeof field.probability === "number" && field.probability >= MIN_CONFIDENCE))
+		.map(([name]) => name);
+	const value = (name) => (defaults.includes(name) ? DEFAULTS[name] : fields[name].value);
+	// What jev itself answered for each defaulted field, so a caller can record the answer and the
+	// default separately instead of writing the default down as jev's own judgement.
+	const answered = {};
+	for (const name of defaults) answered[name] = fields[name].value;
 	const payload = {
-		count: value("count") === null ? null : Number(fields.count.value),
+		count: Number(value("count")),
 		mode: value("mode"),
 		route: value("route"),
 		thinking: value("thinking"),
+		defaults,
+		answered,
 		reason,
-		confidence: Math.round(weakest * 100) / 100,
+		confidence,
 	};
-	if (bad.length) emit(`unsure how to plan this spawn (${bad.join(", ")} unusable) — ask the user`, payload, 3);
+	if (defaults.length) {
+		// One line, every defaulted field with the probability that made it weak, and the values
+		// that stand in for them. It goes to stderr so stdout stays the decision.
+		const named = defaults.map((name) => `${name} ${asNumber(fields[name].probability) ?? "?"}`).join(", ");
+		process.stderr.write(
+			`jev: defaulted ${named} (below ${MIN_CONFIDENCE}) — using count=${payload.count} mode=${payload.mode} route=${payload.route} thinking=${payload.thinking}\n`,
+		);
+	}
 	emit(
 		`count=${payload.count} mode=${payload.mode} route=${payload.route} thinking=${payload.thinking}`,
 		payload,
