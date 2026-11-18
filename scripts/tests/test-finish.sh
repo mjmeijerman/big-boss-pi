@@ -29,7 +29,11 @@ printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"%s/publish-calls"\nexit "${
 	>"$work/stub/publish"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"%s/herdr-calls"\nexit 0\n' "$work" \
 	>"$work/stub/herdr-app"
-printf '#!/usr/bin/env bash\nexit 0\n' >"$work/stub/hc"
+# `hc ls --all --json` is herdr's own answer about what still runs; FAKE_HC_LS is that answer, so a
+# case can show a terminal that is gone and one that is still there. No answer (empty) means hc
+# could not be read, and the record stands.
+printf '#!/usr/bin/env bash\ncase " $* " in *" ls "*) [ -n "${FAKE_HC_LS:-}" ] && printf "%%s\\n" "$FAKE_HC_LS" ;; esac\nexit 0\n' \
+	>"$work/stub/hc"
 chmod +x "$work/stub/publish" "$work/stub/herdr-app" "$work/stub/hc"
 export PATH=$work/stub:$PATH
 
@@ -51,6 +55,7 @@ reset() {
 	: >"$work/publish-calls"
 	: >"$work/herdr-calls"
 	: >"$PI_BOSS_ROOT/state/decisions.jsonl"
+	unset FAKE_HC_LS
 	printf '{"w1":{"space":"space-w1","cwd":"","branch":""}}\n' \
 		>"$PI_BOSS_ROOT/state/delegations.json"
 	cat >"$PI_BOSS_ROOT/reports/w1.md" <<'REPORT'
@@ -204,6 +209,66 @@ elif printf '%s' "$OUT" | grep -qE 'delegate (wipe|close) w1'; then
 	fail "delegate wait still prints the three-command tail — $OUT"
 else
 	pass "delegate wait's done-hint is the one finish command"
+fi
+
+# 7. A worker whose space was closed is not a working worker. The record says what spawn wrote;
+#    `hc ls --all --json` says what herdr still runs, and the list has to say which state it found:
+#    `gone` once the terminal is gone and no report was written, `working` only while herdr still
+#    lists it. Without this the list printed `working` for minutes after space.close answered ok.
+tracked() { # <terminal> — one tracked worker carrying that terminal, with no report yet
+	printf '{"w1":{"space":"space-w1","terminal":"%s","cwd":"","branch":""}}\n' "$1" \
+		>"$PI_BOSS_ROOT/state/delegations.json"
+	rm -f "$PI_BOSS_ROOT/reports/w1.md"
+}
+
+reset
+tracked t1
+export FAKE_HC_LS='{"hidden_finished":0,"terminals":[{"id":"t9","name":"somebody-else"}]}'
+run list
+if [ "$RC" != 0 ]; then
+	fail "delegate list exited $RC — $OUT"
+elif ! printf '%s' "$OUT" | grep -qE '^w1 .* gone '; then
+	fail "delegate list still reads a worker with no terminal as working — $OUT"
+else
+	pass "a worker whose herdr terminal is gone is listed as gone, not working"
+fi
+
+# herdr answering `[]` while the record names terminals is a herdr this side cannot see (another
+# core, a socket from a sandbox), not every worker dying: the record stands, so a sandboxed boss
+# does not call live workers dead.
+reset
+tracked t1
+export FAKE_HC_LS='{"hidden_finished":0,"terminals":[]}'
+run list
+if printf '%s' "$OUT" | grep -qE '^w1 .* gone '; then
+	fail "an empty herdr answer read every worker as gone — $OUT"
+else
+	pass "an empty herdr answer leaves the record standing rather than calling it gone"
+fi
+
+reset
+tracked t1
+export FAKE_HC_LS='{"hidden_finished":0,"terminals":[{"id":"t1","name":"delegate-truth-2"}]}'
+run list
+if printf '%s' "$OUT" | grep -qE '^w1 .* working '; then
+	pass "a worker herdr still lists, with no report, is working"
+else
+	fail "delegate list did not read a live terminal as working — $OUT"
+fi
+
+# 8. And `delegate wait` says it at once instead of sitting out its timeout, because a worker with
+#    no terminal will never write the report the wait is waiting for.
+reset
+tracked t1
+export FAKE_HC_LS='{"hidden_finished":0,"terminals":[{"id":"t9","name":"somebody-else"}]}'
+out=$(timeout 20 "$delegate" wait w1 --timeout 300 2>&1) && RC=0 || RC=$?
+OUT=$out
+if [ "$RC" = 0 ]; then
+	fail "delegate wait on a gone worker exited 0 — $OUT"
+elif ! printf '%s' "$OUT" | grep -qF 'is gone'; then
+	fail "delegate wait on a gone worker did not say it is gone — $OUT"
+else
+	pass "delegate wait on a worker whose terminal is gone fails now, not after the timeout"
 fi
 
 if [ "$fails" != 0 ]; then

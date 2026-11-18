@@ -42,7 +42,18 @@ case " $* " in
 	;;
 *" rev-parse --verify "*)
 	[ "${FAKE_NO_BRANCH:-0}" = 1 ] && exit 1
-	exit 0
+	# The branch's own head: publish reads it before the push and compares it with what origin
+	# answers afterwards, so a silent no-op push is caught.
+	printf '%s\n' "${FAKE_LOCAL_HEAD:-0123456789abcdef0123456789abcdef01234567}"
+	;;
+*" ls-remote "*)
+	# origin's answer, asked after every push. FAKE_REMOTE_HEAD different from FAKE_LOCAL_HEAD is a
+	# push the remote did not take — the case that printed a URL and pushed nothing.
+	if [ "${FAKE_LS_REMOTE_FAIL:-0}" = 1 ]; then
+		printf 'fatal: could not read from remote repository\n' >&2
+		exit 128
+	fi
+	printf '%s\trefs/heads/branch\n' "${FAKE_REMOTE_HEAD:-${FAKE_LOCAL_HEAD:-0123456789abcdef0123456789abcdef01234567}}"
 	;;
 *" rev-parse "*)
 	if [ "${FAKE_NOT_REPO:-0}" = 1 ]; then
@@ -160,7 +171,8 @@ new_case() {
 	export PI_BOSS_ROOT=$ROOTDIR
 	export FAKE_LOG=$CASE/calls
 	export FAKE_BODY_OUT=$CASE/body
-	unset FAKE_HEAD_BRANCH FAKE_NOT_REPO FAKE_PR_URL FAKE_PR_JSON FAKE_CHERRY FAKE_CHERRY_FAIL FAKE_TRAILERS FAKE_TITLE FAKE_ORIGIN_HEAD FAKE_NEW_PR_URL FAKE_NO_BRANCH FAKE_GH_FAIL FAKE_BRANCHES FAKE_WORKER_BRANCH FAKE_SLUG
+	unset FAKE_HEAD_BRANCH FAKE_NOT_REPO FAKE_PR_URL FAKE_PR_JSON FAKE_CHERRY FAKE_CHERRY_FAIL FAKE_TRAILERS FAKE_TITLE FAKE_ORIGIN_HEAD FAKE_NEW_PR_URL FAKE_NO_BRANCH FAKE_GH_FAIL FAKE_BRANCHES FAKE_WORKER_BRANCH FAKE_SLUG \
+		FAKE_LOCAL_HEAD FAKE_REMOTE_HEAD FAKE_LS_REMOTE_FAIL
 	printf '%s' "$REPORT_OK" >"$REPORTER"
 	cat >"$ROOTDIR/state/delegations.json" <<JSON
 {"worker":{"slug":"worker","cwd":"$REPO","branch":"feat/worker","spec":"$ROOTDIR/specs/worker.md","report":"$REPORTER"}}
@@ -624,6 +636,47 @@ run worker
 if [ "$rc" -eq 0 ]; then pass "an old closed PR beside an open one exits 0"; else fail "an old closed PR beside an open one exits 0 (exit $rc: $err)"; fi
 check "  ...the open one is the answer" printed '/pull/4'
 check "  ...nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
+
+# --- the push has to be proved, not announced ---------------------------------------------------
+#
+# Twice a publish printed a URL and exited 0 while `git ls-remote origin <branch>` still showed the
+# old head (fix/agent-pane-sandbox-pi at 0c9e28a, then fix/agent-pane-delta at 24e464f), and pushing
+# the same branch by hand worked immediately: the remote, the auth and the branch were all fine, the
+# publish had simply never asked whether its push landed. So the head is read before the push and
+# origin is asked for it afterwards, and a publish that skips the push because the guard answered
+# reads the remote too, because a URL on its own used to read as `published`.
+new_case push-approved
+export FAKE_LOCAL_HEAD=0123456789abcdef0123456789abcdef01234567 FAKE_REMOTE_HEAD=0123456789abcdef0123456789abcdef01234567
+run worker
+if [ "$rc" -eq 0 ]; then pass "a push the remote confirms still publishes"; else fail "a push the remote confirms still publishes (exit $rc: $err)"; fi
+check "  ...origin was asked for the branch head afterwards" calls '^git .*ls-remote .*origin refs/heads/feat/worker'
+check "  ...and the confirmed commit is named" said 'is at 0123456, the commit just pushed'
+
+new_case push-silent-noop
+export FAKE_LOCAL_HEAD=0123456789abcdef0123456789abcdef01234567 FAKE_REMOTE_HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+run worker
+if [ "$rc" -ne 0 ]; then pass "a push the remote never took fails the publish"; else fail "a push the remote never took fails the publish (exit $rc: $err)"; fi
+check "  ...the refusal names what origin holds" said 'origin/feat/worker is at deadbee'
+check "  ...and the commit it pushed" said 'not 0123456'
+check "  ...and says nothing was published" said 'nothing was published'
+check "  ...no PR was opened" bash -c '! grep -q "pr create" "$FAKE_LOG"'
+check "  ...and no PR URL is printed" bash -c "! printf '%s' \"$out\" | grep -q 'pull/'"
+
+new_case push-unconfirmed
+export FAKE_LS_REMOTE_FAIL=1
+run worker
+if [ "$rc" -ne 0 ]; then pass "a push whose head cannot be read back fails the publish"; else fail "a push whose head cannot be read back fails the publish (exit $rc: $err)"; fi
+check "  ...and the refusal says the push is unconfirmed" said 'unconfirmed'
+check "  ...no PR was opened" bash -c '! grep -q "pr create" "$FAKE_LOG"'
+
+new_case open-pr-behind
+export FAKE_PR_JSON='[{"number":12,"state":"OPEN","url":"https://github.com/example/repo/pull/12"}]'
+export FAKE_LOCAL_HEAD=0123456789abcdef0123456789abcdef01234567 FAKE_REMOTE_HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+run worker
+if [ "$rc" -ne 0 ]; then pass "an open PR whose branch is not on the remote is not a publish"; else fail "an open PR whose branch is not on the remote is not a publish (exit $rc: $err)"; fi
+check "  ...the open PR is still named" said '#12 is already open for feat/worker'
+check "  ...the branch head is named too" said 'the branch is at 0123456'
+check "  ...and nothing was pushed there" bash -c '! grep -q "git push" "$FAKE_LOG"'
 
 # --- a worker that was already wiped and closed -------------------------------------------------
 #
