@@ -1485,15 +1485,20 @@ $acceptance_block
 5. Commit on your branch and stop: no push, no PR, no merge, never on trunk — the boss publishes.
    You stay sandboxed: publishing is the boss's
    job, so it never needs host access from you.
-6. End every commit message with two trailers: \`Agent-Slug: $spawn_slug\` and \`Spec: $SPECS/$spawn_slug.md\`.
+6. Never edit a test to make your own change pass. A change that breaks a test is said in the
+   report and asked about — first line \`DECISION NEEDED: <may this test change, and why>\` — never
+   answered by weakening the assertion until it fits.
+7. End every commit message with two trailers: \`Agent-Slug: $spawn_slug\` and \`Spec: $SPECS/$spawn_slug.md\`.
    The commit-msg hook stamps both; check \`git log -1 --format=%B\` before you report.
-7. Write the report before you stop, in the form \`bin/publish\` reads:
+8. Write the report before you stop, in the form \`bin/publish\` reads:
    - Mission: the one-liner above, updated with what actually happened.
    - \`Review tier: High\` — plain label, tier first: low (docs, comments, formatting), medium (code,
      tests, migrations), high (extensions, AGENTS.md, .github/, git-hooks/, sandbox/, auth, secrets,
      money, deletion). Prose after the word is fine.
    - \`Test change: <why>\` — required when one diff changes a test and the source it tests; say what
      the test now pins. No test can tell it apart: say that instead.
+   - \`Now possible: <fill in: what a person can do now that they could not before>\` — one sentence.
+     No LOC, no PR count, no "refactor". \`bin/publish\` puts it in the PR body at Medium and High tier.
    - What now works: a command, a path, a passing test.
    - What changed: one \`Commit: <sha>\`, the files, the PR branch.
    - Still open, and the one next action.
@@ -1501,9 +1506,9 @@ $acceptance_block
    - \`## Thrown away\`: what you deleted on purpose, and why. "nothing" is fine.
    - \`## What I would do differently next time\`: one or two lines.
    Keep it short.
-8. No claim without the output; "not run" names what would run it.
-9. Then stay idle: the boss relays the report and closes the space — do not close it yourself.
-10. Must the user decide first? Make the first line "DECISION NEEDED: <the question>" and stop —
+9. No claim without the output; "not run" names what would run it.
+10. Then stay idle: the boss relays the report and closes the space — do not close it yourself.
+11. Must the user decide first? Make the first line "DECISION NEEDED: <the question>" and stop —
     only that keeps the space open.
 
 Evidence scaffold:

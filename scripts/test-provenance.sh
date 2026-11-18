@@ -209,10 +209,10 @@ elif ! grep -qF "Agent-Slug: template-check" "$spec" || ! grep -qF "Spec: " "$sp
 	fail "the spawn template does not name both trailers: $(grep -n 'Agent-Slug\\|Spec:' "$spec" 2>&1)"
 elif ! awk '/^[[:space:]]*job, so it never needs/ { if (prev ~ /publishing is the boss.s[[:space:]]*$/) ok = 1 } { prev = $0 } END { exit(ok ? 0 : 1) }' "$spec"; then
 	fail "the spawn template still splices the trailer rule into the middle of the publishing sentence"
-elif ! grep -qE '^6\. End every commit message with two trailers' "$spec"; then
+elif ! grep -qE '^7\. End every commit message with two trailers' "$spec"; then
 	fail "the trailer rule is not its own numbered item in the spawn template"
-elif [ "$(grep -cE '^[0-9]+\. ' "$spec")" != 10 ] || ! grep -qE '^10\. ' "$spec"; then
-	fail "the spawn template's rule list is not numbered 1 to 10: $(grep -oE '^[0-9]+\. ' "$spec" | tr '\n' ' ')"
+elif [ "$(grep -cE '^[0-9]+\. ' "$spec")" != 11 ] || ! grep -qE '^11\. ' "$spec"; then
+	fail "the spawn template's rule list is not numbered 1 to 11: $(grep -oE '^[0-9]+\. ' "$spec" | tr '\n' ' ')"
 elif ! grep -qF 'AGENT_SLUG=template-check' "$work/herdr-calls" 2>/dev/null; then
 	fail "AGENT_SLUG never reached the runner command: $(grep -o 'AGENT_SLUG=[^ ]*' "$work/herdr-calls" 2>&1 | head -2)"
 else

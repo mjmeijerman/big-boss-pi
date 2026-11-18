@@ -684,6 +684,51 @@ run worker
 refused "gh that cannot answer is refused, not read as no-PR" "could not list pull requests"
 check "  ...and nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
 
+# --- the readability line: what a person can do now ---------------------------------------------
+#
+# Beck's action point 9: an unreadable system is worse than a readable one, and a reviewer's five
+# minutes start with "what does this do". So the worker answers it in one sentence and the body
+# carries it above the tier and the diff, at Medium and High tier. Low skips it, and a report
+# written before the line existed publishes with none: the line is omitted with a note, never a
+# refusal, because an older report must not become unpublishable.
+
+now_case() { # <name> <tier> <the Now possible line, or ->
+	new_case "$1"
+	{
+		printf '**Mission**: the reviewer sees what now works before the diff.\n\n'
+		printf 'Review tier: %s\n\n' "$2"
+		[ "$3" = - ] || printf '%s\n\n' "$3"
+		printf '## Evidence\n\n```\ntest-publish: ok\n```\n'
+	} >"$REPORTER"
+	run worker
+}
+
+now_case high-carried 'High' 'Now possible: a worker says what now works in one sentence.'
+if [ "$rc" -eq 0 ]; then pass "a High-tier report with a Now possible line publishes"; else fail "a High-tier report with a Now possible line publishes (exit $rc: $err)"; fi
+check "  ...the body carries the bare label and the sentence" bash -c "grep -qxF 'Now possible: a worker says what now works in one sentence.' '$FAKE_BODY_OUT'"
+check "  ...and only once" bash -c "[ \$(grep -c '^Now possible:' '$FAKE_BODY_OUT') -eq 1 ]"
+check "  ...above the tier, where a reviewer reads first" bash -c "[ \$(grep -n '^Now possible:' '$FAKE_BODY_OUT' | cut -d: -f1) -lt \$(grep -n '^Review tier:' '$FAKE_BODY_OUT' | cut -d: -f1) ]"
+check "  ...and nothing was refused over it" bash -c "! printf '%s' '$err' | grep -q 'predates the rule'"
+
+now_case medium-markdown 'Medium' '**Now possible:** the body gate reads the line, not its markdown.'
+if [ "$rc" -eq 0 ]; then pass "a bolded '**Now possible:**' publishes"; else fail "a bolded '**Now possible:**' publishes (exit $rc: $err)"; fi
+check "  ...reduced to the bare label" bash -c "grep -qxF 'Now possible: the body gate reads the line, not its markdown.' '$FAKE_BODY_OUT'"
+
+now_case high-predates 'High' -
+if [ "$rc" -eq 0 ]; then pass "a High-tier report written before the rule still publishes"; else fail "a High-tier report written before the rule still publishes (exit $rc: $err)"; fi
+check "  ...with the line omitted, not invented" bash -c "! grep -q '^Now possible:' '$FAKE_BODY_OUT'"
+check "  ...and one note saying why, not an error" bash -c "printf '%s' '$err' | grep -q 'predates the rule'"
+check "  ...and the branch was still pushed" calls '^git .*push .*origin feat/worker'
+
+now_case medium-predates 'Medium' -
+if [ "$rc" -eq 0 ]; then pass "a Medium-tier report with no line publishes too"; else fail "a Medium-tier report with no line publishes (exit $rc: $err)"; fi
+check "  ...with the note" bash -c "printf '%s' '$err' | grep -q 'predates the rule'"
+
+now_case low-predates 'Low' -
+if [ "$rc" -eq 0 ]; then pass "a Low-tier report with no line publishes"; else fail "a Low-tier report with no line publishes (exit $rc: $err)"; fi
+check "  ...and says nothing about a line Low tier does not need" bash -c "! printf '%s' '$err' | grep -q 'predates the rule'"
+check "  ...and puts no line in the body" bash -c "! grep -q '^Now possible:' '$FAKE_BODY_OUT'"
+
 new_case already-exists
 export FAKE_PR_JSON='[{"number":5,"state":"OPEN","url":"https://github.com/example/repo/pull/5"}]'
 run worker
