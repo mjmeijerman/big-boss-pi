@@ -84,7 +84,14 @@
 #
 # Provenance is demanded in the shape the commit can still be given it in. A report's commit
 # must carry the `Agent-Slug` trailer, which is one `git commit --amend` away while the branch
-# is unmerged. A commit that is already in trunk cannot be amended — that is a rewrite of
+# is unmerged. The sha that is checked is the report's own commit, not the first sha it mentions:
+# a report quotes another branch's commit as evidence, which is what evidence is, and reading the
+# earliest mention refused a worker whose own commit sat two lines below it (learner-proof, PR
+# #164, quoted the learner's 6dbff2f38d8c from #159). So the reader prefers a `Commit:` line whose
+# sha carries this worker's trailer, then any sha the report names that carries it, then the
+# earliest one; and when none of them carries it, the refusal lists every sha it looked at with
+# what each one is, so the next reader sees at once that the report is quoting someone else. A
+# commit that is already in trunk cannot be amended — that is a rewrite of
 # trunk — so `delegate close <slug> --merged <pr-url-or-number>` is the documented escape, and
 # it closes on one of two verdicts, each with a warning and a row in state/decisions.jsonl
 # carrying slug, sha, pr and the reason. Provenance recorded after the fact is visible
@@ -533,12 +540,83 @@ report_placeholders() {
 	' < "$report"
 }
 
-# report_commit_sha <report> -- the commit sha the report records, empty when it records none.
-# A report names it on a line carrying the word "commit"; the sha is the longest run of hex
-# characters of 7 to 40 on that line, which is what a short and a full sha both look like.
-report_commit_sha() {
+# report_commit_candidates <report> -- every sha the report could be naming, in the order it names
+# them, one per line, deduplicated. Three shapes, because that is what a report writes: on a line
+# carrying the word "commit" (whatever label it uses), inside a backtick span anywhere (reports
+# write `460ec13` beside the prose), and therefore on a `Commit:` line as well. A short and a full
+# sha both look like 7 to 40 hex characters.
+#
+# All of them, not the first: a report quotes another branch's commit as evidence — that is what
+# evidence is — and a reader that takes the earliest mention picks the quoted one and refuses a
+# worker whose own commit is two lines further down. Which one is this worker's is a question for
+# report_commit_sha, which has the slug and the tree to answer it.
+report_commit_candidates() {
 	[ -f "${1:-}" ] || return 0
 	awk '
+		function hexes(s,   w) {
+			while (match(s, /[0-9a-f]+/)) {
+				w = substr(s, RSTART, RLENGTH)
+				if (length(w) >= 7 && length(w) <= 40) print w
+				s = substr(s, RSTART + RLENGTH)
+			}
+		}
+		{
+			line = tolower($0)
+			if (line ~ /commit/) hexes(line)
+			# A backtick span holding nothing but a sha is a name, not prose: `460ec13`.
+			rest = $0
+			while (match(rest, /`[^`]*`/)) {
+				span = tolower(substr(rest, RSTART + 1, RLENGTH - 2))
+				sub(/^[ \t]+/, "", span); sub(/[ \t]+$/, "", span)
+				if (span ~ /^[0-9a-f]{7,40}$/) print span
+				rest = substr(rest, RSTART + RLENGTH)
+			}
+		}
+	' "$1" | awk '!seen[$0]++'
+}
+
+# report_commit_labeled <report> -- the shas on a `Commit:` line, with or without a bullet and
+# with or without bold marks: the one label the spawn template tells a worker to write, and the
+# line that says "this is the commit that carries the work" rather than "this sha came up".
+report_commit_labeled() {
+	[ -f "${1:-}" ] || return 0
+	awk '
+		tolower($0) ~ /^[ \t]*(-[ \t]+)?[*_]*[ \t]*commit[*_]*[ \t]*:/ {
+			line = tolower($0)
+			while (match(line, /[0-9a-f]+/)) {
+				w = substr(line, RSTART, RLENGTH)
+				if (length(w) >= 7 && length(w) <= 40) print w
+				line = substr(line, RSTART + RLENGTH)
+			}
+		}
+	' "$1" | awk '!seen[$0]++'
+}
+
+# report_commit_sha <report> [slug] [cwd] -- the commit sha the report records, empty when it
+# records none. With a slug and a tree, the sha that belongs to THIS worker is preferred over the
+# one the report happens to name first:
+#
+#   a. a `Commit:` line whose sha resolves in cwd and carries `Agent-Slug: <slug>` — the label the
+#      template asks for, on the commit the worker says carries its work;
+#   b. any sha the report names that resolves in cwd and carries that trailer — the "What changed"
+#      list writes `- Commit: \`460ec13\``, and a report may name its commit only there;
+#   c. the sha this reader returned before the candidates existed (the first commit line's longest
+#      hex), then the earliest candidate of any shape. Same answer as yesterday for every report
+#      that has no sha of its own, so nothing that closes today starts failing.
+#
+# Without a slug and a tree the answer is (c): only the sha question is being asked.
+report_commit_sha() {
+	local report=${1:-} slug=${2:-} cwd=${3:-} c legacy
+	[ -f "$report" ] || return 0
+	if [ -n "$slug" ] && [ -n "$cwd" ] && [ -d "$cwd" ] && git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
+		for c in $(report_commit_labeled "$report"); do
+			if commit_carries_slug "$cwd" "$c" "$slug"; then printf '%s\n' "$c"; return 0; fi
+		done
+		for c in $(report_commit_candidates "$report"); do
+			if commit_carries_slug "$cwd" "$c" "$slug"; then printf '%s\n' "$c"; return 0; fi
+		done
+	fi
+	legacy=$(awk '
 		tolower($0) ~ /commit/ {
 			line = tolower($0); best = ""
 			while (match(line, /[0-9a-f]+/)) {
@@ -548,7 +626,9 @@ report_commit_sha() {
 			}
 			if (best != "") { print best; exit }
 		}
-	' "$1"
+	' "$report")
+	if [ -n "$legacy" ]; then printf '%s\n' "$legacy"; return 0; fi
+	report_commit_candidates "$report" | head -n 1
 }
 
 # commit_message <cwd> <sha> -- the full message of that commit, empty when the sha does not
@@ -556,6 +636,64 @@ report_commit_sha() {
 # was given, so a made-up sha fails instead of passing as a mystery.
 commit_message() {
 	git -C "${1:-}" log -1 --format=%B "${2:-}" 2>/dev/null
+}
+
+# commit_carries_slug <cwd> <sha> <slug> -- true when that commit resolves in that tree and its
+# message carries `Agent-Slug: <slug>`, this worker's own slug and not merely some trailer. A
+# trailer naming another worker ties the change to that worker; it says nothing about this one.
+commit_carries_slug() {
+	local msg
+	msg=$(commit_message "${1:-}" "${2:-}") || return 1
+	[ -n "$msg" ] || return 1
+	printf '%s\n' "$msg" | awk -v slug="${3:-}" '
+		# match(), not a bare pattern rule: mawk sets RSTART/RLENGTH only for match(), and
+		# commit_carries_slug is the whole question the close asks — it cannot depend on awk.
+		match($0, /^Agent-Slug:[ \t]*/) {
+			v = substr($0, RLENGTH + 1)
+			sub(/[ \t\r]+$/, "", v)
+			if (v == slug) { found = 1; exit }
+		}
+		END { exit(found ? 0 : 1) }'
+}
+
+# report_provenance_note <report> <slug> <cwd> <chosen> -- every sha the reader looked at and why
+# each one did not tie the change to this worker. Printed only when a close is refused, so the
+# refusal answers the question the next person actually has: is the report quoting another
+# branch's commit as evidence, and which line is this worker's own? A refusal that names one sha
+# out of four, and suggests amending it, sends them to amend a commit they do not own.
+report_provenance_note() {
+	local report=$1 slug=$2 cwd=$3 chosen=$4 c list n=0 shown=0 msg trailer state plural
+	list=$(report_commit_candidates "$report")
+	[ -n "$list" ] || return 0
+	for c in $list; do n=$((n + 1)); done
+	if [ "$n" = 1 ]; then plural=""; else plural="s"; fi
+	printf '%s: %s names %d commit sha%s; the reader took %s:\n' \
+		"$prog" "$report" "$n" "$plural" "$chosen" >&2
+	for c in $list; do
+		# Eight lines is a report's own shas; the rest are pasted output, and a refusal nobody
+		# reads to the end is the refusal this fixes. The count still says how many there were.
+		[ "$shown" -ge 8 ] && break
+		shown=$((shown + 1))
+		msg=$(commit_message "$cwd" "$c" 2>/dev/null || true)
+		if [ -z "$msg" ]; then
+			state="does not resolve in $cwd"
+		else
+			trailer=$(printf '%s\n' "$msg" | awk -F':[ \t]*' '/^Agent-Slug:/ { v = $2; sub(/[ \t\r]+$/, "", v); print v; exit }')
+			if [ -z "$trailer" ]; then
+				state="no Agent-Slug trailer"
+			elif [ "$trailer" = "$slug" ]; then
+				state="Agent-Slug: $trailer"
+			else
+				state="Agent-Slug: $trailer (not this worker)"
+			fi
+		fi
+		printf '    %s  %s\n' "$c" "$state" >&2
+	done
+	if [ "$n" -gt "$shown" ]; then
+		printf '    and %d more\n' "$((n - shown))" >&2
+	fi
+	printf '  A sha quoted as evidence is not provenance: put the sha of the commit that carries this worker\047s own work on a "Commit: <sha>" line and close again:\n' >&2
+	printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
 }
 
 # wipe_recorded <slug> — true when state/decisions.jsonl carries a wipe line for that slug,
@@ -1935,7 +2073,7 @@ cmd_close() {
 # commit to check by definition, and its own block above has already asked for the rest.
 if [ -z "$nothing_given" ] && [ -n "$cwd" ] && [ -d "$cwd" ] && git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
 	local sha msg
-	sha=$(report_commit_sha "$report")
+	sha=$(report_commit_sha "$report" "$slug" "$cwd")
 	if [ -z "$sha" ]; then
 		printf '%s: refusing to close %s: %s records no commit sha, so nothing ties the change to this worker.\n' "$prog" "$slug" "$report" >&2
 		printf 'Fix: add a line "Commit: <sha>" to the report naming the commit that carries the work, then close again:\n' >&2
@@ -1949,10 +2087,28 @@ if [ -z "$nothing_given" ] && [ -n "$cwd" ] && [ -d "$cwd" ] && git -C "$cwd" re
 		printf 'Fix: record the sha of the commit that carries the work, then close again:\n' >&2
 		printf '  git -C %q log -1 --format=%%H\n' "$cwd" >&2
 		printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
+		report_provenance_note "$report" "$slug" "$cwd" "$sha"
 		return 1
 	fi
+	# The trailer has to name THIS worker. A commit carrying another worker's Agent-Slug is a sha
+	# the report quotes, not provenance: it ties the change to that worker and says nothing about
+	# this one. merged_escape stays what it is — the path for a commit that landed with no trailer
+	# at all — so a wrong-slug commit is refused here with its own message rather than routed
+	# through a permission that exists for a different problem.
 	if ! printf '%s\n' "$msg" | grep -qE '^Agent-Slug:[[:space:]]*[^[:space:]]'; then
-		merged_escape "$slug" "$sha" "$cwd" "$merged" || return 1
+		if ! merged_escape "$slug" "$sha" "$cwd" "$merged"; then
+			report_provenance_note "$report" "$slug" "$cwd" "$sha"
+			return 1
+		fi
+	elif ! commit_carries_slug "$cwd" "$sha" "$slug"; then
+		printf '%s: refusing to close %s: %s records commit %s, and that commit carries %s, not Agent-Slug: %s — it ties the change to another worker.\n' \
+			"$prog" "$slug" "$report" "$sha" \
+			"$(printf '%s\n' "$msg" | sed -nE 's/^Agent-Slug:[[:space:]]*([^[:space:]]+).*/Agent-Slug: \1/p' | head -n 1)" "$slug" >&2
+		printf 'Fix: name the commit that carries this worker\047s own work on a "Commit: <sha>" line, then close again:\n' >&2
+		printf '  git -C %q log --format=%%h%%x09%%s -20\n' "$cwd" >&2
+		printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
+		report_provenance_note "$report" "$slug" "$cwd" "$sha"
+		return 1
 	fi
 fi
 

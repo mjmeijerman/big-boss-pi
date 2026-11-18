@@ -186,6 +186,12 @@ expect "close --nothing: reason, evidence, and no sha" 0 "nothing: ok" -- \
 #     on a fresh clone.
 expect "publish: refusals, body gates and the push it reports" 0 "test-publish: ok" -- \
 	bash "$root/scripts/tests/test-publish.sh"
+# 5m. Which sha a close reads, when a report names more than one. A report quotes another branch's
+#     commit as evidence, and the reader used to take the first one it found and refuse over a sha
+#     the worker does not own. Its own script because the answer depends on three commits in one
+#     throwaway repo and on the trailer each of them carries.
+expect "close reads the sha that belongs to this worker" 0 "close-provenance: ok" -- \
+	bash "$root/scripts/tests/test-close-provenance.sh"
 
 # 6. Routing is a refusal, not a warning. delegate reads jev from $PI_BOSS_ROOT/bin, so a
 #    fake jev there answers route=local without a model and without touching the real tree.
