@@ -32,8 +32,9 @@
 #
 # What it does, in order: the target repo's own body gate (`make pr-check BODY=<file>`, else
 # `scripts/pr-gate.sh --body <file>`, else skipped with a line saying so) — a red gate stops the
-# publish before anything leaves the machine; an existing PR for the branch prints its URL instead
-# of failing; then the branch is pushed to origin and the PR is opened against trunk.
+# publish before anything leaves the machine; then the branch's existing pull requests, asked once
+# across all states, so a branch that is already merged or already open never becomes a second PR;
+# then the branch is pushed to origin and the PR is opened against trunk.
 #
 # What it carries from the report into the body: the Mission line, the bare review tier, the
 # Evidence block, the Thrown away section when there is one, and the worker's own `Test change:`
@@ -45,12 +46,12 @@
 # in its own worktree, so a gate diffing the checkout alone sees trunk against trunk and answers
 # `unverifiable: no changed files`, refusing every publish. So the branch is named to the gate when
 # the checkout is not on it: `make pr-check BRANCH=<branch>`, or `scripts/pr-gate.sh --body
-# <file> --branch <branch>`. Whether the target's `make pr-check` takes the variable is detected
-# once, with a dry run: a sentinel branch is offered and the recipe make would run is read back —
-# if the sentinel is in it, the target expands BRANCH and gets the real branch; a target whose
-# recipe never mentions it is called exactly as before, so a gate that would choke on the variable
-# keeps working. Naming the branch is another way to see the diff, never a way to skip it: an
-# empty diff still refuses.
+# <file> --branch <branch>`. Whether the target takes it is detected once, before it is called: a
+# dry run for `make` (a sentinel branch is offered and the recipe make would run is read back — if
+# the sentinel is in it, the target expands BRANCH and gets the real branch), a grep of the
+# script's own argument parsing for the fallback flag. A target that never mentions the branch is
+# called exactly as before, so a gate that would choke on it keeps working. Naming the branch is
+# another way to see the diff, never a way to skip it: an empty diff still refuses.
 #
 # What it never does: merge, push trunk, force-push, or touch the worker's files. Pushing a
 # branch is not landing it — the merge stays the person's.
@@ -83,6 +84,7 @@ note() { printf '%s: %s\n' "$prog" "$*" >&2; }
 usage() {
 	printf 'usage: %s <slug> [--cwd DIR]\n' "$prog"
 	printf '  body gate: make pr-check BODY=<report body> [BRANCH=<worker branch>] — BRANCH is passed only when a dry run shows the recipe expands it, because a gate that diffs a named branch cannot verify a checkout sitting on trunk otherwise.\n'
+	printf '  duplicate guard: gh pr list --state all for the branch before anything is pushed — open or already-merged stops the publish, closed is named.\n'
 }
 slug=""
 lookup_cwd=""
@@ -249,8 +251,12 @@ if ! printf '%s\n' "$slugs" | grep -qE '^Agent-Slug:[[:space:]]*[^[:space:]]'; t
 fi
 
 # 5. gh has to be there before anything is pushed: a push that cannot be followed by a PR leaves
-# the branch uploaded and the person with a loose end.
-command -v gh >/dev/null 2>&1 || die "gh is not on PATH, so the branch would be pushed with no PR to follow it"
+# the branch uploaded and the person with a loose end. The duplicate guard needs gh too, so it is
+# skipped by name rather than quietly: a publish that never had a guard should say so.
+if ! command -v gh >/dev/null 2>&1; then
+	note "gh unavailable, duplicate guard skipped — gh is not on PATH"
+	die "gh is not on PATH, so the branch would be pushed with no PR to follow it"
+fi
 
 # The PR body, built from the report: mission verbatim, the tier, the evidence, and the thrown-away
 # section when the worker wrote one. The body gate and gh both read this file.
@@ -335,7 +341,15 @@ if [ -f "$cwd/Makefile" ] && grep -qE '^pr-check[[:space:]]*:' "$cwd/Makefile"; 
 		die "the body gate (make pr-check) failed, so nothing was pushed"
 	fi
 elif [ -x "$cwd/scripts/pr-gate.sh" ]; then
-	if [ -n "$gate_branch" ]; then
+	# The fallback script takes the branch as a flag, and only some versions have one. A repo whose
+	# pr-gate.sh has no --branch must not be handed a flag it treats as a path or refuses outright,
+	# so the flag is offered only when the script's own argument parsing mentions it — the same
+	# shape as the `make -n` probe above, one probe instead of a guess.
+	gate_flag=""
+	if [ -n "$gate_branch" ] && grep -qE -- '--branch[)=|[:space:]]' "$cwd/scripts/pr-gate.sh"; then
+		gate_flag=1
+	fi
+	if [ -n "$gate_flag" ]; then
 		note "body gate: $cwd/scripts/pr-gate.sh --body --branch $branch"
 		if ! (cd "$cwd" && ./scripts/pr-gate.sh --body "$body" --branch "$branch"); then
 			die "the body gate (scripts/pr-gate.sh --branch $branch) failed, so nothing was pushed"
@@ -350,16 +364,82 @@ else
 	note "body gate skipped: $cwd has no 'make pr-check' target and no scripts/pr-gate.sh"
 fi
 
-# 7. An existing PR is an answer, not an error: print it and stop without pushing again.
+# How many of the branch's commits are not already in trunk: ancestry first, then `git cherry`, which
+# marks a commit `-` when its patch is already upstream under another sha. That second half is not
+# decoration — this repo squash-merges, so a merged branch's own commit is never an ancestor of
+# trunk and a plain commit count reads every merged branch as new work. It is the same
+# squash-equivalence `delegate close --merged` already trusts. `unknown` when git cannot say, and
+# the caller then publishes exactly as it did before.
+new_commits() { # <cwd> <trunk> <branch>
+	local cwd=$1 trunk=$2 branch=$3 cherry mark sha n=0
+	git -C "$cwd" rev-list --count "refs/remotes/origin/$trunk..$branch" >/dev/null 2>&1 || {
+		printf 'unknown'
+		return 0
+	}
+	cherry=$(git -C "$cwd" cherry "refs/remotes/origin/$trunk" "$branch" 2>/dev/null) || {
+		printf 'unknown'
+		return 0
+	}
+	while read -r mark sha; do
+		case $mark in +) n=$((n + 1)) ;; esac
+	done <<<"$cherry"
+	printf '%s' "$n"
+}
+
+# 7. One PR per branch, asked once and before anything is pushed. An existing PR is an answer,
+# whatever state it is in: a proof run on a branch that was already merged opened a second PR that
+# a person had to close, so the branch is now asked about across all states.
+#   open            → print it, stop, nothing pushed;
+#   merged          → stop, unless the branch has commits the trunk does not: then this is a
+#                     re-publish of further work and it says so and carries on;
+#   closed unmerged → carry on, naming the old number so nobody reads the new PR as the first.
 # gh failing to answer is not "no PR exists": it is usually a missing login, and pushing first
-# would leave the branch uploaded with no PR behind it.
-if ! existing=$(cd "$cwd" && gh pr list --head "$branch" --state open --json url --jq '.[0].url' 2>/dev/null); then
+# would leave the branch uploaded with no PR behind it. That refusal is kept — the guard is the
+# only reason the branch is not pushed blind, so it is never the reason a publish fails.
+repo_slug=$(cd "$cwd" && gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)
+guard_args=(pr list --head "$branch" --state all --json number,state,url)
+[ -z "$repo_slug" ] || guard_args+=(--repo "$repo_slug")
+if ! pr_list=$(cd "$cwd" && gh "${guard_args[@]}" 2>&1); then
+	note "$pr_list"
 	die "gh could not list pull requests for $branch (is it authenticated?), so nothing was pushed"
 fi
-if [ -n "$existing" ]; then
-	note "a pull request for $branch already exists"
-	printf '%s\n' "$existing"
-	exit 0
+# The newest PR that matters: an open one beats a merged one beats a closed one, then the highest
+# number, so a re-published branch reads its latest attempt.
+pr_line=$(printf '%s' "$pr_list" | node -e '
+	const fs = require("fs");
+	let a = [];
+	try { a = JSON.parse(fs.readFileSync(0, "utf8") || "[]"); } catch { a = []; }
+	const rank = { OPEN: 0, MERGED: 1, CLOSED: 2 };
+	a = a.filter(p => p && p.number);
+	a.sort((x, y) => ((rank[x.state] ?? 3) - (rank[y.state] ?? 3)) || (y.number - x.number));
+	if (a[0]) process.stdout.write(`${a[0].number}\t${a[0].state}\t${a[0].url}`);')
+if [ -n "$pr_line" ]; then
+	IFS=$'\t' read -r pr_number pr_state pr_url <<<"$pr_line"
+	case $pr_state in
+	OPEN)
+		note "#$pr_number is already open for $branch: $pr_url"
+		printf '%s\n' "$pr_url"
+		exit 0
+		;;
+	MERGED)
+		ahead=$(new_commits "$cwd" "$trunk" "$branch")
+		case $ahead in
+		0)
+			note "$branch is already merged as #$pr_number — nothing to publish"
+			exit 0
+			;;
+		unknown)
+			note "$branch was merged as #$pr_number, and git cannot tell whether it carries work that is not in origin/$trunk; publishing it as a new pull request"
+			;;
+		*)
+			note "$branch was merged as #$pr_number; it carries $ahead commit(s) whose change is not in origin/$trunk, so they are published as a new pull request"
+			;;
+		esac
+		;;
+	CLOSED)
+		note "$branch's earlier pull request #$pr_number was closed without merge; opening a new one"
+		;;
+	esac
 fi
 
 # 8. Push the branch only. Never a force, never trunk.
