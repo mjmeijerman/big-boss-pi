@@ -7,6 +7,9 @@ reports/
 # dependencies
 node_modules/
 
+# a worker's worktree, cut inside the repo so the sandbox binds it
+.worktrees/
+
 # editors and OS junk
 .DS_Store
 Thumbs.db

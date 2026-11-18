@@ -172,9 +172,12 @@ is the boss's job, a worker stays sandboxed: it needs neither an ssh agent nor `
 report carries the PR URL once the boss has opened it, so the boss can relay it. A change with no
 PR is unfinished, however green it looks locally — merging stays the human's call.
 
-A worker cuts its own worktree (`git worktree add ../<slug>-worktree -b <branch>`) and never
-switches the boss's live checkout: `delegate spawn` records that checkout's branch, and
-`delegate close` warns, names both branches and checks the original back out when it moved.
+A worker cuts its own worktree inside the repo it works in (`git worktree add .worktrees/<slug>
+-b <branch>`) and never switches the boss's live checkout: `delegate spawn` records that
+checkout's branch, and `delegate close` warns, names both branches and checks the original back
+out when it moved. Inside, because the sandbox binds the repo and not its parent: at
+`../<slug>-worktree` the directory is created in the sandbox's own filesystem, dies with it, and
+leaves a `prunable` entry behind.
 
 A worker space is not kept around for browsing. The flow is: the worker writes
 `reports/<slug>.md` and stays idle, the agent relays the report to the user, and the space is

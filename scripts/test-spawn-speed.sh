@@ -21,7 +21,8 @@
 #   E. A generated spec stays under a stated byte ceiling. The worker reads that file before it
 #      reads the repo, so a template that grows back into a wall of prose is a slowdown nothing
 #      would notice. The fixture paths are folded to one character, so the number is about the
-#      template and not about where mktemp put the throwaway tree.
+#      template and not about where mktemp put the throwaway tree. The same fixture pins the
+#      worktree path inside the repo: outside the sandbox's bind, a worker's files vanish.
 #   F. A plan that could not be decided: a weak field spawns on its default and says so, a dead
 #      model refuses without a flag and spawns with one, and the flag without a reason refuses.
 #
@@ -469,6 +470,14 @@ else
 		fail "the plain spec carries the acceptance block, which only --acceptance should inline"
 	else
 		pass "the plain spec carries no acceptance block"
+	fi
+	# The worktree lives inside the repo the worker works in. The sandbox binds the repo, not its
+	# parent, so `../SLUG-worktree` is a directory that never exists on the host: three workers in
+	# a row left a `prunable` entry that way. Pin the path, not just the prose around it.
+	if grep -qF 'git worktree add .worktrees/' "$plain" && ! grep -qF '../SLUG-worktree' "$plain"; then
+		pass "the spec cuts the worker's worktree inside the repo, at .worktrees/SLUG"
+	else
+		fail "the spec does not cut the worktree at .worktrees/SLUG — a worker outside the bind loses its files: $(grep -n 'worktree add' "$plain" | head -2)"
 	fi
 fi
 
