@@ -40,12 +40,26 @@
 # entry, never a directory. That half is not gated on `gh`: a directory that is gone cannot come back
 # through a pull request, so it is pruned even when the open-PR question went unanswered.
 #
+# A directory that is still there is a checkout, and a dead branch is often held by one: every worker
+# that cut `.worktrees/SLUG` leaves its checkout behind, and `git branch -D` refuses the branch until
+# that checkout is gone, so the same three branches came back on every run. --apply removes the
+# checkout with `git worktree remove` in the same run, then deletes the branch. It never forces: a
+# checkout with changes the tool would destroy (modified or untracked files) keeps its branch and
+# names the worktree that held it.
+#
+# What outranks every proof is a live worker. state/delegations.json (`$PRUNE_DELEGATIONS`, default
+# `<boss root>/state/delegations.json`) lists the workers cmd_close has not deleted yet; a worktree
+# whose directory name or branch names one of them is kept, and so is a record of one whose directory
+# is gone. A registry that exists and cannot be read stops the run rather than delete without
+# protection. No registry file, no protection — a choice, and the run says so out loud.
+#
 # --apply prunes the dead worktree entries first and deletes the branches after: a merged branch can
 # still be held by an entry whose directory is gone, and `git branch -D` refuses it until that entry
 # is gone. One run finishes, where pruning last left the deletion for a second invocation.
 #
 #   exit 0  nothing to do, or the list was printed, or everything printed was deleted
-#   exit 2  bad usage, or no origin/<trunk> to compare against, or --apply without the second yes
+#   exit 2  bad usage, no origin/<trunk> to compare against, --apply without the second yes, or a
+#           worker registry that exists but cannot be read
 set -uo pipefail
 
 usage() {
@@ -54,6 +68,8 @@ usage() {
 	printf '  --cwd DIR    the checkout to look at (default: the current directory)\n' >&2
 	printf '  --apply      delete the branches and worktrees listed; asks first\n' >&2
 	printf '  --yes        skip the confirmation, for a script that has already decided\n' >&2
+	printf '  PRUNE_DELEGATIONS=FILE  worker registry to keep clear of (default <boss root>/state/delegations.json);\n' >&2
+	printf '               no registry, no protection: a file that is not there guards nothing\n' >&2
 	exit 2
 }
 
@@ -104,6 +120,57 @@ upstream="refs/remotes/origin/$trunk"
 current=$(git -C "$cwd" symbolic-ref --quiet --short HEAD 2>/dev/null) || current=""
 
 printf 'prune-refs: %s, trunk origin/%s\n' "$cwd" "$trunk"
+
+# --- which workers are still live ------------------------------------------------------------
+
+# The boss root is the checkout the registry belongs to, not the checkout this copy of the script
+# sits in: a worker runs its own worktree's script, and the workers being protected are the boss's.
+# `git rev-parse --git-common-dir` is absolute from a worktree and `.git` from the main checkout, so
+# the two spellings are the two cases.
+script_dir=$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)
+common=$(git -C "$script_dir/.." rev-parse --git-common-dir 2>/dev/null) || common=""
+case $common in
+/*) root=$(dirname -- "$common") ;;
+*) root=$(cd -- "$script_dir/.." && pwd) || root=$script_dir ;;
+esac
+delegations=${PRUNE_DELEGATIONS:-$root/state/delegations.json}
+
+# A slug in the registry is a worker that has not been closed: cmd_close deletes the entry when it
+# ends a space. Its checkout is the only directory that keeps the worker alive, so removing one of
+# those is the mistake that cost two spaces earlier. The registry is read before anything is
+# deleted, and unreadable means stopped, never unprotected.
+declare -A live_slug=()
+if [ -f "$delegations" ]; then
+	if ! command -v node >/dev/null 2>&1; then
+		die "cannot read the worker registry $delegations (node is not on PATH), so a live worker would not be protected"
+	fi
+	if ! live_slugs=$(node -e '
+		const fs = require("fs");
+		let j = {};
+		try { j = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch (e) { process.exit(3); }
+		Object.keys(j || {}).forEach((k) => process.stdout.write(k + "\n"));' "$delegations" 2>/dev/null); then
+		die "the worker registry $delegations is not readable JSON, so a live worker would not be protected"
+	fi
+	while IFS= read -r slug; do
+		[ -n "$slug" ] && live_slug[$slug]=1
+	done <<<"$live_slugs"
+fi
+
+# live_worker_for <path> <branch> — the slug of a live worker holding this worktree, or nothing.
+# A checkout is named after its slug (`<repo>/.worktrees/SLUG`, or the older `SLUG-worktree` beside
+# the repo) and a worker's branch ends in it, so every one of those spellings is tried.
+live_worker_for() {
+	local path=$1 branch=$2 base cand
+	base=$(basename -- "$path")
+	for cand in "$base" "${base%-worktree}" "${branch##*/}"; do
+		[ -n "$cand" ] || continue
+		if [ -n "${live_slug[$cand]:-}" ]; then
+			printf '%s' "$cand"
+			return 0
+		fi
+	done
+	return 0
+}
 
 # --- the open-PR question, asked once for every branch ------------------------------------------
 
@@ -198,9 +265,61 @@ while IFS= read -r name; do
 	[ -n "$name" ] && by_ancestry[$name]=1
 done < <(git -C "$cwd" branch --merged "$upstream" --format='%(refname:short)' 2>/dev/null)
 
-dead_branches=()
-declare -A dead_detail=()
+# --- which worktree entries are dead, and which hold a branch -------------------------------------
+
+# `git worktree list --porcelain` repeats `worktree <path>` and `branch refs/heads/<name>` per entry.
+# A path whose directory is gone is the only thing `git worktree prune` removes. A path that is still
+# there is a checkout, and a checkout is exactly what makes `git branch -D` refuse the branch it has.
+wt_paths=()
+wt_branches=()
+wt_path=""
+wt_branch=""
+while IFS= read -r line; do
+	case $line in
+	worktree\ *)
+		if [ -n "$wt_path" ]; then
+			wt_paths+=("$wt_path")
+			wt_branches+=("$wt_branch")
+		fi
+		wt_path=${line#worktree }
+		wt_branch=""
+		;;
+	branch\ refs/heads/*) wt_branch=${line#branch refs/heads/} ;;
+	esac
+done < <(git -C "$cwd" worktree list --porcelain 2>/dev/null)
+if [ -n "$wt_path" ]; then
+	wt_paths+=("$wt_path")
+	wt_branches+=("$wt_branch")
+fi
+
 kept=0
+declare -A wt_holder=() live_holds=()
+dead_worktrees=()
+for i in "${!wt_paths[@]}"; do
+	path=${wt_paths[$i]}
+	branch=${wt_branches[$i]}
+	slug=$(live_worker_for "$path" "$branch")
+	if [ -e "$path" ]; then
+		# The boss's own checkout is never removed here, whatever a proof says about its branch.
+		[ "$path" = "$cwd" ] && continue
+		[ -n "$slug" ] && live_holds[$path]=$slug
+		[ -n "$branch" ] && wt_holder[$branch]=$path
+	elif [ -n "$slug" ]; then
+		# A record of a live worker whose directory is gone: the worker may still be writing into
+		# it, and a pruned record is the one thing that makes the branch deletable. Keep it.
+		printf 'kept worktree %s: live worker %s holds it, so it is kept\n' "$path" "$slug"
+		kept=$((kept + 1))
+	else
+		dead_worktrees+=("$path")
+	fi
+done
+if [ ! -f "$delegations" ] && [ ${#wt_paths[@]} -gt 0 ]; then
+	printf 'prune-refs: no worker registry at %s, so no live worker is protected\n' "$delegations"
+fi
+
+dead_branches=()
+declare -A dead_detail=() wt_remove=()
+holder=""
 for name in $(git -C "$cwd" for-each-ref --format='%(refname:short)' refs/heads/); do
 	[ "$name" = "$trunk" ] && continue
 	subject=$(git -C "$cwd" log -1 --format=%s "$name" 2>/dev/null) || subject=""
@@ -264,23 +383,27 @@ for name in $(git -C "$cwd" for-each-ref --format='%(refname:short)' refs/heads/
 		kept=$((kept + 1))
 		continue
 	fi
+	# A branch a checkout still holds: the live worker comes first, then the changes git would
+	# destroy, and only a clean checkout of a dead branch is removed with it in the apply phase.
+	if [ -n "${wt_holder[$name]:-}" ]; then
+		holder=${wt_holder[$name]}
+		if [ -n "${live_holds[$holder]:-}" ]; then
+			printf 'kept branch %s (%s): live worker %s holds %s, so it is kept\n' \
+				"$name" "$subject" "${live_holds[$holder]}" "$holder"
+			kept=$((kept + 1))
+			continue
+		fi
+		if [ -n "$(git -C "$holder" status --porcelain 2>/dev/null)" ]; then
+			printf 'kept branch %s (%s): worktree %s holds uncommitted changes, so the branch is kept\n' \
+				"$name" "$subject" "$holder"
+			kept=$((kept + 1))
+			continue
+		fi
+		wt_remove[$name]=$holder
+	fi
 	dead_branches+=("$name")
 	dead_detail[$name]="($subject): $proof$note"
 done
-
-# --- which worktree entries are dead -----------------------------------------------------------
-
-# `git worktree list --porcelain` repeats a `worktree <path>` line per entry; a path whose directory
-# is gone is the only thing `git worktree prune` removes, so that is the only test here.
-dead_worktrees=()
-while IFS= read -r line; do
-	case $line in
-	worktree\ *)
-		path=${line#worktree }
-		[ -e "$path" ] || dead_worktrees+=("$path")
-		;;
-	esac
-done < <(git -C "$cwd" worktree list --porcelain 2>/dev/null)
 
 # --- print the plan, or do it ------------------------------------------------------------------
 
@@ -289,7 +412,12 @@ nworktree=${#dead_worktrees[@]}
 
 if [ "$apply" = 0 ]; then
 	for name in ${dead_branches[@]+"${dead_branches[@]}"}; do
-		printf 'would delete branch %s %s\n' "$name" "${dead_detail[$name]}"
+		if [ -n "${wt_remove[$name]:-}" ]; then
+			printf 'would delete branch %s %s and its worktree %s\n' \
+				"$name" "${dead_detail[$name]}" "${wt_remove[$name]}"
+		else
+			printf 'would delete branch %s %s\n' "$name" "${dead_detail[$name]}"
+		fi
 	done
 	for path in ${dead_worktrees[@]+"${dead_worktrees[@]}"}; do
 		printf 'would prune worktree %s\n' "$path"
@@ -335,6 +463,22 @@ if [ "$nworktree" -gt 0 ]; then
 	fi
 fi
 
+# The clean checkout of a dead branch is removed here, after the dead records and before the
+# branches: `git branch -D` refuses a branch a checkout holds, so the checkout goes first and one
+# run still finishes. Never --force: a checkout that git would not remove is a keep, and the branch
+# it holds is kept with it by the deletion below.
+removed_worktrees=0
+for name in ${dead_branches[@]+"${dead_branches[@]}"}; do
+	path=${wt_remove[$name]:-}
+	[ -n "$path" ] || continue
+	if out=$(git -C "$cwd" worktree remove "$path" 2>&1); then
+		printf 'removed worktree %s\n' "$path"
+		removed_worktrees=$((removed_worktrees + 1))
+	else
+		printf 'kept worktree %s: git refused (%s)\n' "$path" "$(printf '%s' "$out" | head -n 1)"
+	fi
+done
+
 # `git branch -D`, not -d: a squash-merged branch is not an ancestor of trunk, so -d refuses the
 # very branches this command exists for. The proof above is what makes force safe here. A branch a
 # live worktree still holds is a keep with git's own reason, not something to retry.
@@ -349,8 +493,11 @@ for name in ${dead_branches[@]+"${dead_branches[@]}"}; do
 	fi
 done
 
-if [ "$deleted_branches" = 0 ] && [ "$pruned_worktrees" = 0 ]; then
+if [ "$deleted_branches" = 0 ] && [ "$pruned_worktrees" = 0 ] && [ "$removed_worktrees" = 0 ]; then
 	printf 'summary: nothing deleted in %s, %d branch(es) kept\n' "$cwd" "$kept"
+elif [ "$removed_worktrees" -gt 0 ]; then
+	printf 'summary: deleted %d branch(es), pruned %d worktree(s), removed %d checkout(s), %d kept\n' \
+		"$deleted_branches" "$pruned_worktrees" "$removed_worktrees" "$kept"
 else
 	printf 'summary: deleted %d branch(es), pruned %d worktree(s), %d kept\n' \
 		"$deleted_branches" "$pruned_worktrees" "$kept"
