@@ -99,10 +99,13 @@ with key-shaped tokens redacted. The answer itself is never logged. Recording ca
 call: a failed write is swallowed.
 
 The same screen carries the jev scorecard: per decision kind (`mode`, `count`, `route`,
-`thinking`, `permit`, `in-flight`) how many rows carry jev's own answer, how many are unknown, how
-many were overridden, the override rate, and how many rows carried a field jev defaulted. A row
+`thinking`, `permit`) how many rows carry jev's own answer, how many are unknown, how many were
+overridden, the override rate, and how many rows carried a field jev defaulted. A row
 written before the `jev` field existed is unknown and stays out of the rate — it is never
-agreement. `in-flight` is the spawn cap, not a jev answer, so it is reported as a cap.
+agreement. The spawn cap — `in-flight` — is not a jev answer at all: the branch diff decides it
+(the worker's branch paths against the paths the task names, in `bin/delegate`), so it gets its
+own line saying how many cap checks were recorded, what each decided, and how many refused a
+spawn. Folded into the table it printed `0/24 … —`, which reads as a guard that never decides.
 
 **There is no agreement rate, and the screen says so.** A spawn that does not pass
 `--override-jev` copies jev's answer into the decision, so `decision` equals `jev` on every such
