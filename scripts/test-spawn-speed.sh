@@ -202,10 +202,14 @@ STUB
 cat >"$work/stub/herdr-app" <<'STUB'
 #!/usr/bin/env bash
 # A fresh space, tab, pane and terminal per space.new — distinct ids, so a second worker cannot
-# silently reuse the first one's space. status answers a focusable view; everything else is a no-op.
+# silently reuse the first one's space. status answers a focusable view; ls answers the window's
+# own list (FAKE_HERDR_LS), which is where a space's name and its id sit together; every `do` is
+# logged when HERDR_LOG names a file, which is how a case reads what was actually closed.
 case ${1:-} in
 status) printf '{"space":"s0","tab":"t0"}\n' ;;
+ls) [ -n "${FAKE_HERDR_LS:-}" ] && printf '%s\n' "$FAKE_HERDR_LS" ;;
 do)
+	[ -n "${HERDR_LOG:-}" ] && printf '%s\n' "$*" >>"$HERDR_LOG"
 	case ${2:-} in
 	space.new)
 		n=$(cat "${HERDR_COUNTER:-/dev/null}" 2>/dev/null || echo 0)
@@ -221,7 +225,11 @@ exit 0
 STUB
 cat >"$work/stub/hc" <<'STUB'
 #!/usr/bin/env bash
-# The banner marker immediately: the spawn's wait loop exits on its first read.
+# The banner marker immediately: the spawn's wait loop exits on its first read. `ls` answers herdr's
+# terminal list instead, when a case cares about the leftover `learn-*` spaces.
+case ${1:-} in
+ls) [ -n "${FAKE_HC_LS:-}" ] && printf '%s\n' "$FAKE_HC_LS"; exit 0 ;;
+esac
 printf 'escape interrupt\n'
 exit 0
 STUB
@@ -290,6 +298,30 @@ if [ "$SPAWN_RC" = 0 ] && [ "$names" = "solo-task" ] && [ -f "$PI_BOSS_ROOT/spec
 else
 	fail "count 1: exit $SPAWN_RC, slugs '$names' — $spawn_out"
 fi
+
+# B2b. A spawn reaps the learner space an earlier compaction left open: the `learn-*` space whose
+#      terminals are all finished is closed with the id the window names, and the worker the spawn
+#      actually starts still gets its space. Both, in one command.
+rm -f "$PI_BOSS_ROOT/state/delegations.json"
+export FAKE_HC_LS='{"hidden_finished":0,"terminals":[
+{"address":"t1","status":"done","where":"learn-07-08 / learn-07-08"},
+{"address":"t2","status":"done","where":"learn-07-08 / learn-07-08"}]}'
+export FAKE_HERDR_LS='{"spaces":[{"id":"sp-learn","name":"learn-07-08","folder":"/home/mark/.pi"}]}'
+: >"$work/herdr-log"
+export HERDR_LOG=$work/herdr-log
+JEV_STUB_COUNT=1 spawn reap-task --cwd "$area" "one small change"
+if [ "$SPAWN_RC" != 0 ]; then
+	fail "a spawn with a finished learn space exited $SPAWN_RC — $spawn_out"
+elif ! grep -qF "space.close --id sp-learn --confirmed true" "$work/herdr-log"; then
+	fail "the spawn did not reap the finished learn space: $(tr '\n' ';' <"$work/herdr-log")"
+elif ! grep -qF "space.new --name reap-task" "$work/herdr-log"; then
+	fail "the reap replaced the spawn's own space.new: $(tr '\n' ';' <"$work/herdr-log")"
+elif ! printf '%s' "$spawn_out" | grep -qF "reap: closed learn-07-08 (2 terminals, all done)"; then
+	fail "the reap did not report itself in one line — $spawn_out"
+else
+	pass "a spawn reaps the finished learn space and still starts its own worker"
+fi
+unset FAKE_HC_LS FAKE_HERDR_LS HERDR_LOG
 
 # B3. The live ceiling refuses a count that would cross it, instead of starting one.
 node -e '

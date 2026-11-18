@@ -24,15 +24,16 @@ mkdir -p "$PI_BOSS_ROOT/reports" "$PI_BOSS_ROOT/state" "$PI_BOSS_ROOT/specs" "$w
 
 # The fakes. `publish` is the one command finish calls out to: its exit code is the case, and its
 # log is how "nothing was published" is proved. `herdr-app` records the space.close, which is the
-# only way a worker's space goes away.
+# only way a worker's space goes away; `herdr-app ls` is the window's own list, the one place a
+# space's name and its id sit together, so FAKE_HERDR_LS is that answer.
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"%s/publish-calls"\nexit "${FAKE_PUBLISH_RC:-0}"\n' "$work" \
 	>"$work/stub/publish"
-printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"%s/herdr-calls"\nexit 0\n' "$work" \
+printf '#!/usr/bin/env bash\nif [ "${1:-}" = ls ]; then [ -n "${FAKE_HERDR_LS:-}" ] && printf "%%s\\n" "$FAKE_HERDR_LS"; exit 0; fi\nprintf "%%s\\n" "$*" >>"%s/herdr-calls"\nexit 0\n' "$work" \
 	>"$work/stub/herdr-app"
 # `hc ls --all --json` is herdr's own answer about what still runs; FAKE_HC_LS is that answer, so a
 # case can show a terminal that is gone and one that is still there. No answer (empty) means hc
-# could not be read, and the record stands.
-printf '#!/usr/bin/env bash\ncase " $* " in *" ls "*) [ -n "${FAKE_HC_LS:-}" ] && printf "%%s\\n" "$FAKE_HC_LS" ;; esac\nexit 0\n' \
+# could not be read, and the record stands. FAKE_HC_RC is a herdr that refuses outright.
+printf '#!/usr/bin/env bash\ncase " $* " in *" ls "*) [ -n "${FAKE_HC_LS:-}" ] && printf "%%s\\n" "$FAKE_HC_LS" ;; esac\nexit "${FAKE_HC_RC:-0}"\n' \
 	>"$work/stub/hc"
 chmod +x "$work/stub/publish" "$work/stub/herdr-app" "$work/stub/hc"
 export PATH=$work/stub:$PATH
@@ -55,7 +56,7 @@ reset() {
 	: >"$work/publish-calls"
 	: >"$work/herdr-calls"
 	: >"$PI_BOSS_ROOT/state/decisions.jsonl"
-	unset FAKE_HC_LS
+	unset FAKE_HC_LS FAKE_HERDR_LS FAKE_HC_RC
 	printf '{"w1":{"space":"space-w1","cwd":"","branch":""}}\n' \
 		>"$PI_BOSS_ROOT/state/delegations.json"
 	cat >"$PI_BOSS_ROOT/reports/w1.md" <<'REPORT'
@@ -269,6 +270,98 @@ elif ! printf '%s' "$OUT" | grep -qF 'is gone'; then
 	fail "delegate wait on a gone worker did not say it is gone — $OUT"
 else
 	pass "delegate wait on a worker whose terminal is gone fails now, not after the timeout"
+fi
+
+# 9. The `learn-*` spaces self-learn opens per compaction pile up and nobody closes them. A
+#    finished one is closed where herdr is already being talked to — at the top of a finish — with
+#    the id the window names, and a space that is not a finished `learn-*` is left alone.
+reset
+export FAKE_HC_LS='{"hidden_finished":0,"terminals":[
+{"address":"t1","status":"done","where":"learn-00-13 / learn-00-13"},
+{"address":"t2","status":"idle","where":"learn-00-13 / learn-00-13"},
+{"address":"t3","status":"done","where":"learner-gaps-rebase / learner-gaps-rebase"}]}'
+export FAKE_HERDR_LS='{"spaces":[
+{"id":"sp-learn","name":"learn-00-13","folder":"/home/mark/.pi"},
+{"id":"sp-other","name":"learner-gaps-rebase","folder":"/home/mark/.pi"}]}'
+run finish w1
+if [ "$RC" != 0 ]; then
+	fail "finish with a finished learn space exited $RC — $OUT"
+elif ! grep -qF "space.close --id sp-learn --confirmed true" "$work/herdr-calls"; then
+	fail "the finished learn space was not closed: $(tr '\n' ';' <"$work/herdr-calls")"
+elif grep -qF "space.close --id sp-other" "$work/herdr-calls"; then
+	fail "a space that is not a finished learn-* was closed: $(tr '\n' ';' <"$work/herdr-calls")"
+elif ! grep -qF "space.close --id space-w1" "$work/herdr-calls"; then
+	fail "the reap replaced the worker's own close: $(tr '\n' ';' <"$work/herdr-calls")"
+elif ! printf '%s' "$OUT" | grep -qF "reap: closed learn-00-13 (2 terminals, all done or idle)"; then
+	fail "the reap did not report itself in one line — $OUT"
+else
+	pass "a finished learn space is reaped with the id herdr names, and nothing else is closed"
+fi
+
+# 10. One terminal still working is one learner still running: the whole space stays. A reap that
+#     guessed here would end somebody's work, which is worse than a leftover space.
+reset
+export FAKE_HC_LS='{"hidden_finished":0,"terminals":[
+{"address":"t1","status":"done","where":"learn-00-14 / learn-00-14"},
+{"address":"t2","status":"working","where":"learn-00-14 / learn-00-14"}]}'
+export FAKE_HERDR_LS='{"spaces":[{"id":"sp-learn2","name":"learn-00-14","folder":"/home/mark/.pi"}]}'
+run finish w1
+if [ "$RC" != 0 ]; then
+	fail "finish with a live learner exited $RC — $OUT"
+elif grep -qF "sp-learn2" "$work/herdr-calls"; then
+	fail "a learn space with a working terminal was closed: $(tr '\n' ';' <"$work/herdr-calls")"
+elif printf '%s' "$OUT" | grep -qF "reap: closed"; then
+	fail "the reap claimed a close it did not make — $OUT"
+else
+	pass "one working terminal keeps the whole learn space open"
+fi
+
+# 11. A learn slug that is a live delegation is somebody's worker, whatever its terminals say.
+reset
+printf '{"w1":{"space":"space-w1","cwd":"","branch":""},"learn-00-15":{"space":"sp-learn3","cwd":"","branch":""}}\n' \
+	>"$PI_BOSS_ROOT/state/delegations.json"
+export FAKE_HC_LS='{"hidden_finished":0,"terminals":[{"address":"t1","status":"done","where":"learn-00-15 / learn-00-15"}]}'
+export FAKE_HERDR_LS='{"spaces":[{"id":"sp-learn3","name":"learn-00-15","folder":"/home/mark/.pi"}]}'
+run finish w1
+if [ "$RC" != 0 ]; then
+	fail "finish with a tracked learn slug exited $RC — $OUT"
+elif grep -qF "sp-learn3" "$work/herdr-calls"; then
+	fail "the reap closed a learn space that is a live delegation: $(tr '\n' ';' <"$work/herdr-calls")"
+else
+	pass "a learn space recorded in state/delegations.json survives the reap"
+fi
+
+# 12. hc refusing is not evidence about anything: nothing is closed, and the command still does
+#     its own job. One warning line names the skip, and no fake count is printed.
+reset
+export FAKE_HC_LS='{"hidden_finished":0,"terminals":[{"address":"t1","status":"done","where":"learn-00-16 / learn-00-16"}]}'
+export FAKE_HERDR_LS='{"spaces":[{"id":"sp-learn4","name":"learn-00-16","folder":"/home/mark/.pi"}]}'
+export FAKE_HC_RC=1
+run finish w1
+if [ "$RC" != 0 ]; then
+	fail "a failing hc changed finish's exit status: $RC — $OUT"
+elif grep -qF "sp-learn4" "$work/herdr-calls"; then
+	fail "the reap closed a space on an hc that never answered: $(tr '\n' ';' <"$work/herdr-calls")"
+elif ! printf '%s' "$OUT" | grep -qF "reap: skipped"; then
+	fail "the skip was silent — $OUT"
+else
+	pass "a failing hc closes nothing and leaves the command's own exit status alone"
+fi
+
+# 13. The reap is opt-out for anything that must see the ordinary paths untouched.
+reset
+export FAKE_HC_LS='{"hidden_finished":0,"terminals":[{"address":"t1","status":"done","where":"learn-00-17 / learn-00-17"}]}'
+export FAKE_HERDR_LS='{"spaces":[{"id":"sp-learn5","name":"learn-00-17","folder":"/home/mark/.pi"}]}'
+out=$(env DELEGATE_NO_REAP=1 "$delegate" finish w1 2>&1) && RC=0 || RC=$?
+OUT=$out
+if [ "$RC" != 0 ]; then
+	fail "finish with DELEGATE_NO_REAP=1 exited $RC — $OUT"
+elif grep -qF "sp-learn5" "$work/herdr-calls"; then
+	fail "DELEGATE_NO_REAP=1 still closed a learn space: $(tr '\n' ';' <"$work/herdr-calls")"
+elif printf '%s' "$OUT" | grep -qF "reap:"; then
+	fail "DELEGATE_NO_REAP=1 still reported a reap — $OUT"
+else
+	pass "DELEGATE_NO_REAP=1 makes no close call and says nothing"
 fi
 
 if [ "$fails" != 0 ]; then
