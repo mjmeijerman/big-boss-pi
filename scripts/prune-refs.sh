@@ -14,8 +14,8 @@
 #   * squash-equivalence: `git cherry origin/<trunk> <branch>` marks every one of its commits `-`,
 #     meaning the patch is already upstream under another sha; or
 #   * squash-merge: GitHub's pull request for that head is MERGED, the local head is the head that
-#     pull request merged (its `headRefOid`), and no commit on the branch was written after that
-#     merge.
+#     pull request merged (its `headRefOid`), and none of the commits the branch has that trunk does
+#     not was written after that merge.
 # The second is not decoration: this repo squash-merges, so a branch merged through a PR is never an
 # ancestor of trunk. It is the same check bin/publish's duplicate guard and `delegate close --merged`
 # trust. One `+` line — a commit whose patch is not in trunk, pushed or not — and the branch stays.
@@ -24,7 +24,11 @@
 # squashed into one: a merge commit has no patch to match, and the squashed commits were rewritten on
 # trunk, so `git cherry` marks them `+` and the branch was kept forever. There the evidence is the
 # pull request itself, and it has to promise three things at once — MERGED, the head here is the
-# head it merged, and nothing was committed after the merge. The head comes from the pull request,
+# head it merged, and nothing the branch wrote itself was committed after the merge. The branch's own
+# work is `git log <branch> --not origin/<trunk>`: the commits it has that trunk does not. The base
+# commits it was cut from are trunk's history, and trunk's tip can be a squash commit dated after
+# this branch's own mergedAt — dating the whole history read that as a late commit and kept a dead
+# branch forever. The head comes from the pull request,
 # not from `origin/<branch>`: the host deletes that remote branch when it merges, so a ref that is
 # gone proves nothing — a live remote-tracking ref that still equals the local head is accepted too,
 # because that is the common case and it means the same thing. Anything else the pull request cannot
@@ -246,7 +250,7 @@ squash_evidence() {
 			"$(printf '%s' "$head_oid" | cut -c1-7)" "$(printf '%s' "$local_head" | cut -c1-7)"
 		return 0
 	fi
-	worst=$(git -C "$cwd" log --format='%ct %H' "$branch" 2>/dev/null |
+	worst=$(git -C "$cwd" log --format='%ct %H' "$branch" --not "$upstream" 2>/dev/null |
 		awk -v m="$epoch" '$1 > m { print $1 " " $2; exit }') || worst=""
 	if [ -n "$worst" ]; then
 		read -r when after <<<"$worst"
