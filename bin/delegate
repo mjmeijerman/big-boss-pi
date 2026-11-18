@@ -601,6 +601,86 @@ merged_pr_ref() {
 		| head -n 1
 }
 
+# commit_in_trunk <cwd> <trunk> <sha> [name-landed] — is that commit's change in origin/<trunk>?
+#
+# The ONE implementation of "these commits are already in trunk", asked by the two commands that
+# used to answer it separately and disagreed about the same commit: publish's new_commits (how much
+# of a branch is not in trunk) and this file's merged_escape (a report's commit with no Agent-Slug
+# trailer). Both call it, so the answer cannot be one thing on the publish side and another on the
+# close side. It is git only — no `gh`, no network, no login — because a close has to answer
+# offline, and the publish side keeps the better message (a merged PR has a number to name).
+#
+# Prints one line, and returns 0 when the change is in trunk:
+#   in                       the commit itself is an ancestor of origin/<trunk>
+#   in <landed-sha>          not an ancestor, but its patch is upstream under that sha (a squash)
+#   notin                    git compared the patch and it is not in trunk
+#   reverted [<landed-sha>]  the patch is in trunk's history but the change is not in its tree
+#   fetch                    the commit's parent is not readable here, so there is no patch to compare
+#   unknown <why>            git could not compare it at all
+#
+# [name-landed] asks for the landed sha, which is what a close records: a row that says "trust me,
+# it is in" is what that record exists to avoid. It costs a walk over the commits trunk has that the
+# commit's branch point does not, so it runs only for the caller that writes the row.
+#
+# A `-` from git cherry is not the end of the answer: a landing that was later reverted is still
+# reachable from trunk's history, so the content is checked too (patch_already_in_trunk), and a
+# reverted change has not landed.
+commit_in_trunk() {
+	local cwd=$1 trunk=$2 sha=$3 want_landed=${4:-} full out rc flag wantid base landed c patch
+	full=$(git -C "$cwd" rev-parse --verify --quiet "$sha^{commit}" 2>/dev/null) || full=$sha
+	if git -C "$cwd" merge-base --is-ancestor "$full" "refs/remotes/origin/$trunk" 2>/dev/null; then
+		printf 'in'
+		return 0
+	fi
+	if ! git -C "$cwd" rev-parse --verify --quiet "$full^" >/dev/null 2>&1; then
+		printf 'fetch'
+		return 1
+	fi
+	out=$(git -C "$cwd" cherry "refs/remotes/origin/$trunk" "$full" 2>&1) && rc=0 || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		printf 'unknown %s' "$(printf '%s\n' "$out" | tail -n 1)"
+		return 1
+	fi
+	flag=$(printf '%s\n' "$out" | awk -v s="$full" '$2 == s { print $1; exit }')
+	case $flag in
+	-)
+		landed=""
+		if [ -n "$want_landed" ]; then
+			wantid=$(git -C "$cwd" show --format= "$full" 2>/dev/null | git -C "$cwd" patch-id --stable 2>/dev/null | awk 'NR == 1 { print $1 }')
+			base=$(git -C "$cwd" merge-base "$full" "refs/remotes/origin/$trunk" 2>/dev/null) || base=""
+			if [ -n "$wantid" ] && [ -n "$base" ]; then
+				for c in $(git -C "$cwd" rev-list "refs/remotes/origin/$trunk" "^$base" 2>/dev/null); do
+					patch=$(git -C "$cwd" show --format= "$c" 2>/dev/null | git -C "$cwd" patch-id --stable 2>/dev/null | awk 'NR == 1 { print $1 }')
+					if [ -n "$patch" ] && [ "$patch" = "$wantid" ]; then
+						landed=$c
+						break
+					fi
+				done
+			fi
+			if [ -z "$landed" ]; then
+				printf 'unknown git reports the patch as already applied upstream, but no commit in origin/%s since %s carries it, so the landed sha cannot be named' \
+					"$trunk" "${base:-the branch point}"
+				return 1
+			fi
+		fi
+		if ! patch_already_in_trunk "$cwd" "$trunk" "$full"; then
+			printf 'reverted%s' "${landed:+ $(git -C "$cwd" rev-parse --short "$landed" 2>/dev/null || printf '%s' "$landed")}"
+			return 1
+		fi
+		if [ -n "$landed" ]; then printf 'in %s' "$landed"; else printf 'in'; fi
+		return 0
+		;;
+	+) 
+		printf 'notin'
+		return 1
+		;;
+	*)
+		printf 'unknown git cherry named no patch for %s against origin/%s' "$full" "$trunk"
+		return 1
+		;;
+	esac
+}
+
 # merged_escape <slug> <sha> <cwd> <pr-arg> — the close path for a commit that is already in trunk,
 # where the Agent-Slug trailer can no longer be added without rewriting trunk.
 #
@@ -624,8 +704,7 @@ merged_pr_ref() {
 # The trunk side is read from origin/, never from the local branch: a local trunk can be behind or
 # ahead of what was actually merged, and "is this in trunk" has one meaning — the remote's.
 merged_escape() {
-	local slug=$1 sha=$2 cwd=$3 prarg=$4 full trunk short pr reason flag base want landed landed_short
-	local out rc c patch
+	local slug=$1 sha=$2 cwd=$3 prarg=$4 full trunk short pr reason verdict landed landed_short
 	full=$(git -C "$cwd" rev-parse --verify --quiet "$sha^{commit}" 2>/dev/null) || full=$sha
 	short=$(git -C "$cwd" rev-parse --short "$full" 2>/dev/null) || short=$full
 	if [ -z "$prarg" ]; then
@@ -646,74 +725,26 @@ merged_escape() {
 		printf 'Fix: fetch the remote first (%s), or amend the commit with its trailers and close again.\n' "git -C $cwd fetch origin" >&2
 		return 1
 	fi
-	if git -C "$cwd" merge-base --is-ancestor "$full" "refs/remotes/origin/$trunk" 2>/dev/null; then
+	# One answer to "is this change already in trunk", shared with publish's new_commits: this
+	# command used to run its own ancestry-then-`git cherry` check, and the two disagreed about the
+	# same commit. The last argument asks commit_in_trunk to name the landed sha, because the record
+	# written below has to say which two commits are the same change.
+	verdict=$(commit_in_trunk "$cwd" "$trunk" "$full" 1) || true
+	case $verdict in
+	in)
 		reason="commit $short carries no Agent-Slug trailer and is already in origin/$trunk, so the trailer cannot be added without rewriting trunk; provenance recorded after the fact from PR $pr"
 		printf '%s: warning: %s records commit %s, which has no Agent-Slug trailer. That commit is already in origin/%s (PR %s), so it cannot be amended without rewriting trunk; closing anyway and recording the exception in state/decisions.jsonl.\n' \
 			"$prog" "$slug" "$short" "$trunk" "$pr" >&2
 		record_decision provenance "$slug" merged "$reason" false "$slug" "" \
 			"$(printf '{"sha":"%s","pr":"%s","trunk":"origin/%s"}' "$full" "$pr" "$trunk")"
 		return 0
-	fi
-
-	# Not an ancestor, so the squash-merge question is open. git cannot compare a patch with
-	# upstream unless it can read the commit's diff, and that starts at its parent: a commit that
-	# exists only locally, or in a shallow clone, has no parent here, and no answer to compare. Say
-	# fetch instead of reading the silence as "not upstream".
-	if ! git -C "$cwd" rev-parse --verify --quiet "$full^" >/dev/null 2>&1; then
-		printf '%s: refusing to close %s: %s records commit %s with no Agent-Slug trailer, and --merged does not apply yet: %s cannot read that commit'"'"'s parent, so its patch cannot be compared with origin/%s — a commit whose history was never fetched looks exactly like this.\n' \
-			"$prog" "$slug" "$REPORTS/$slug.md" "$sha" "$cwd" "$trunk" >&2
-		printf 'Fix: fetch the remote first, then close again:\n' >&2
-		printf '  git -C %q fetch origin\n' "$cwd" >&2
-		printf '  %s close %s --merged %s\n' "$BIN/delegate" "$slug" "$prarg" >&2
-		return 1
-	fi
-	out=$(git -C "$cwd" cherry "refs/remotes/origin/$trunk" "$full" 2>&1) && rc=0 || rc=$?
-	if [ "$rc" -ne 0 ]; then
-		printf '%s: refusing to close %s: %s records commit %s with no Agent-Slug trailer, and --merged does not apply yet: git cherry could not compare the patch with origin/%s, so "not upstream" has not been established.\n' \
-			"$prog" "$slug" "$REPORTS/$slug.md" "$sha" "$trunk" >&2
-		printf 'git said: %s\n' "$(printf '%s\n' "$out" | tail -n 1)" >&2
-		printf 'Fix: fetch the remote first, then close again:\n' >&2
-		printf '  git -C %q fetch origin\n' "$cwd" >&2
-		printf '  %s close %s --merged %s\n' "$BIN/delegate" "$slug" "$prarg" >&2
-		return 1
-	fi
-	flag=$(printf '%s\n' "$out" | awk -v s="$full" '$2 == s { print $1; exit }')
-	case $flag in
-	-)
-		# git says an equivalent patch is already upstream. Name the landing commit, because a row
+		;;
+	in\ *)
+		# git says an equivalent patch is already upstream. The landed sha is named because a row
 		# that says "trust me, it is in" is exactly what this check exists to avoid: the record has
 		# to say which two commits are the same change.
-		want=$(git -C "$cwd" show --format= "$full" 2>/dev/null | git -C "$cwd" patch-id --stable 2>/dev/null | awk 'NR == 1 { print $1 }')
-		landed=""
-		base=$(git -C "$cwd" merge-base "$full" "refs/remotes/origin/$trunk" 2>/dev/null) || base=""
-		if [ -n "$want" ] && [ -n "$base" ]; then
-			for c in $(git -C "$cwd" rev-list "refs/remotes/origin/$trunk" "^$base" 2>/dev/null); do
-				patch=$(git -C "$cwd" show --format= "$c" 2>/dev/null | git -C "$cwd" patch-id --stable 2>/dev/null | awk 'NR == 1 { print $1 }')
-				if [ -n "$patch" ] && [ "$patch" = "$want" ]; then
-					landed=$c
-					break
-				fi
-			done
-		fi
-		if [ -z "$landed" ]; then
-			printf '%s: refusing to close %s: %s records commit %s with no Agent-Slug trailer, and --merged does not apply yet: git reports the patch as already applied upstream, but no commit in origin/%s since %s carries it, so the landed sha cannot be named and the record would say less than the check knows.\n' \
-				"$prog" "$slug" "$REPORTS/$slug.md" "$sha" "$trunk" "${base:-the branch point}" >&2
-			printf 'Fix: name the landed commit instead — put its sha on the report'"'"'s Commit: line and close again:\n' >&2
-			printf '  git -C %q log --oneline origin/%s\n' "$cwd" "$trunk" >&2
-			printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
-			return 1
-		fi
+		landed=${verdict#in }
 		landed_short=$(git -C "$cwd" rev-parse --short "$landed" 2>/dev/null) || landed_short=$landed
-		# A landing that was later reverted is still reachable from trunk, so cherry still says `-`.
-		# The content is what tells them apart, and a reverted change is not a landed change.
-		if ! patch_already_in_trunk "$cwd" "$trunk" "$full"; then
-			printf '%s: refusing to close %s: %s records commit %s with no Agent-Slug trailer, and --merged does not apply: git reports its patch as applied upstream, as %s, but the change is not in origin/%s'"'"'s tree any more — the shape of a landing that was later reverted, or of a squash whose neighbouring lines moved so far that the patch no longer un-makes cleanly. Either way git cannot certify it as landed, and a reverted change has not landed.\n' \
-				"$prog" "$slug" "$REPORTS/$slug.md" "$sha" "$landed_short" "$trunk" >&2
-			printf 'Fix: check the revert in origin/%s first. If the landing does stand, name the landed commit on the report'"'"'s Commit: line and close again:\n' "$trunk" >&2
-			printf '  git -C %q log --oneline origin/%s -- %s\n' "$cwd" "$trunk" "$(git -C "$cwd" diff-tree --no-commit-id --name-only -r "$full" 2>/dev/null | head -n 1)" >&2
-			printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
-			return 1
-		fi
 		reason="commit $short carries no Agent-Slug trailer and is not itself in origin/$trunk; the same change landed there as $landed_short from PR $pr, which git cherry marks as an applied patch (git patch-id --stable), so provenance is recorded after the fact against both shas"
 		printf '%s: warning: %s records commit %s, which has no Agent-Slug trailer. That commit is not in origin/%s itself, but the same change is, as %s (PR %s): git cherry reports its patch as already applied upstream. Closing anyway; state/decisions.jsonl records both shas, so the exception can be checked rather than trusted.\n' \
 			"$prog" "$slug" "$short" "$trunk" "$landed_short" "$pr" >&2
@@ -721,9 +752,22 @@ merged_escape() {
 			"$(printf '{"sha":"%s","landed":"%s","pr":"%s","trunk":"origin/%s","how":"patch-id"}' "$full" "$landed" "$pr" "$trunk")"
 		return 0
 		;;
-	+)
-		# git says the patch is not upstream. Two findings hide behind that `+`, and the fixes
-		# differ, so say which one this is: a squash that also touched neighbouring lines moved the
+	reverted\ *)
+		# The patch is reachable from trunk's history but the change is not in trunk's tree any
+		# more: a landing that was later reverted, or a squash whose neighbouring lines moved so far
+		# that the patch no longer un-makes cleanly. Either way git cannot certify it as landed, and
+		# a reverted change has not landed.
+		landed_short=${verdict#reverted }
+		printf '%s: refusing to close %s: %s records commit %s with no Agent-Slug trailer, and --merged does not apply: git reports its patch as applied upstream%s, but the change is not in origin/%s'"'"'s tree any more — the shape of a landing that was later reverted, or of a squash whose neighbouring lines moved so far that the patch no longer un-makes cleanly. Either way git cannot certify it as landed, and a reverted change has not landed.\n' \
+			"$prog" "$slug" "$REPORTS/$slug.md" "$sha" "${landed_short:+ as $landed_short}" "$trunk" >&2
+		printf 'Fix: check the revert in origin/%s first. If the landing does stand, name the landed commit on the report'"'"'s Commit: line and close again:\n' "$trunk" >&2
+		printf '  git -C %q log --oneline origin/%s -- %s\n' "$cwd" "$trunk" "$(git -C "$cwd" diff-tree --no-commit-id --name-only -r "$full" 2>/dev/null | head -n 1)" >&2
+		printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
+		return 1
+		;;
+	notin)
+		# git says the patch is not upstream. Two findings hide behind that, and the fixes differ,
+		# so say which one this is: a squash that also touched neighbouring lines moved the
 		# patch-id while the content went in, where a plain unlanded commit is one amendment away.
 		if patch_already_in_trunk "$cwd" "$trunk" "$full"; then
 			printf '%s: refusing to close %s: %s records commit %s with no Agent-Slug trailer, and --merged does not apply: git will not certify it as landed. Its change is already in origin/%s, but under a different patch-id — a squash that also touched neighbouring lines reads as not upstream in git cherry, so the content is in and git cannot prove it.\n' \
@@ -741,12 +785,26 @@ merged_escape() {
 		printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
 		return 1
 		;;
+	fetch)
+		# git cannot compare a patch with upstream unless it can read the commit's diff, and that
+		# starts at its parent: a commit that exists only locally, or in a shallow clone, has no
+		# parent here and no answer to compare. Say fetch instead of reading the silence as "not
+		# upstream".
+		printf '%s: refusing to close %s: %s records commit %s with no Agent-Slug trailer, and --merged does not apply yet: %s cannot read that commit'"'"'s parent, so its patch cannot be compared with origin/%s — a commit whose history was never fetched looks exactly like this.\n' \
+			"$prog" "$slug" "$REPORTS/$slug.md" "$sha" "$cwd" "$trunk" >&2
+		printf 'Fix: fetch the remote first, then close again:\n' >&2
+		printf '  git -C %q fetch origin\n' "$cwd" >&2
+		printf '  %s close %s --merged %s\n' "$BIN/delegate" "$slug" "$prarg" >&2
+		return 1
+		;;
 	*)
-		# Neither flag: git listed no patch for this commit, which is not a finding about trunk at
-		# all. Refuse and say so rather than let an unread answer pass as an answer.
-		printf '%s: refusing to close %s: %s records commit %s with no Agent-Slug trailer, and --merged does not apply: git cherry named no patch for %s against origin/%s, so nothing has been established about that commit.\n' \
-			"$prog" "$slug" "$REPORTS/$slug.md" "$sha" "$full" "$trunk" >&2
-		printf 'Fix: fetch the remote (%s), or amend the commit with its trailers and close again.\n' "git -C $cwd fetch origin" >&2
+		# Neither answer: git could not read the patch at all, which is not a finding about trunk.
+		# Refuse and say what git said rather than let an unread answer pass as an answer.
+		printf '%s: refusing to close %s: %s records commit %s with no Agent-Slug trailer, and --merged does not apply yet: git could not compare its patch with origin/%s (%s), so "not upstream" has not been established.\n' \
+			"$prog" "$slug" "$REPORTS/$slug.md" "$sha" "$trunk" "${verdict#unknown }" >&2
+		printf 'Fix: fetch the remote first, then close again:\n' >&2
+		printf '  git -C %q fetch origin\n' "$cwd" >&2
+		printf '  %s close %s --merged %s\n' "$BIN/delegate" "$slug" "$prarg" >&2
 		return 1
 		;;
 	esac

@@ -277,6 +277,20 @@ if [ -n "$lookup" ]; then
 		fi
 		;;
 	0)
+		# A worker with no branch is not necessarily a worker that did nothing. prune-refs deletes a
+		# branch whose pull request merged, and a close deletes the delegation entry, so the second
+		# `delegate finish` on a merged worker finds neither — only the report, and trunk itself. The
+		# report's own `Commit:` line is then the only thing naming the work, and when that change is
+		# already in origin/<trunk> the question is answered: there is nothing left to publish. The
+		# verdict is commit_in_trunk's, the same one the merged-PR guard above trusts, so this cannot
+		# call a commit landed that the close would refuse — and it needs no `gh`, so an offline tree
+		# still answers it.
+		worker_sha=$(report_commit_sha "$report")
+		if [ -n "$worker_sha" ] && commit_in_trunk "$cwd" "$trunk" "$worker_sha" >/dev/null; then
+			note "no local branch in $cwd carries 'Agent-Slug: $slug' any more; prune-refs deletes a merged worker's branch and a close drops its delegation entry"
+			note "$report names commit $worker_sha, and that change is already in origin/$trunk — nothing to publish"
+			exit 0
+		fi
 		die "no branch in $cwd carries a commit with 'Agent-Slug: $slug', so nothing ties a branch to this worker"
 		;;
 	*)
@@ -413,25 +427,32 @@ else
 	note "body gate skipped: $cwd has no 'make pr-check' target and no scripts/pr-gate.sh"
 fi
 
-# How many of the branch's commits are not already in trunk: ancestry first, then `git cherry`, which
+# How many of the branch's commits are not already in trunk. The answer is `commit_in_trunk`'s, per
+# commit — the one implementation of that question, shared with `delegate close`'s merged check,
+# which used to answer it separately and disagree. It is ancestry first, then `git cherry`, which
 # marks a commit `-` when its patch is already upstream under another sha. That second half is not
 # decoration — this repo squash-merges, so a merged branch's own commit is never an ancestor of
-# trunk and a plain commit count reads every merged branch as new work. It is the same
-# squash-equivalence `delegate close --merged` already trusts. `unknown` when git cannot say, and
-# the caller then publishes exactly as it did before.
+# trunk and a plain commit count reads every merged branch as new work. `unknown` when git cannot
+# say, and the caller then publishes exactly as it did before.
 new_commits() { # <cwd> <trunk> <branch>
-	local cwd=$1 trunk=$2 branch=$3 cherry mark sha n=0
-	git -C "$cwd" rev-list --count "refs/remotes/origin/$trunk..$branch" >/dev/null 2>&1 || {
+	local cwd=$1 trunk=$2 branch=$3 sha n=0 set verdict
+	set=$(git -C "$cwd" rev-list "refs/remotes/origin/$trunk..$branch" 2>/dev/null) || {
 		printf 'unknown'
 		return 0
 	}
-	cherry=$(git -C "$cwd" cherry "refs/remotes/origin/$trunk" "$branch" 2>/dev/null) || {
-		printf 'unknown'
-		return 0
-	}
-	while read -r mark sha; do
-		case $mark in +) n=$((n + 1)) ;; esac
-	done <<<"$cherry"
+	while read -r sha; do
+		[ -n "$sha" ] || continue
+		if verdict=$(commit_in_trunk "$cwd" "$trunk" "$sha"); then
+			continue
+		fi
+		case $verdict in
+		notin | reverted*) n=$((n + 1)) ;;
+		*)
+			printf 'unknown'
+			return 0
+			;;
+		esac
+	done <<<"$set"
 	printf '%s' "$n"
 }
 
