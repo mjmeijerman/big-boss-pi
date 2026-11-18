@@ -35,6 +35,11 @@ cat >"$work/stub/git" <<'FAKE'
 printf 'git %s\n' "$*" >>"${FAKE_LOG:-/dev/null}"
 if [ "${1:-}" = -C ]; then shift 2; fi
 case " $* " in
+*" symbolic-ref --quiet --short HEAD"*)
+	# The checkout's own branch: what publish compares the published branch against.
+	[ -n "${FAKE_HEAD_BRANCH:-}" ] || exit 1
+	printf '%s\n' "$FAKE_HEAD_BRANCH"
+	;;
 *" rev-parse --verify "*)
 	[ "${FAKE_NO_BRANCH:-0}" = 1 ] && exit 1
 	exit 0
@@ -139,7 +144,7 @@ new_case() {
 	export PI_BOSS_ROOT=$ROOTDIR
 	export FAKE_LOG=$CASE/calls
 	export FAKE_BODY_OUT=$CASE/body
-	unset FAKE_NOT_REPO FAKE_PR_URL FAKE_TRAILERS FAKE_TITLE FAKE_ORIGIN_HEAD FAKE_NEW_PR_URL FAKE_NO_BRANCH FAKE_GH_FAIL FAKE_BRANCHES FAKE_WORKER_BRANCH FAKE_SLUG
+	unset FAKE_HEAD_BRANCH FAKE_NOT_REPO FAKE_PR_URL FAKE_TRAILERS FAKE_TITLE FAKE_ORIGIN_HEAD FAKE_NEW_PR_URL FAKE_NO_BRANCH FAKE_GH_FAIL FAKE_BRANCHES FAKE_WORKER_BRANCH FAKE_SLUG
 	printf '%s' "$REPORT_OK" >"$REPORTER"
 	cat >"$ROOTDIR/state/delegations.json" <<JSON
 {"worker":{"slug":"worker","cwd":"$REPO","branch":"feat/worker","spec":"$ROOTDIR/specs/worker.md","report":"$REPORTER"}}
@@ -310,6 +315,97 @@ check "the body carries the Thrown away section" bash -c "grep -qF '## Thrown aw
 check "nothing was merged" bash -c '! grep -q "pr merge" "$FAKE_LOG"'
 check "trunk was never pushed" bash -c '! grep -qE "push .*( main| master| trunk)$" "$FAKE_LOG"'
 check "no force-push flag" bash -c '! grep -q -- "--force" "$FAKE_LOG"'
+
+# --- the body gate has to see the worker's diff, not the checkout's ----------------------------
+#
+# The gate reads the changed files from the checkout it runs in. A publish from a worktree finds the
+# boss's tree on trunk and the worker's commits on its own branch, so a plain `make pr-check` diffed
+# trunk against trunk, said `unverifiable: no changed files`, and refused every publish — the bug
+# this file exists to keep fixed. The branch is named to the gate exactly when the checkout is not
+# on it, and never in a way that blesses a diff nobody looked at.
+
+gate_makefile() { # a gate that records the BODY and the BRANCH it was handed
+	cat >"$REPO/Makefile" <<'EOF'
+pr-check:
+	@test -n "$(BODY)" || { echo "no BODY"; exit 1; }
+	@printf 'BODY=%s BRANCH=%s\n' "$(BODY)" "$(BRANCH)" >>"$(GATE_LOG)"
+	@echo "body gate: green"
+EOF
+}
+
+new_case gate-worktree-branch
+export FAKE_HEAD_BRANCH=trunk GATE_LOG=$CASE/gate.log
+gate_makefile
+run worker
+if [ "$rc" -eq 0 ]; then pass "a branch the checkout is not on still publishes (exit 0)"; else fail "a branch the checkout is not on still publishes (exit $rc: $err)"; fi
+check "  ...the gate is handed the branch" bash -c "grep -q ' BRANCH=feat/worker$' '$GATE_LOG'"
+check "  ...and the note says why" bash -c "printf '%s' \"$err\" | grep -q 'not feat/worker'"
+check "  ...nothing was merged" bash -c '! grep -q "pr merge" "$FAKE_LOG"'
+
+new_case gate-checked-out
+export FAKE_HEAD_BRANCH=feat/worker GATE_LOG=$CASE/gate.log
+gate_makefile
+run worker
+if [ "$rc" -eq 0 ]; then pass "a checkout already on the branch publishes (exit 0)"; else fail "a checkout already on the branch publishes (exit $rc: $err)"; fi
+check "  ...the gate is handed no BRANCH" bash -c "grep -q ' BRANCH=$' '$GATE_LOG'"
+
+new_case gate-unverifiable-diff
+# What the real gate prints when it cannot see a diff. Naming the branch is another way to see the
+# diff, not a way to skip it: an unverifiable run still refuses the publish.
+export FAKE_HEAD_BRANCH=trunk
+cat >"$REPO/Makefile" <<'EOF'
+pr-check:
+	@echo "pr-gate: unverifiable: no changed files" >&2
+	@exit 2
+EOF
+run worker
+refused "an unverifiable diff still refuses the publish" "body gate"
+check "  ...and nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
+check "  ...and no PR was created" bash -c '! grep -q "pr create" "$FAKE_LOG"'
+
+new_case gate-fallback-branch
+# No Makefile: the fallback script gets the same treatment, as a flag.
+export FAKE_HEAD_BRANCH=trunk GATE_LOG=$CASE/gate.log
+rm -f "$REPO/Makefile"
+mkdir -p "$REPO/scripts"
+cat >"$REPO/scripts/pr-gate.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$GATE_LOG"
+echo "body gate: green"
+EOF
+chmod +x "$REPO/scripts/pr-gate.sh"
+run worker
+if [ "$rc" -eq 0 ]; then pass "the fallback gate publishes a worktree branch (exit 0)"; else fail "the fallback gate publishes a worktree branch (exit $rc: $err)"; fi
+check "  ...it is handed --branch" bash -c "grep -q -- '--branch feat/worker' '$GATE_LOG'"
+
+new_case gate-fallback-checked-out
+export FAKE_HEAD_BRANCH=feat/worker GATE_LOG=$CASE/gate.log
+run worker
+check "  ...and no --branch when the checkout is the branch" bash -c "! grep -q -- '--branch' '$GATE_LOG'"
+rm -rf "$REPO/scripts"
+
+# --- a target repo's test-change gate gets the worker's own reason ---------------------------------
+#
+# `make pr-check` here (and in /home/mark/.pi) asks why a test changed beside its source, and a
+# body with that line is the only thing that answers it. The worker is the only one who knows, so
+# the report's line is carried into the body; when the report has none, the body has none, and the
+# gate that wants one still refuses. Nothing here invents a reason.
+
+new_case test-change-carried
+export FAKE_HEAD_BRANCH=trunk GATE_LOG=$CASE/gate.log
+gate_makefile
+sed -i 's|^Review tier:|**Test change:** the retry needed a fake clock, so the retry test fakes one.\n\nReview tier:|' "$REPORTER"
+run worker
+if [ "$rc" -eq 0 ]; then pass "a report with a Test change line publishes"; else fail "a report with a Test change line publishes (exit $rc: $err)"; fi
+check "  ...the body carries the bare label and the reason" bash -c "grep -qxF 'Test change: the retry needed a fake clock, so the retry test fakes one.' '$FAKE_BODY_OUT'"
+check "  ...and only once" bash -c "[ \$(grep -c '^Test change:' '$FAKE_BODY_OUT') -eq 1 ]"
+
+new_case test-change-absent
+export FAKE_HEAD_BRANCH=trunk GATE_LOG=$CASE/gate.log
+gate_makefile
+run worker
+if [ "$rc" -eq 0 ]; then pass "a report with no Test change line still publishes"; else fail "a report with no Test change line still publishes (exit $rc: $err)"; fi
+check "  ...and puts no Test change line in the body" bash -c "! grep -q '^Test change:' '$FAKE_BODY_OUT'"
 
 new_case red-gate
 mkdir -p "$REPO/scripts"
