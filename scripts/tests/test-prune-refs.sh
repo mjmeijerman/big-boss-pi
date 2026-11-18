@@ -23,6 +23,9 @@
 #      deleted by the merge is deleted when its local head is the `headRefOid` the PR reports; a head
 #      that differs from it, a PR that reports no head sha, and two PRs on one head are all kept,
 #      each naming the clause that held it.
+#   G5. Clause 3 dates the branch's own commits, not the trunk history it was cut from: a branch cut
+#      from a squash commit that is itself dated after its pull request's mergedAt is deleted, and a
+#      branch with one commit genuinely written after mergedAt is still kept and names it.
 #   H. A dead branch held by a checkout that is still there: a clean one is removed with the branch in
 #      one run and nothing is left for a second; a dirty one keeps its branch and names the worktree;
 #      a live delegation for that slug keeps both and says which worker; a live delegation whose
@@ -125,6 +128,8 @@ if [ -n "$head" ]; then
 		squash-clean) printf '21\tMERGED\t2020-01-02T00:00:00Z\t%s\n' "$local_head" ;;
 		squash-gone) printf '31\tMERGED\t2020-01-02T00:00:00Z\t%s\n' "$local_head" ;;
 		squash-new) printf '22\tMERGED\t2019-12-31T00:00:00Z\t%s\n' "$local_head" ;;
+		squash-cut) printf '41\tMERGED\t2020-01-02T00:00:00Z\t%s\n' "$local_head" ;;
+		squash-cut-late) printf '42\tMERGED\t2020-01-02T00:00:00Z\t%s\n' "$local_head" ;;
 		head-mismatch) printf '33\tMERGED\t2020-01-02T00:00:00Z\t0123456789abcdef0123456789abcdef01234567\n' ;;
 		head-none) printf '34\tMERGED\t2020-01-02T00:00:00Z\t\n' ;;
 		head-two)
@@ -153,6 +158,8 @@ ok | head-empty | head-fail)
 	printf '33\thead-mismatch\tMERGED\n'
 	printf '34\thead-none\tMERGED\n'
 	printf '35\thead-two\tMERGED\n'
+	printf '41\tsquash-cut\tMERGED\n'
+	printf '42\tsquash-cut-late\tMERGED\n'
 	;;
 *)
 	printf 'gh: HTTP 401: Bad credentials\n' >&2
@@ -503,6 +510,83 @@ want_branch_in "$repo3" squash-new present
 want_branch_in "$repo3" head-mismatch present
 want_branch_in "$repo3" head-none present
 want_branch_in "$repo3" head-two present
+
+# --- G5. clause 3 dates the branch's own commits, not the trunk it was cut from ------------------
+
+# A branch is cut from trunk's tip, and that tip can be the squash commit of a pull request that
+# merged *after* this branch's own pull request did. The base commit is then dated after this
+# branch's mergedAt, and a proof that dates the branch's whole history calls it work written after
+# the merge: a false keep. Only the commits the branch has that trunk does not are its own.
+repo6=$work/repo6
+git init -q --bare -b main "$work/origin6.git"
+git clone -q "$work/origin6.git" "$repo6"
+git -C "$repo6" config user.email worker@example.invalid
+git -C "$repo6" config user.name Test
+commit_at6() {
+	GIT_COMMITTER_DATE="$1" GIT_AUTHOR_DATE="$1" git -C "$repo6" commit -qm "$2"
+}
+printf 'base\n' >"$repo6/README"
+git -C "$repo6" add README
+commit_at6 "2019-12-29T00:00:00 +0000" "base"
+git -C "$repo6" push -q origin main
+
+# The trunk commit every branch below is cut from: the squash of pull request #40, dated 2020-01-05,
+# which is later than both of their mergedAt dates.
+git -C "$repo6" checkout -qb cut-trunk
+printf 't\n' >"$repo6/t.file"
+git -C "$repo6" add t.file
+commit_at6 "2019-12-30T00:00:00 +0000" "cut-trunk one"
+git -C "$repo6" checkout -q main
+git -C "$repo6" merge -q --squash cut-trunk
+commit_at6 "2020-01-05T00:00:00 +0000" "cut-trunk one (#40)"
+git -C "$repo6" push -q origin main
+git -C "$repo6" branch -qD cut-trunk
+cut_base=$(git -C "$repo6" rev-parse main)
+
+# squash-cut: cut from that commit, nothing of its own written after its mergedAt (2020-01-02).
+# Clause 3 must delete it; dating its whole history keeps it on the base commit's 2020-01-05.
+git -C "$repo6" checkout -qb squash-cut "$cut_base"
+for step in one two; do
+	printf '%s\n' "$step" >"$repo6/cut-$step.file"
+	git -C "$repo6" add "cut-$step.file"
+	commit_at6 "2019-12-31T00:00:00 +0000" "squash-cut $step"
+done
+git -C "$repo6" push -q origin squash-cut
+git -C "$repo6" checkout -q main
+
+# squash-cut-late: the same cut, plus one commit genuinely written after mergedAt. That commit is
+# the branch's own, so the narrowed clause still keeps it and still names the commit.
+git -C "$repo6" checkout -qb squash-cut-late "$cut_base"
+for step in one; do
+	printf '%s\n' "$step" >"$repo6/late-$step.file"
+	git -C "$repo6" add "late-$step.file"
+	commit_at6 "2019-12-31T00:00:00 +0000" "squash-cut-late $step"
+done
+printf 'late\n' >"$repo6/late-late.file"
+git -C "$repo6" add late-late.file
+commit_at6 "2020-01-04T00:00:00 +0000" "squash-cut-late late step"
+git -C "$repo6" push -q origin squash-cut-late
+git -C "$repo6" checkout -q main
+cut_late_sha=$(git -C "$repo6" rev-parse --short squash-cut-late)
+
+run -- --cwd "$repo6"
+want_rc 0 "the narrowed third proof on a dry run"
+want_text "would delete branch squash-cut (squash-cut two): PR #41 MERGED 2020-01-02T00:00:00Z, head is the merged head, no commit after the merge" \
+	"a branch cut from a later trunk commit is deleted, because that commit is not its own"
+want_branch_in "$repo6" squash-cut present
+want_text "kept branch squash-cut-late (squash-cut-late late step)" \
+	"a branch with its own commit after the merge is still kept"
+want_text "commit $cut_late_sha dated 2020-01-04T00:00:00Z was written after PR #42 merged at 2020-01-02T00:00:00Z" \
+	"the narrowed clause still names the commit written after the merge"
+want_branch_in "$repo6" squash-cut-late present
+
+# and the apply phase deletes exactly the one it listed.
+run -- --cwd "$repo6" --apply --yes
+want_rc 0 "the narrowed third proof on --apply"
+want_text "deleted branch squash-cut (squash-cut two): PR #41 MERGED 2020-01-02T00:00:00Z" \
+	"the branch cut from a later trunk commit is deleted"
+want_branch_in "$repo6" squash-cut gone
+want_branch_in "$repo6" squash-cut-late present
 
 # --- H. a dead branch held by a checkout that is still there -----------------------------------
 
