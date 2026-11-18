@@ -23,6 +23,11 @@
 #      deleted by the merge is deleted when its local head is the `headRefOid` the PR reports; a head
 #      that differs from it, a PR that reports no head sha, and two PRs on one head are all kept,
 #      each naming the clause that held it.
+#   H. A dead branch held by a checkout that is still there: a clean one is removed with the branch in
+#      one run and nothing is left for a second; a dirty one keeps its branch and names the worktree;
+#      a live delegation for that slug keeps both and says which worker; a live delegation whose
+#      directory is gone keeps the record instead of pruning it; a registry file that is not there
+#      protects nothing, and one that is unreadable stops the run.
 #
 #   bash scripts/tests/test-prune-refs.sh      exit 0 = every case held
 set -uo pipefail
@@ -41,6 +46,10 @@ fail() { printf '  FAIL  %s\n' "$*"; fails=$((fails + 1)); }
 
 out=""
 rc=0
+# Every run gets a registry path of its own, so a fixture can never be protected (or deleted) by the
+# real registry of the checkout this test is run from. A case that wants one passes
+# `PRUNE_DELEGATIONS=...` in its env list, and env's last assignment wins.
+registry=$work/no-registry.json
 # run [env...] -- <args...> : prune-refs.sh against the fixture repo, stdin closed.
 run() {
 	local -a envs=()
@@ -49,7 +58,7 @@ run() {
 		shift
 	done
 	[ "${1:-}" = "--" ] && shift
-	out=$(env "PATH=$stub:$PATH" "${envs[@]+"${envs[@]}"}" bash "$script" "$@" </dev/null 2>&1)
+	out=$(env "PATH=$stub:$PATH" "PRUNE_DELEGATIONS=$registry" "${envs[@]+"${envs[@]}"}" bash "$script" "$@" </dev/null 2>&1)
 	rc=$?
 }
 want_rc() { # <want> <description>
@@ -494,6 +503,142 @@ want_branch_in "$repo3" squash-new present
 want_branch_in "$repo3" head-mismatch present
 want_branch_in "$repo3" head-none present
 want_branch_in "$repo3" head-two present
+
+# --- H. a dead branch held by a checkout that is still there -----------------------------------
+
+# This is what every worker that cut `.worktrees/SLUG` leaves behind: a real directory holding a
+# merged branch. `git branch -D` refuses it, so without this the same branches are listed as
+# `would delete` on every run and never go away.
+repo4=$work/repo4
+git init -q --bare -b main "$work/origin4.git"
+git clone -q "$work/origin4.git" "$repo4"
+git -C "$repo4" config user.email worker@example.invalid
+git -C "$repo4" config user.name Test
+printf 'base\n' >"$repo4/README"
+git -C "$repo4" add README
+git -C "$repo4" commit -qm "base"
+git -C "$repo4" push -q origin main
+
+# held-clean: a clean checkout of a branch that is an ancestor of origin/main.
+git -C "$repo4" worktree add -q "$work/held-clean" -b fix/held-clean
+printf 'y\n' >"$work/held-clean/y"
+git -C "$work/held-clean" add y
+git -C "$work/held-clean" commit -qm "held clean work"
+git -C "$repo4" merge -q --ff-only fix/held-clean
+git -C "$repo4" push -q origin main
+
+# H1. the listing says what the apply phase will do to the checkout, and one run does all of it.
+run -- --cwd "$repo4"
+want_rc 0 "a dead branch held by a clean checkout, dry run"
+want_text "would delete branch fix/held-clean (held clean work): merged into origin/main and its worktree $work/held-clean" \
+	"the plan names the worktree that is removed with the branch"
+want_branch_in "$repo4" fix/held-clean present
+
+run -- --cwd "$repo4" --apply --yes
+want_rc 0 "one apply removes the checkout and the branch"
+want_no_text "git refused" "the branch is not left behind by the checkout holding it"
+want_text "removed worktree $work/held-clean" "the clean checkout is removed"
+want_text "deleted branch fix/held-clean (held clean work)" "the branch it held is deleted in the same run"
+if [ -d "$work/held-clean" ]; then
+	fail "the checkout directory is still on disk"
+else
+	pass "the checkout directory is gone"
+fi
+if git -C "$repo4" worktree list --porcelain | grep -qx "worktree $work/held-clean"; then
+	fail "the worktree entry is still registered"
+else
+	pass "the worktree entry is gone after one run"
+fi
+want_branch_in "$repo4" fix/held-clean gone
+
+run -- --cwd "$repo4" --apply --yes
+want_rc 0 "the second run on the same repo"
+want_text "summary: nothing deleted" "the second run reprints nothing as deleted"
+
+# --- H2. the same, but the checkout has work the removal would destroy ---------------------------
+
+repo5=$work/repo5
+git init -q --bare -b main "$work/origin5.git"
+git clone -q "$work/origin5.git" "$repo5"
+git -C "$repo5" config user.email worker@example.invalid
+git -C "$repo5" config user.name Test
+printf 'base\n' >"$repo5/README"
+git -C "$repo5" add README
+git -C "$repo5" commit -qm "base"
+git -C "$repo5" push -q origin main
+
+git -C "$repo5" worktree add -q "$work/held-dirty" -b fix/held-dirty
+printf 'z\n' >"$work/held-dirty/z"
+git -C "$work/held-dirty" add z
+git -C "$work/held-dirty" commit -qm "held dirty work"
+git -C "$repo5" merge -q --ff-only fix/held-dirty
+git -C "$repo5" push -q origin main
+# An untracked file is the shape git refuses to remove without --force, and the shape a worker leaves.
+printf 'uncommitted\n' >"$work/held-dirty/local-notes.txt"
+
+run -- --cwd "$repo5" --apply --yes
+want_rc 0 "a dead branch held by a dirty checkout"
+want_text "kept branch fix/held-dirty (held dirty work): worktree $work/held-dirty holds uncommitted changes, so the branch is kept" \
+	"a dirty checkout keeps its branch and names the worktree"
+want_no_text "removed worktree" "a dirty checkout is never removed, not even with --force"
+want_branch_in "$repo5" fix/held-dirty present
+if [ -d "$work/held-dirty" ] && [ -f "$work/held-dirty/local-notes.txt" ]; then
+	pass "the dirty checkout and its untracked file are untouched"
+else
+	fail "the dirty checkout or its untracked file was removed"
+fi
+
+# --- H3. a live delegation outranks the delete proof -------------------------------------------
+
+# The slug is what the directory and the branch both carry: `held-dirty` names
+# `.worktrees/held-dirty` in the real checkout, and `fix/held-dirty` here.
+printf '{\n  "held-dirty": {"slug": "held-dirty", "cwd": "%s"}\n}\n' "$repo5" >"$work/delegations.json"
+run PRUNE_DELEGATIONS="$work/delegations.json" -- --cwd "$repo5" --apply --yes
+want_rc 0 "a live worker holding the branch"
+want_text "kept branch fix/held-dirty (held dirty work): live worker held-dirty holds $work/held-dirty, so it is kept" \
+	"a live worker keeps its branch and is named"
+want_no_text "removed worktree" "a live worker's checkout is not removed"
+want_branch_in "$repo5" fix/held-dirty present
+if [ -d "$work/held-dirty" ]; then pass "a live worker's checkout is still on disk"; else fail "a live worker's checkout was removed"; fi
+
+# H3b. the same guard on the dead-entry half: a record whose directory is gone is kept, not pruned,
+# because pruning it is what makes the branch deletable.
+git -C "$repo5" worktree add -q "$work/held-gone" -b fix/held-gone
+printf 'w\n' >"$work/held-gone/w"
+git -C "$work/held-gone" add w
+git -C "$work/held-gone" commit -qm "held gone work"
+git -C "$repo5" merge -q --ff-only fix/held-gone
+git -C "$repo5" push -q origin main
+rm -rf "$work/held-gone"
+printf '{\n  "held-dirty": {"slug": "held-dirty"},\n  "held-gone": {"slug": "held-gone"}\n}\n' >"$work/delegations.json"
+run PRUNE_DELEGATIONS="$work/delegations.json" -- --cwd "$repo5" --apply --yes
+want_rc 0 "a live worker whose directory is gone"
+want_text "kept worktree $work/held-gone: live worker held-gone holds it, so it is kept" \
+	"a live worker's dead worktree record is kept and named"
+want_no_text "pruned worktree $work/held-gone" "a live worker's worktree record is not pruned"
+want_text "kept branch fix/held-gone: git refused (error: cannot delete branch 'fix/held-gone' used by worktree at '$work/held-gone')" \
+	"the branch that record holds stays, with git's own reason"
+want_branch_in "$repo5" fix/held-gone present
+
+# --- H4. no registry, no protection — and an unreadable one stops the run ------------------------
+
+run PRUNE_DELEGATIONS="$work/not-a-registry.json" -- --cwd "$repo5" --apply --yes
+want_rc 0 "a registry file that is not there"
+want_text "no worker registry at $work/not-a-registry.json, so no live worker is protected" \
+	"a missing registry is said out loud"
+want_text "pruned worktree $work/held-gone" "a missing registry protects nothing: the record is pruned"
+want_text "deleted branch fix/held-gone" "a missing registry protects nothing: the branch is deleted"
+want_branch_in "$repo5" fix/held-gone gone
+want_branch_in "$repo5" fix/held-dirty present
+want_text "worktree $work/held-dirty holds uncommitted changes" \
+	"the other branch is kept by its changes, not by a guard that does not exist"
+
+printf 'nonsense, not json\n' >"$work/broken-registry.json"
+run PRUNE_DELEGATIONS="$work/broken-registry.json" -- --cwd "$repo5" --apply --yes
+want_rc 2 "a registry that exists and cannot be read"
+want_text "is not readable JSON, so a live worker would not be protected" \
+	"an unreadable registry stops the run and says why"
+want_no_text "deleted branch" "an unreadable registry deletes nothing"
 
 printf '\n'
 if [ "$fails" = 0 ]; then
