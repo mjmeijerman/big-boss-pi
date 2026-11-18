@@ -9,13 +9,24 @@
 #   bash scripts/prune-refs.sh --cwd /home/mark/.pi                 list them, change nothing
 #   bash scripts/prune-refs.sh --cwd /home/mark/.pi --apply --yes   delete exactly what it listed
 #
-# Two proofs, and only two, make a branch dead — everything else is kept and says why:
+# Three proofs, and only three, make a branch dead — everything else is kept and says why:
 #   * ancestry: `git branch --merged origin/<trunk>` lists it; or
 #   * squash-equivalence: `git cherry origin/<trunk> <branch>` marks every one of its commits `-`,
-#     meaning the patch is already upstream under another sha.
+#     meaning the patch is already upstream under another sha; or
+#   * squash-merge: GitHub's pull request for that head is MERGED, the local head is the pushed
+#     head, and no commit on the branch was written after that merge.
 # The second is not decoration: this repo squash-merges, so a branch merged through a PR is never an
 # ancestor of trunk. It is the same check bin/publish's duplicate guard and `delegate close --merged`
 # trust. One `+` line — a commit whose patch is not in trunk, pushed or not — and the branch stays.
+#
+# The third exists because the first two cannot answer a merge commit or a multi-commit pull request
+# squashed into one: a merge commit has no patch to match, and the squashed commits were rewritten on
+# trunk, so `git cherry` marks them `+` and the branch was kept forever. There the evidence is the
+# pull request itself, and it has to promise three things at once — MERGED, the head here is the
+# head there, and nothing was committed after the merge. Anything else the pull request cannot
+# settle (`gh` missing or silent, no pull request, two or more, a state that is not MERGED, an
+# unreadable `mergedAt`) keeps the branch and prints the clause that held it. It never falls through
+# to the delete path.
 #
 # Never deleted, whatever the proofs say: the current branch, the trunk, a branch with an open pull
 # request, and any branch at all while `gh` cannot answer (its open-PR status is then unknown, and
@@ -118,6 +129,60 @@ fi
 
 # `git branch --merged` prints the current branch and the trunk too; both are filtered by name below
 # rather than by trusting that list, so a detached checkout cannot smuggle either one in.
+# squash_evidence <branch> — the third proof, on stdout as one tab-separated line:
+# `ok<TAB><proof>` when the branch is provably squash-merged, `no<TAB><reason>` otherwise. Every
+# ambiguity is a `no`, because guessing here deletes work.
+squash_evidence() {
+	local branch=$1 list n number state merged_at epoch local_head remote_head worst when after
+	local template='{{range .}}{{.number}}{{"\t"}}{{.state}}{{"\t"}}{{.mergedAt}}{{"\n"}}{{end}}'
+	if ! list=$(cd "$cwd" && gh pr list --head "$branch" --state all --limit 100 \
+		--json number,state,mergedAt --template "$template" 2>&1); then
+		printf 'no\tgh gave nothing for this head: %s' "$(printf '%s' "$list" | head -n 1)"
+		return 0
+	fi
+	n=$(printf '%s\n' "$list" | grep -c . 2>/dev/null) || n=0
+	if [ "$n" -eq 0 ]; then
+		printf 'no\tgh gave nothing for this head: no pull request listed'
+		return 0
+	fi
+	if [ "$n" -gt 1 ]; then
+		printf 'no\t%s pull requests on this head, so which one merged is ambiguous' "$n"
+		return 0
+	fi
+	IFS=$'\t' read -r number state merged_at <<<"$list"
+	if [ "$state" != MERGED ]; then
+		printf 'no\tPR #%s is %s, not MERGED' "$number" "${state:-unknown}"
+		return 0
+	fi
+	epoch=$(date -u -d "$merged_at" +%s 2>/dev/null) || epoch=""
+	if [ -z "$epoch" ]; then
+		printf 'no\tPR #%s has no readable mergedAt (%s)' "$number" "${merged_at:-empty}"
+		return 0
+	fi
+	remote_head=$(git -C "$cwd" rev-parse --verify --quiet "refs/remotes/origin/$branch") || remote_head=""
+	if [ -z "$remote_head" ]; then
+		printf 'no\tnothing pushed to origin/%s, so the merge does not cover this head' "$branch"
+		return 0
+	fi
+	local_head=$(git -C "$cwd" rev-parse --verify --quiet "refs/heads/$branch") || local_head=""
+	if [ "$local_head" != "$remote_head" ]; then
+		printf 'no\tlocal head %s is not the pushed head, so it carries work the merge never saw' \
+			"$(printf '%s' "$local_head" | cut -c1-7)"
+		return 0
+	fi
+	worst=$(git -C "$cwd" log --format='%ct %H' "$branch" 2>/dev/null |
+		awk -v m="$epoch" '$1 > m { print $1 " " $2; exit }') || worst=""
+	if [ -n "$worst" ]; then
+		read -r when after <<<"$worst"
+		printf 'no\tcommit %s dated %s was written after PR #%s merged at %s' \
+			"$(printf '%s' "$after" | cut -c1-7)" \
+			"$(date -u -d "@$when" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '%s' "$when")" \
+			"$number" "$merged_at"
+		return 0
+	fi
+	printf 'ok\tPR #%s %s %s, head pushed, no commit after the merge' "$number" "$state" "$merged_at"
+}
+
 declare -A by_ancestry=()
 while IFS= read -r name; do
 	[ -n "$name" ] && by_ancestry[$name]=1
@@ -162,6 +227,21 @@ for name in $(git -C "$cwd" for-each-ref --format='%(refname:short)' refs/heads/
 		else
 			proof="patch-identical to origin/$trunk (git cherry: all -)"
 		fi
+	fi
+	# The third proof runs only where the first two failed and GitHub says this head merged: a
+	# branch it cannot settle keeps the reason from above plus the clause that held it.
+	if [ -z "$proof" ] && [ -z "$gh_unknown" ] && [ "${pr_state[$name]:-}" = MERGED ]; then
+		squash=$(squash_evidence "$name")
+		case $squash in
+		ok$'\t'*)
+			proof=${squash#ok$'\t'}
+			note=""
+			;;
+		no$'\t'*)
+			clause=${squash#no$'\t'}
+			reason=${reason:+"$reason; "}$clause
+			;;
+		esac
 	fi
 	if [ -z "$proof" ]; then
 		printf 'kept branch %s (%s): %s%s\n' "$name" "$subject" "$reason" "$note"

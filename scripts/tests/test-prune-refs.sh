@@ -16,6 +16,9 @@
 #   E. Nothing left: exit 0, not an error.
 #   F. One --apply finishes: a merged branch held only by a worktree entry whose directory is gone
 #      is deleted by the same run that prunes the entry, and the run after it has nothing to do.
+#   G. The third proof: a PR the host squash-merged deletes a branch the two patch proofs cannot see
+#      (the branch commits were rewritten on trunk), a commit written after that merge keeps the
+#      branch and is named, and a `gh` that answers nothing keeps it too.
 #
 #   bash scripts/tests/test-prune-refs.sh      exit 0 = every case held
 set -uo pipefail
@@ -62,43 +65,72 @@ want_no_text() { # <text> <description>
 		pass "$2"
 	fi
 }
-has_branch() { git -C "$repo" rev-parse --verify --quiet "refs/heads/$1" >/dev/null; }
-want_branch() { # <name> <present|gone>
-	if has_branch "$1"; then
-		if [ "$2" = present ]; then
-			pass "branch $1 is present"
+has_branch() { git -C "$1" rev-parse --verify --quiet "refs/heads/$2" >/dev/null; }
+want_branch() { want_branch_in "$repo" "$1" "$2"; }
+want_branch_in() { # <repo> <name> <present|gone>
+	if has_branch "$1" "$2"; then
+		if [ "$3" = present ]; then
+			pass "branch $2 is present"
 		else
-			fail "branch $1 is still there, wanted gone"
+			fail "branch $2 is still there, wanted gone"
 		fi
-	elif [ "$2" = gone ]; then
-		pass "branch $1 is gone"
+	elif [ "$3" = gone ]; then
+		pass "branch $2 is gone"
 	else
-		fail "branch $1 is gone, wanted present"
+		fail "branch $2 is gone, wanted present"
 	fi
 }
 
-# --- stub gh: one call, three answers ----------------------------------------------------------
+# --- stub gh: one call, four answers ----------------------------------------------------------
 
+# The bulk `pr list` is what the script asks once for every branch. A `pr list --head BRANCH` is the
+# third proof's question about one branch, and the dates below are what its commit dates are measured
+# against: squash-clean's commits are older than its merge, squash-new has one written after it.
 stub=$work/stub
 mkdir -p "$stub"
 cat >"$stub/gh" <<'STUB'
 #!/usr/bin/env bash
 case $* in
-*"pr list"*)
-	case ${GH_MODE:-ok} in
+*"pr list"*) ;;
+*) exit 0 ;;
+esac
+head=""
+prev=""
+for arg in "$@"; do
+	[ "$prev" = --head ] && head=$arg
+	prev=$arg
+done
+mode=${GH_MODE:-ok}
+if [ -n "$head" ]; then
+	case $mode in
 	ok)
-		printf '11\topen-pr\tOPEN\n'
-		printf '12\tmerged-ff\tMERGED\n'
-		printf '13\tsquashed\tMERGED\n'
+		case $head in
+		squash-clean) printf '21\tMERGED\t2020-01-02T00:00:00Z\n' ;;
+		squash-new) printf '22\tMERGED\t2019-12-31T00:00:00Z\n' ;;
+		*) ;;
+		esac
 		;;
+	head-empty) ;;
 	*)
-		printf 'gh: HTTP 401: Bad credentials\n' >&2
+		printf 'gh: HTTP 502: Bad Gateway\n' >&2
 		exit 1
 		;;
 	esac
+	exit 0
+fi
+case $mode in
+ok | head-empty | head-fail)
+	printf '11\topen-pr\tOPEN\n'
+	printf '12\tmerged-ff\tMERGED\n'
+	printf '13\tsquashed\tMERGED\n'
+	printf '21\tsquash-clean\tMERGED\n'
+	printf '22\tsquash-new\tMERGED\n'
+	;;
+*)
+	printf 'gh: HTTP 401: Bad credentials\n' >&2
+	exit 1
 	;;
 esac
-exit 0
 STUB
 chmod +x "$stub/gh"
 
@@ -297,6 +329,89 @@ fi
 run -- --cwd "$repo2" --apply --yes
 want_rc 0 "a second apply on the same repo"
 want_text "summary: nothing deleted" "the second run reports nothing to do"
+
+# --- G. the third proof: the pull request the host squash-merged --------------------------------
+
+# squash-clean and squash-new are the case `git cherry` cannot answer: two commits squashed into one
+# on trunk, so neither commit is on trunk by patch and both proofs fail. The pull request is the
+# evidence, and the committer dates below are what its mergedAt is compared against.
+repo3=$work/repo3
+git init -q --bare -b main "$work/origin3.git"
+git clone -q "$work/origin3.git" "$repo3"
+git -C "$repo3" config user.email worker@example.invalid
+git -C "$repo3" config user.name Test
+# commit_at <date> <message>: a commit written on <date>, so the merge has a fixed order to compare.
+commit_at() {
+	GIT_COMMITTER_DATE="$1" GIT_AUTHOR_DATE="$1" git -C "$repo3" commit -qm "$2"
+}
+
+printf 'base\n' >"$repo3/README"
+git -C "$repo3" add README
+# Every branch carries this commit, so it is dated before every pull request below tells about: a
+# commit written after the merge is what keeps a branch, and that is what these cases test.
+commit_at "2019-12-29T00:00:00 +0000" "base"
+git -C "$repo3" push -q origin main
+
+# squash-clean: two commits in, one squashed commit on trunk, nothing written afterwards.
+git -C "$repo3" checkout -qb squash-clean
+for step in one two; do
+	printf '%s\n' "$step" >"$repo3/clean-$step.file"
+	git -C "$repo3" add "clean-$step.file"
+	commit_at "2019-12-30T00:00:00 +0000" "squash-clean $step"
+done
+git -C "$repo3" push -q origin squash-clean
+git -C "$repo3" checkout -q main
+git -C "$repo3" merge -q --squash squash-clean
+git -C "$repo3" commit -qm "squash-clean one and two (#21)"
+git -C "$repo3" push -q origin main
+
+# squash-new: the same shape, plus one commit written after its pull request had already merged.
+git -C "$repo3" checkout -qb squash-new
+for step in one two; do
+	printf '%s\n' "$step" >"$repo3/new-$step.file"
+	git -C "$repo3" add "new-$step.file"
+	commit_at "2019-12-30T01:00:00 +0000" "squash-new $step"
+done
+git -C "$repo3" push -q origin squash-new
+git -C "$repo3" checkout -q main
+git -C "$repo3" merge -q --squash squash-new
+git -C "$repo3" commit -qm "squash-new one and two (#22)"
+git -C "$repo3" push -q origin main
+git -C "$repo3" checkout -q squash-new
+printf 'late\n' >"$repo3/new-late.file"
+git -C "$repo3" add new-late.file
+commit_at "2020-01-01T12:00:00 +0000" "squash-new late step"
+git -C "$repo3" push -q origin squash-new
+git -C "$repo3" checkout -q main
+late_sha=$(git -C "$repo3" rev-parse --short squash-new)
+
+run -- --cwd "$repo3"
+want_rc 0 "the third proof on a dry run"
+want_text "would delete branch squash-clean (squash-clean two): PR #21 MERGED 2020-01-02T00:00:00Z, head pushed, no commit after the merge" \
+	"a branch whose pull request merged before its last commit is listed for deletion"
+want_text "kept branch squash-new (squash-new late step)" \
+	"a commit written after the merge keeps the branch"
+want_text "commit $late_sha dated 2020-01-01T12:00:00Z was written after PR #22 merged at 2019-12-31T00:00:00Z" \
+	"the kept branch names the commit that was written after the merge"
+want_branch_in "$repo3" squash-clean present
+
+# G2. gh cannot answer about one head: the branch stays, and the reason says gh gave nothing. Both
+# shapes are pinned, an error and an empty answer, because "no output" must never read as "no pull
+# request, so the merge is unopposed".
+for mode in head-fail head-empty; do
+	run GH_MODE=$mode -- --cwd "$repo3"
+	want_rc 0 "gh silent about one head ($mode)"
+	want_text "kept branch squash-clean (squash-clean two): 2 commit(s) not in origin/main, by patch (git cherry: +); gh gave nothing for this head" \
+		"a head gh cannot answer about is kept and says so ($mode)"
+done
+
+# G3. and when it can answer, exactly that branch is deleted.
+run -- --cwd "$repo3" --apply --yes
+want_rc 0 "the third proof on --apply"
+want_text "deleted branch squash-clean (squash-clean two): PR #21 MERGED 2020-01-02T00:00:00Z" \
+	"the squash-merged branch is deleted with its pull request named"
+want_branch_in "$repo3" squash-clean gone
+want_branch_in "$repo3" squash-new present
 
 printf '\n'
 if [ "$fails" = 0 ]; then
