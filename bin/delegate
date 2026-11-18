@@ -1408,10 +1408,10 @@ $acceptance_block
 ## Rules
 
 1. Do the task in \`$cwd\`; write nothing in \`$ROOT\` but the report.
-2. Never switch \`$cwd\` (the boss keeps reading it). Cut a worktree first:
-   \`git worktree add ../SLUG-worktree -b BRANCH\`; no \`git checkout\`, \`switch\`, \`stash\`
-   or \`reset\` in it.
-3. Ask the route first: \`jev route "<the task>"\`. If it is \`local\`, run \`local-run\` with the
+2. Never switch \`$cwd\` (the boss reads it). Cut a worktree inside the repo:
+   \`git worktree add .worktrees/SLUG -b BRANCH\` from its root — the sandbox binds the repo,
+   not its parent. No \`git checkout\`, \`switch\`, \`stash\` or \`reset\` in it.
+3. Ask the route first: \`jev route "<the task>"\`. If \`local\`, run \`local-run\` with the
    text instead and put the answer in the report.
 4. Do not spawn agents or spaces or rename, move, close one; need more hands: say so.
 5. Commit on your branch and stop: no upload, no pull request, no fallback — the boss publishes.
@@ -1431,7 +1431,7 @@ job, so it never needs host access from you.
    - \`## Thrown away\`: what you deleted on purpose, and why. "nothing" is fine.
    - \`## What I would do differently next time\`: one or two lines.
    Keep it short.
-8. No claim without the output; not run is written as "not run" plus what would run it.
+8. No claim without the output; "not run" names what would run it.
 9. Then stay idle: the boss relays the report and closes the space — do not close it yourself.
 10. If the user must decide before work goes on, make the first line "DECISION NEEDED: <the
     question>" and stop — only that keeps the space open.
