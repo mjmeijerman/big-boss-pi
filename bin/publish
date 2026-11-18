@@ -24,8 +24,12 @@
 #     uses, sourced from there so the two commands cannot drift apart;
 #   - a report with no line starting `Review tier:`, or one whose value is not High, Medium or
 #     Low (the tier is the one thing the PR body must carry, so a publish with no tier is not a
-#     publish). A report is markdown, so the value may arrive bolded, backticked, quoted or with a
-#     trailing period or a reason after it; the body carries the bare word, never the decoration;
+#     publish). A report is markdown, so the label may be bolded, italicised or indented
+#     (`**Review tier:** Medium`, `__Review tier:__ high`) and the value may arrive bolded,
+#     backticked, quoted or with a trailing period or a reason after it; the body carries the bare
+#     word, never the decoration. A line that nearly says it — `Review tier = High`, `- Review
+#     tier: High`, `Review-tier: High` — is refused with the report path and the line number, so
+#     the next person sees which line to change;
 #   - a branch with no commit carrying the `Agent-Slug:` trailer (nothing ties the branch to the
 #     worker that wrote the report);
 #   - `gh` not on PATH, and a tree that is not a git repo;
@@ -45,10 +49,11 @@
 # origin holds for the branch and refuses when that is not the branch: nothing was pushed there, so
 # a URL on its own would read as a publish.
 #
-# What it carries from the report into the body: the Mission line, the bare review tier, the
-# Evidence block, the Thrown away section when there is one, and the worker's own `Test change:`
-# line when the report has one (a target repo may require a reason for a test changed beside its
-# source; the worker knows it, so it is carried verbatim and never invented).
+# What it carries from the report into the body: the Mission line (its label reduced to the bare
+# `Mission:` a body gate greps for, the text untouched), the bare review tier, the Evidence block,
+# the Thrown away section when there is one, and the worker's own `Test change:` line when the
+# report has one (a target repo may require a reason for a test changed beside its source; the
+# worker knows it, so it is carried verbatim and never invented).
 #
 # The branch: the gate reads the changed files from the checkout it runs in, and most publishes are
 # from a tree that is not on the branch — the boss's tree sits on trunk while the worker committed
@@ -210,12 +215,22 @@ fi
 
 # 3. The review tier is the one line the update cannot do without. The value is read out of the
 # markdown around it — `**Medium**`, `` `low` ``, `"High".`, `High — one script` — because a
-# report is markdown and a worker should not have to write a bare word to be published. The body
-# carries the bare word so a body gate never has to parse decoration to find the tier.
-tier_line=$(grep -m1 -E '^Review tier:' "$report" || true)
-[ -n "$tier_line" ] || die "$report has no line starting 'Review tier:', so the PR body would omit the tier"
-tier_raw=${tier_line#Review tier:}
-tier_raw=${tier_raw#"${tier_raw%%[![:space:]]*}"} # leading blanks
+# report is markdown and a worker should not have to write a bare word to be published. The label
+# wears markdown too: `**Review tier:** Medium` was refused twice with the work finished and correct
+# because the pattern wanted the bare label at column 0, so emphasis before or around the label is
+# read as decoration like the value's. The body carries the bare word so a body gate never has to
+# parse decoration to find the tier. A line that nearly says it is refused with its line number, so
+# the next person changes one line instead of guessing which one.
+tier_line=$(grep -m1 -iE '^[[:space:]]*[*_]*[[:space:]]*review[[:space:]]+tier[*_]*:[[:space:]]*[*_]*' "$report" || true)
+if [ -z "$tier_line" ]; then
+	near=$(grep -niE 'review[[:space:]_*-]*tier' "$report" | head -n 1 || true)
+	if [ -n "$near" ]; then
+		die "$report line ${near%%:*} comes close to the tier but the gate cannot read it: $(printf '%s' "${near#*:}" | sed -e 's/^[[:space:]]*//'). It needs a line starting 'Review tier:' — plain, or '**Review tier:**' — with High, Medium or Low as the first word"
+	fi
+	die "$report has no line starting 'Review tier:', so the PR body would omit the tier"
+fi
+tier_raw=${tier_line#*:}                      # everything after the first colon is the value
+tier_raw=$(printf '%s' "$tier_raw" | sed -e 's/^[[:space:]*_]*//') # blanks, bold, italics
 tier_raw=${tier_raw%%[[:space:]]*}            # the first word is the tier
 # The word may be wrapped in bold/code/quotes and end in a period; the tier itself has none of
 # those characters, so deleting them from the word leaves it intact.
@@ -308,8 +323,15 @@ if ! command -v gh >/dev/null 2>&1; then
 fi
 
 # The PR body, built from the report: mission verbatim, the tier, the evidence, and the thrown-away
-# section when the worker wrote one. The body gate and gh both read this file.
-mission=$(grep -m1 -E '^[[:space:]]*(\*\*)?Mission(\*\*)?:' "$report" || true)
+# section when the worker wrote one. The body gate and gh both read this file. The mission label is
+# reduced to the bare `Mission:` a body gate greps for, the same way the tier's value is: the text
+# after it is the worker's and is carried untouched.
+mission=$(grep -m1 -iE '^[[:space:]]*[*_]*[[:space:]]*mission[*_]*:[[:space:]]*[*_]*' "$report" || true)
+if [ -n "$mission" ]; then
+	mission=$(printf '%s' "$mission" |
+		sed -e 's/^[[:space:]]*[*_]*[[:space:]]*[Mm][Ii][Ss][Ss][Ii][Oo][Nn][*_]*:[[:space:]]*[*_]*[[:space:]]*//')
+	mission="Mission: $mission"
+fi
 [ -n "$mission" ] || mission='Mission: (the report names no Mission line)'
 section_body() { # <report> <heading text>
 	awk -v want="$2" '
@@ -331,12 +353,12 @@ thrown=$(section_body "$report" "Thrown away")
 # A target repo may ask why a test changed beside its source (this repo's own test-change gate does).
 # The worker is the only one who knows, so the report's line is carried into the body verbatim,
 # label and all, and only when the report has one: a body with no line is a body the gate refuses,
-# which is the right answer for a report that never said why. **Test change:** and a trailing
-# period are the markdown the worker wrote; the label is reduced to the bare form the gate reads.
-test_change=$(grep -m1 -iE '^[[:space:]]*(\*\*)?Test change(\*\*)?:' "$report" || true)
+# which is the right answer for a report that never said why. `**Test change:**`, a bullet's
+# emphasis and a trailing period are the markdown the worker wrote; the label is reduced to the bare
+# form the gate reads, and the reason after it is carried untouched.
+test_change=$(grep -m1 -iE '^[[:space:]]*[*_]*[[:space:]]*test[[:space:]]+change[*_]*:[[:space:]]*[*_]*' "$report" || true)
 if [ -n "$test_change" ]; then
-	test_change=$(printf '%s' "$test_change" | tr -d '*' |
-		sed -e 's/^[[:space:]]*[Tt][Ee][Ss][Tt][[:space:]][Cc][Hh][Aa][Nn][Gg][Ee][[:space:]]*:[[:space:]]*//')
+	test_change=$(printf '%s' "$test_change" | sed -e 's/^[[:space:]]*[*_]*[[:space:]]*[Tt][Ee][Ss][Tt][[:space:]]\+[Cc][Hh][Aa][Nn][Gg][Ee][*_]*:[[:space:]]*[*_]*[[:space:]]*//')
 	test_change="Test change: $test_change"
 fi
 

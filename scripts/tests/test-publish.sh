@@ -269,6 +269,71 @@ tier_case empty-tier ''
 refused "an empty tier value is refused" "Review tier"
 check "  ...and nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
 
+# The label wears markdown too. `**Review tier:** Medium` is what two finished workers wrote, and
+# publish answered "has no line starting 'Review tier:'" while the work was correct and finished —
+# the boss edited the report by hand both times. Emphasis around the label is decoration like the
+# value's, and the body still carries the bare line.
+
+tier_label_case() { # <name> <the tier line as the worker wrote it> <the bare word the body needs>
+	new_case "$1"
+	{
+		printf '**Mission**: the label survives the markdown it was written in.\n\n'
+		printf '%s\n\n' "$2"
+		printf '## Evidence\n\n```\ntest-publish: ok\n```\n'
+	} >"$REPORTER"
+	run worker
+	if [ "$rc" -eq 0 ]; then pass "a report writing '$2' publishes"; else fail "a report writing '$2' publishes (exit $rc: $err)"; fi
+	check "  ...the body carries the bare 'Review tier: $3'" bash -c "grep -qxF 'Review tier: $3' '$FAKE_BODY_OUT'"
+}
+
+tier_label_case bolded-label '**Review tier:** Medium' Medium
+tier_label_case bolded-label-with-reason '**Review tier:** high — the gateway, read line by line' High
+tier_label_case underscored-label '__Review tier:__ low' Low
+tier_label_case indented-label '   **Review tier:** Medium' Medium
+tier_label_case bolded-label-and-value '**Review tier:** **Medium**' Medium
+
+# A line that nearly says it is refused with the report path and the line number, so the next
+# person changes one line instead of hunting for the shape the gate wanted.
+
+near_miss_case() { # <name> <the line that is not the tier line>
+	new_case "$1"
+	{
+		printf '**Mission**: a near miss names its own line.\n\n'
+		printf 'Some prose.\n\n%s\n\n' "$2"
+		printf '## Evidence\n\n```\ntest-publish: ok\n```\n'
+	} >"$REPORTER"
+	run worker
+}
+
+near_miss_case tier-equals-sign 'Review tier = High'
+refused "a tier line with no colon is refused" "comes close to the tier"
+check "  ...the refusal names the line number" bash -c "printf '%s' \"$err\" | grep -q '$REPORTER line 5'"
+check "  ...and quotes what the line says" bash -c "printf '%s' \"$err\" | grep -qF 'Review tier = High'"
+check "  ...and nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
+
+near_miss_case tier-as-bullet '- **Review tier:** High'
+refused "a bulleted tier line is refused, not read as four spaces of prose" "comes close to the tier"
+check "  ...naming the line" bash -c "printf '%s' \"$err\" | grep -q '$REPORTER line 5'"
+
+# The mission label is reduced to the bare `Mission:` a body gate greps for, the same way the
+# tier's value is: the text after it is the worker's and arrives untouched.
+new_case mission-labelled-bold
+{
+	printf '**Mission:** the body gate reads a bare Mission line.\n\n'
+	printf 'Review tier: Medium\n\n'
+	printf '## Evidence\n\n```\ntest-publish: ok\n```\n'
+} >"$REPORTER"
+cat >"$REPO/Makefile" <<'EOF'
+pr-check:
+	@test -n "$(BODY)" || { echo "no BODY"; exit 1; }
+	@grep -q '^Mission: ' "$(BODY)" || { echo "pr-gate: no Mission line" >&2; exit 1; }
+	@echo "body gate: green"
+EOF
+run worker
+if [ "$rc" -eq 0 ]; then pass "a '**Mission:**' report publishes past a gate that wants 'Mission:'"; else fail "a '**Mission:**' report publishes (exit $rc: $err)"; fi
+check "  ...the body carries the bare label" bash -c "grep -qxF 'Mission: the body gate reads a bare Mission line.' '$FAKE_BODY_OUT'"
+rm -f "$REPO/Makefile"
+
 new_case no-trailer
 export FAKE_TRAILERS='Subject only
 
@@ -532,6 +597,44 @@ gate_makefile
 run worker
 if [ "$rc" -eq 0 ]; then pass "a report with no Test change line still publishes"; else fail "a report with no Test change line still publishes (exit $rc: $err)"; fi
 check "  ...and puts no Test change line in the body" bash -c "! grep -q '^Test change:' '$FAKE_BODY_OUT'"
+
+# The gate that wants that line, as the one that refused tonight does: a diff that changes a test
+# beside its source, a body with no reason for it. Nothing in the spec said the line was required,
+# so the worker never wrote it and the publish stopped on a message about a line it had never been
+# told about. Both directions here: the gate still refuses a body with no reason, and the report's
+# own line is the only thing that gets it through.
+gate_wants_test_change() {
+	cat >"$REPO/Makefile" <<'EOF'
+pr-check:
+	@test -n "$(BODY)" || { echo "no BODY"; exit 1; }
+	@grep -q '^Test change: ' "$(BODY)" || { echo "pr-gate: a test file and its source changed together; the PR body needs a 'Test change: <reason>' line" >&2; exit 1; }
+	@echo "body gate: green"
+EOF
+}
+
+new_case test-change-required-refused
+export FAKE_HEAD_BRANCH=trunk GATE_LOG=$CASE/gate.log
+gate_wants_test_change
+run worker
+refused "a test+source diff with no Test change line is still refused" "Test change: <reason>"
+check "  ...and nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
+check "  ...and no PR was created" bash -c '! grep -q "pr create" "$FAKE_LOG"'
+
+new_case test-change-required-carried
+export FAKE_HEAD_BRANCH=trunk GATE_LOG=$CASE/gate.log
+gate_wants_test_change
+sed -i 's|^Review tier:|**Test change:** the retry needed a fake clock, so the retry test fakes one.\n\nReview tier:|' "$REPORTER"
+run worker
+if [ "$rc" -eq 0 ]; then pass "the report's bolded '**Test change:**' line gets that gate through"; else fail "the report's bolded '**Test change:**' line gets that gate through (exit $rc: $err)"; fi
+check "  ...the body carries the bare label and the reason" bash -c "grep -qxF 'Test change: the retry needed a fake clock, so the retry test fakes one.' '$FAKE_BODY_OUT'"
+
+new_case test-change-underscored
+export FAKE_HEAD_BRANCH=trunk GATE_LOG=$CASE/gate.log
+gate_wants_test_change
+sed -i 's|^Review tier:|__Test change:__ the pinned count moved, so the count is pinned again.\n\nReview tier:|' "$REPORTER"
+run worker
+if [ "$rc" -eq 0 ]; then pass "an underscored '__Test change:__' line publishes"; else fail "an underscored '__Test change:__' line publishes (exit $rc: $err)"; fi
+check "  ...reduced to the bare label" bash -c "grep -qxF 'Test change: the pinned count moved, so the count is pinned again.' '$FAKE_BODY_OUT'"
 
 new_case red-gate
 mkdir -p "$REPO/scripts"

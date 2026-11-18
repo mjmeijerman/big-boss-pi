@@ -467,6 +467,18 @@ if grep -q '^## Evidence$' "$spec" && grep -qF 'Command: <fill in:' "$spec"; the
 else
 	fail "no Evidence scaffold in $spec"
 fi
+# The two body lines a publish is refused without are handed over in the exact form the gate reads.
+# `**Review tier:** Medium` and a bare `Review tier: Medium` are both read; a worker told the shape
+# writes it first time, which is the whole cost of not saying it.
+missing_lines=""
+for anchor in 'Review tier: High' 'Test change: <why>'; do
+	grep -qF -- "$anchor" "$spec" || missing_lines="$missing_lines '$anchor'"
+done
+if [ -n "$missing_lines" ]; then
+	fail "the generated spec never names the body lines publish needs:$missing_lines"
+else
+	pass "the generated spec hands over the Review tier and Test change lines"
+fi
 # The scaffold as the worker sees it, copied verbatim into a report.
 awk '/^````markdown$/{f=1;next} f&&/^````$/{exit} f' "$spec" >"$PI_BOSS_ROOT/reports/scaffold.md"
 if [ -s "$PI_BOSS_ROOT/reports/scaffold.md" ]; then
