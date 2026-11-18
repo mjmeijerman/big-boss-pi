@@ -254,8 +254,12 @@ bin/publish <slug> --cwd <repo>
 ```
 
 Before anything leaves the machine it runs the target repo's own body gate: `make pr-check
-BODY=<file>` when the Makefile has that target, `scripts/pr-gate.sh --body <file>` when only
-that exists, and it prints a skip when neither does. A red gate stops the publish. A PR that
+BODY=<file>`, `scripts/pr-gate.sh --body <file>` when only that exists, and it prints a skip when
+neither does. When the `pr-check` recipe expands `BRANCH` — detected once with a `make -n` dry run
+and a sentinel branch — the call also carries `BRANCH=<the worker's branch>`, because a gate that
+diffs a named branch would otherwise compare the checkout (usually trunk) with itself and refuse
+with `unverifiable: no changed files`; a recipe that never mentions it is called with `BODY` alone.
+A red gate stops the publish. A PR that
 already exists for the branch prints its URL instead of failing. Trunk is never pushed, nothing
 is force-pushed, and nothing is merged — the merge stays yours.
 

@@ -30,9 +30,11 @@
 #     worker that wrote the report);
 #   - `gh` not on PATH, and a tree that is not a git repo.
 #
-# What it does, in order: the target repo's own body gate (`make pr-check BODY=<file>`, else
-# `scripts/pr-gate.sh --body <file>`, else skipped with a line saying so) — a red gate stops the
-# publish before anything leaves the machine; an existing PR for the branch prints its URL
+# What it does, in order: the target repo's own body gate (`make pr-check BODY=<file>`, plus
+# `BRANCH=<the worker branch>` when a dry run shows its recipe expands BRANCH — the form a gate
+# that diffs a named branch needs — else `scripts/pr-gate.sh --body <file>`, else skipped with a
+# line saying so) — a red gate stops the publish before anything leaves the machine; an existing
+# PR for the branch prints its URL
 # instead of failing; then the branch is pushed to origin and the PR is opened against trunk.
 #
 # What it never does: merge, push trunk, force-push, or touch the worker's files. Pushing a
@@ -63,7 +65,10 @@ die() {
 }
 note() { printf '%s: %s\n' "$prog" "$*" >&2; }
 
-usage() { printf 'usage: %s <slug> [--cwd DIR]\n' "$prog"; }
+usage() {
+	printf 'usage: %s <slug> [--cwd DIR]\n' "$prog"
+	printf '  body gate: make pr-check BODY=<report body> [BRANCH=<worker branch>] — BRANCH is passed only when a dry run shows the recipe expands it, because a gate that diffs a named branch cannot verify a checkout sitting on trunk otherwise.\n'
+}
 slug=""
 lookup_cwd=""
 while [ "$#" -gt 0 ]; do
@@ -267,8 +272,23 @@ trap 'rm -f "$body"' EXIT
 
 # 6. The target repo's own body gate, before anything leaves the machine.
 if [ -f "$cwd/Makefile" ] && grep -qE '^pr-check[[:space:]]*:' "$cwd/Makefile"; then
-	note "body gate: make -C $cwd pr-check"
-	if ! make -C "$cwd" --no-print-directory pr-check BODY="$body"; then
+	# A gate may diff the branch it is told about instead of the checkout it sits in: `make
+	# pr-check BRANCH=<branch>` is how a repo verifies a worker's branch from a tree that stays
+	# on trunk. Without it such a gate diffs trunk against trunk and answers "unverifiable: no
+	# changed files", refusing every publish. Whether the target takes the variable is detected
+	# once, with a dry run: a sentinel branch is offered and the recipe make would run is read
+	# back — if the sentinel is in it, the target expands BRANCH and gets the real branch. A
+	# target whose recipe never mentions it is called exactly as before, so a gate that would
+	# choke on the variable keeps working.
+	gate_args=(BODY="$body")
+	if probe=$(make -C "$cwd" --no-print-directory -n pr-check BODY=/dev/null BRANCH=__publish_probe__ 2>/dev/null) &&
+		printf '%s\n' "$probe" | grep -q '__publish_probe__'; then
+		gate_args+=("BRANCH=$branch")
+		note "body gate: make -C $cwd pr-check BRANCH=$branch (its recipe expands BRANCH)"
+	else
+		note "body gate: make -C $cwd pr-check"
+	fi
+	if ! make -C "$cwd" --no-print-directory pr-check "${gate_args[@]}"; then
 		die "the body gate (make pr-check) failed, so nothing was pushed"
 	fi
 elif [ -x "$cwd/scripts/pr-gate.sh" ]; then

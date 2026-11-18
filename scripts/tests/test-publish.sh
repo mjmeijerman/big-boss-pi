@@ -311,6 +311,65 @@ check "nothing was merged" bash -c '! grep -q "pr merge" "$FAKE_LOG"'
 check "trunk was never pushed" bash -c '! grep -qE "push .*( main| master| trunk)$" "$FAKE_LOG"'
 check "no force-push flag" bash -c '! grep -q -- "--force" "$FAKE_LOG"'
 
+# A gate that diffs the branch it is told about cannot verify a checkout that stays on trunk: it
+# needs `BRANCH=<the worker branch>` beside BODY, or it compares trunk with itself and refuses
+# `unverifiable: no changed files`. The form is chosen per repo, so a target that never mentions
+# BRANCH still gets the plain call — including one that dies on an unknown variable.
+
+new_case branch-arg-gate
+cat >"$REPO/Makefile" <<'EOF'
+pr-check:
+	@test -n "$(BODY)" || { echo "no BODY"; exit 1; }
+	@test -n "$(BRANCH)" || { echo "no BRANCH"; exit 1; }
+	@printf '%s\n' "$(BRANCH)" >"$$GATE_LOG"
+	@echo "body gate: green"
+EOF
+export GATE_LOG=$CASE/gate.log
+run worker
+unset GATE_LOG
+if [ "$rc" -eq 0 ]; then pass "a gate whose recipe expands BRANCH publishes green (exit 0)"; else fail "a gate whose recipe expands BRANCH publishes (exit $rc: $err)"; fi
+check "  ...it was given the worker's branch" bash -c "grep -qxF 'feat/worker' '$CASE/gate.log'"
+check "  ...and the form is named" bash -c "printf '%s' '$err' | grep -q 'expands BRANCH'"
+check "  ...the branch was pushed to origin" calls '^git .*push .*origin feat/worker'
+
+new_case gate-rejects-branch
+cat >"$REPO/Makefile" <<'EOF'
+pr-check:
+	@echo "body gate: green"
+EOF
+mkdir -p "$CASE/rejectmake"
+cat >"$CASE/rejectmake/make" <<'FAKE'
+#!/usr/bin/env bash
+printf 'make %s\n' "$*" >>"${FAKE_LOG:-/dev/null}"
+case " $* " in
+*" BRANCH="*)
+	printf 'make: unknown variable BRANCH\n' >&2
+	exit 2
+	;;
+esac
+printf 'body gate: green\n'
+FAKE
+chmod +x "$CASE/rejectmake/make"
+out=$(PATH=$CASE/rejectmake:$PATH "$script" worker 2>"$CASE/err")
+rc=$?
+err=$(cat "$CASE/err")
+if [ "$rc" -eq 0 ]; then pass "a gate that rejects BRANCH is still called with BODY alone (exit 0)"; else fail "a gate that rejects BRANCH still publishes (exit $rc: $err)"; fi
+check "  ...the call that ran carried no BRANCH=" bash -c "grep -E '^make .*pr-check' \"\$FAKE_LOG\" | grep -vq 'BRANCH='"
+check "  ...and the plain form is what was announced" bash -c "printf '%s' '$err' | grep -qx 'publish: body gate: make -C $REPO pr-check'"
+check "  ...the branch was still pushed" calls '^git .*push .*origin feat/worker'
+
+new_case red-make-gate
+cat >"$REPO/Makefile" <<'EOF'
+pr-check:
+	@echo "body gate: red — no Mission line" >&2
+	@exit 1
+EOF
+run worker
+if [ "$rc" -ne 0 ]; then pass "a red make pr-check stops the publish"; else fail "a red make pr-check stops the publish (exit 0)"; fi
+check "  ...the refusal names the gate" bash -c "printf '%s' '$err' | grep -q 'body gate (make pr-check) failed'"
+check "  ...and nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
+check "  ...and no PR was created" bash -c '! grep -q "pr create" "$FAKE_LOG"'
+
 new_case red-gate
 mkdir -p "$REPO/scripts"
 cat >"$REPO/scripts/pr-gate.sh" <<'EOF'
