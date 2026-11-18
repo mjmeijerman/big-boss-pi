@@ -50,10 +50,18 @@
 # a URL on its own would read as a publish.
 #
 # What it carries from the report into the body: the Mission line (its label reduced to the bare
-# `Mission:` a body gate greps for, the text untouched), the bare review tier, the Evidence block,
-# the Thrown away section when there is one, and the worker's own `Test change:` line when the
-# report has one (a target repo may require a reason for a test changed beside its source; the
-# worker knows it, so it is carried verbatim and never invented).
+# `Mission:` a body gate greps for, the text untouched), the `Now possible:` sentence when the report
+# has one, the bare review tier, the Evidence block, the Thrown away section when there is one, and
+# the worker's own `Test change:` line when the report has one (a target repo may require a reason
+# for a test changed beside its source; the worker knows it, so it is carried verbatim and never
+# invented).
+#
+# The `Now possible:` line is Beck's readability gate: an unreadable change is worse than a readable
+# one, and the reviewer's five minutes start with "what does this do". So the worker answers it in
+# one sentence and the body carries it above the diff, at Medium and High tier — the tiers where a
+# person has to understand the change rather than skim it. A report written before the line existed
+# has none, and that is not a reason to fail a publish: the line is omitted with one note, so an
+# older report still publishes exactly as it did.
 #
 # The branch: the gate reads the changed files from the checkout it runs in, and most publishes are
 # from a tree that is not on the branch — the boss's tree sits on trunk while the worker committed
@@ -376,10 +384,31 @@ if [ -n "$test_change" ]; then
 	test_change="Test change: $test_change"
 fi
 
+# Beck's readability gate, in the worker's own words: one sentence on what a person can do now that
+# they could not before. It rides directly under the Mission, above the tier and the diff, because
+# that is the order a reviewer reads in. No LOC, no PR count — those are effort, and effort is cost.
+# The same markdown tolerance as the tier and the test-change line: `**Now possible:**`, a bullet's
+# emphasis, a trailing period. A report that predates the line has none, and none is not a refusal.
+now_possible=$(grep -m1 -iE '^[[:space:]]*[*_]*[[:space:]]*now[[:space:]]+possible[*_]*:[[:space:]]*[*_]*' "$report" || true)
+if [ -n "$now_possible" ]; then
+	now_possible=$(printf '%s' "$now_possible" | sed -e 's/^[[:space:]]*[*_]*[[:space:]]*[Nn][Oo][Ww][[:space:]]\+[Pp][Oo][Ss][Ss][Ii][Bb][Ll][Ee][*_]*:[[:space:]]*[*_]*[[:space:]]*//')
+	now_possible="Now possible: $now_possible"
+fi
+case $tier in
+Low) ;; # Low is docs, comments, formatting: a reviewer skims it and the sentence adds nothing.
+*)
+	[ -n "$now_possible" ] ||
+		note "$report has no 'Now possible:' line, so the body carries none — the report predates the rule, and that is not a reason to refuse a publish"
+	;;
+esac
+
 body=$(mktemp "${TMPDIR:-/tmp}/publish-body.XXXXXX")
 trap 'rm -f "$body"' EXIT
 {
 	printf '%s\n\n' "$mission"
+	if [ -n "$now_possible" ]; then
+		printf '%s\n\n' "$now_possible"
+	fi
 	printf 'Review tier: %s\n\n' "$tier"
 	if [ -n "$test_change" ]; then
 		printf '%s\n\n' "$test_change"

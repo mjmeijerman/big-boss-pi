@@ -1497,6 +1497,8 @@ $acceptance_block
      money, deletion). Prose after the word is fine.
    - \`Test change: <why>\` — required when one diff changes a test and the source it tests; say what
      the test now pins. No test can tell it apart: say that instead.
+   - \`Now possible: <fill in: what a person can do now that they could not before>\` — one sentence.
+     No LOC, no PR count, no "refactor". \`bin/publish\` puts it in the PR body at Medium and High tier.
    - What now works: a command, a path, a passing test.
    - What changed: one \`Commit: <sha>\`, the files, the PR branch.
    - Still open, and the one next action.

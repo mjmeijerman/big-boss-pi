@@ -47,7 +47,7 @@ fail() { printf '  FAIL  %s\n' "$*"; fails=$((fails + 1)); }
 # The plain-spec byte ceiling asserted in E, with the fixture paths folded to one character each.
 # The template was ~6.1 KB before #36 halved it; the ceiling sits just above the halved size, so
 # an addition has room and a paragraph of prose coming back does not.
-SPEC_CEILING=3300
+SPEC_CEILING=3500
 
 # ---------------------------------------------------------------------------------------------
 # A. `jev plan`: one call, four answers, same validation.
@@ -471,7 +471,7 @@ fi
 # `**Review tier:** Medium` and a bare `Review tier: Medium` are both read; a worker told the shape
 # writes it first time, which is the whole cost of not saying it.
 missing_lines=""
-for anchor in 'Review tier: High' 'Test change: <why>'; do
+for anchor in 'Review tier: High' 'Test change: <why>' 'Now possible: <fill in:'; do
 	grep -qF -- "$anchor" "$spec" || missing_lines="$missing_lines '$anchor'"
 done
 if [ -n "$missing_lines" ]; then
