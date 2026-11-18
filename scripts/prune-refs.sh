@@ -25,6 +25,10 @@
 # entry, never a directory. That half is not gated on `gh`: a directory that is gone cannot come back
 # through a pull request, so it is pruned even when the open-PR question went unanswered.
 #
+# --apply prunes the dead worktree entries first and deletes the branches after: a merged branch can
+# still be held by an entry whose directory is gone, and `git branch -D` refuses it until that entry
+# is gone. One run finishes, where pruning last left the deletion for a second invocation.
+#
 #   exit 0  nothing to do, or the list was printed, or everything printed was deleted
 #   exit 2  bad usage, or no origin/<trunk> to compare against, or --apply without the second yes
 set -uo pipefail
@@ -224,19 +228,10 @@ if [ "$yes" = 0 ]; then
 	fi
 fi
 
-# `git branch -D`, not -d: a squash-merged branch is not an ancestor of trunk, so -d refuses the
-# very branches this command exists for. The proof above is what makes force safe here.
-deleted_branches=0
-for name in ${dead_branches[@]+"${dead_branches[@]}"}; do
-	if out=$(git -C "$cwd" branch -D "$name" 2>&1); then
-		printf 'deleted branch %s %s\n' "$name" "${dead_detail[$name]}"
-		deleted_branches=$((deleted_branches + 1))
-	else
-		printf 'kept branch %s: git refused (%s)\n' "$name" "$(printf '%s' "$out" | head -n 1)"
-		kept=$((kept + 1))
-	fi
-done
-
+# The apply order matters: worktree entries first, branches second. A merged branch can still be
+# held by a worktree entry whose directory is gone, and `git branch -D` refuses it until
+# `git worktree prune` has dropped that entry — pruning afterwards would leave the deletion for a
+# second run to finish.
 pruned_worktrees=0
 if [ "$nworktree" -gt 0 ]; then
 	if out=$(git -C "$cwd" worktree prune 2>&1); then
@@ -249,6 +244,20 @@ if [ "$nworktree" -gt 0 ]; then
 		kept=$((kept + nworktree))
 	fi
 fi
+
+# `git branch -D`, not -d: a squash-merged branch is not an ancestor of trunk, so -d refuses the
+# very branches this command exists for. The proof above is what makes force safe here. A branch a
+# live worktree still holds is a keep with git's own reason, not something to retry.
+deleted_branches=0
+for name in ${dead_branches[@]+"${dead_branches[@]}"}; do
+	if out=$(git -C "$cwd" branch -D "$name" 2>&1); then
+		printf 'deleted branch %s %s\n' "$name" "${dead_detail[$name]}"
+		deleted_branches=$((deleted_branches + 1))
+	else
+		printf 'kept branch %s: git refused (%s)\n' "$name" "$(printf '%s' "$out" | head -n 1)"
+		kept=$((kept + 1))
+	fi
+done
 
 if [ "$deleted_branches" = 0 ] && [ "$pruned_worktrees" = 0 ]; then
 	printf 'summary: nothing deleted in %s, %d branch(es) kept\n' "$cwd" "$kept"

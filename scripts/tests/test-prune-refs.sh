@@ -14,6 +14,8 @@
 #   D. --apply --yes deletes exactly the branches it listed and prunes exactly the worktree whose
 #      directory is gone, while the live worktree stays.
 #   E. Nothing left: exit 0, not an error.
+#   F. One --apply finishes: a merged branch held only by a worktree entry whose directory is gone
+#      is deleted by the same run that prunes the entry, and the run after it has nothing to do.
 #
 #   bash scripts/tests/test-prune-refs.sh      exit 0 = every case held
 set -uo pipefail
@@ -253,6 +255,48 @@ want_rc 0 "nothing left to do"
 want_text "summary: 0 branch(es) and 0 worktree(s) would be deleted" "the second run lists nothing"
 want_no_text "would delete" "the second run prints no plan"
 want_no_text "would prune" "the second run prunes nothing"
+
+# --- F. one --apply finishes: a merged branch held only by a dead worktree entry ---------------
+
+# The worktree entry outlives its directory, so `git branch -D` still refuses the branch. Pruning
+# the entry is what makes the deletion possible, so the apply phase prunes first and deletes after:
+# one run, not two.
+repo2=$work/repo2
+git init -q --bare -b main "$work/origin2.git"
+git clone -q "$work/origin2.git" "$repo2"
+git -C "$repo2" config user.email worker@example.invalid
+git -C "$repo2" config user.name Test
+printf 'base\n' >"$repo2/README"
+git -C "$repo2" add README
+git -C "$repo2" commit -qm "base"
+git -C "$repo2" push -q origin main
+git -C "$repo2" worktree add -q "$work/held-wt" -b held-merged
+printf 'x\n' >"$work/held-wt/x"
+git -C "$work/held-wt" add x
+git -C "$work/held-wt" commit -qm "held work"
+git -C "$repo2" merge -q --ff-only held-merged
+git -C "$repo2" push -q origin main
+rm -rf "$work/held-wt"
+
+run -- --cwd "$repo2" --apply --yes
+want_rc 0 "one-pass apply"
+want_no_text "git refused" "the branch is not left behind by a stale worktree entry"
+want_text "deleted branch held-merged (held work)" \
+	"a branch held only by a dead worktree entry is deleted in the same run"
+want_text "pruned worktree $work/held-wt" "the dead worktree entry is pruned in that run"
+if git -C "$repo2" worktree list --porcelain | grep -qx "worktree $work/held-wt"; then
+	fail "the dead worktree entry is still registered"
+else
+	pass "the dead worktree entry is gone after one run"
+fi
+if git -C "$repo2" rev-parse --verify --quiet refs/heads/held-merged >/dev/null; then
+	fail "branch held-merged is still there after one run, wanted gone"
+else
+	pass "branch held-merged is gone after one run"
+fi
+run -- --cwd "$repo2" --apply --yes
+want_rc 0 "a second apply on the same repo"
+want_text "summary: nothing deleted" "the second run reports nothing to do"
 
 printf '\n'
 if [ "$fails" = 0 ]; then
