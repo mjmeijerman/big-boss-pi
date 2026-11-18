@@ -49,7 +49,7 @@
 import fs from "node:fs";
 import process from "node:process";
 import { ENDPOINT, MODEL, TIMEOUT, MIN_CONFIDENCE, KEY_ENV, KEY_FILE } from "./jev-model.mjs";
-import { logUsage, context } from "./usage.mjs";
+import { logUsage, logDecision, context } from "./usage.mjs";
 
 // Wall clock for the usage line: a decision model that takes 40s is a fact worth having.
 const started = Date.now();
@@ -403,6 +403,22 @@ if (opts.kind === "permit") {
 	const field = pick(answers, "permission", ["allow", "deny", "ask"]);
 	const reason = reasonOf({ permission: field });
 	const confidence = asNumber(field.probability);
+	// A permit answer is the highest-consequence decision jev makes, so it gets a row in
+	// state/decisions.jsonl like every spawn decision: without one, `delegate stats` can never
+	// say how many permission calls there were or how they went. `decision` is jev's answer — no
+	// person's counter-answer exists yet, which is why the scorecard calls permit recorded-but-
+	// unscored rather than claiming an agreement rate for it.
+	const verdict = !usable(field) || field.value === "ask" ? "unsure" : field.value === "allow" ? "allow" : "deny";
+	logDecision({
+		command: "permit",
+		task: opts.text,
+		decision: verdict,
+		reason,
+		overridden: false,
+		slug: process.env.AGENT_SLUG || context(),
+		jev: verdict,
+		extra: { confidence },
+	});
 	if (!usable(field) || field.value === "ask")
 		emit("unsure — ask the user", { decision: "unsure", reason, confidence }, 3);
 	if (field.value === "allow") emit("yes", { decision: "yes", reason, confidence }, 0);

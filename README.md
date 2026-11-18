@@ -99,12 +99,21 @@ with key-shaped tokens redacted. The answer itself is never logged. Recording ca
 call: a failed write is swallowed.
 
 The same screen carries the jev scorecard: per decision kind (`mode`, `count`, `route`,
-`thinking`, `in-flight`) how many rows carry jev's own answer, how many are unknown, how many
-were overridden, and the agreement rate. A row written before the `jev` field existed is
-unknown and stays out of the rate — it is never agreement. `in-flight` is the spawn cap, not a
-jev answer, so it is reported as a cap. Below that, every override is listed per slug with its
-reason and whether the worker produced a report: **an override that ended with no report ended
-with no PR, and that is jev's answer being right**.
+`thinking`, `permit`, `in-flight`) how many rows carry jev's own answer, how many are unknown, how
+many were overridden, the override rate, and how many rows carried a field jev defaulted. A row
+written before the `jev` field existed is unknown and stays out of the rate — it is never
+agreement. `in-flight` is the spawn cap, not a jev answer, so it is reported as a cap.
+
+**There is no agreement rate, and the screen says so.** A spawn that does not pass
+`--override-jev` copies jev's answer into the decision, so `decision` equals `jev` on every such
+row by construction; a percentage computed from that measures nothing. What the scorecard prints
+is the override rate — how often a person overruled jev, out of rows of that kind — plus the rows
+where jev filled a field in under the caller (the `defaults` list `delegate spawn` already wrote
+and nothing read), plus the `permit` answers, which are logged to `state/decisions.jsonl` by
+`bin/jev.mjs` and scored as recorded-but-unscored: permit has no person's counter-answer in the
+log yet, so nothing can check it. Below that, every override is listed per slug with its reason
+and whether the worker produced a report: **an override that ended with no report ended with no
+PR, and that is jev's answer being right**.
 
 ## Jev gates every delegation
 
