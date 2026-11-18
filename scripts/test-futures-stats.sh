@@ -28,9 +28,10 @@ fail() { printf '  FAIL  %s\n' "$*"; fails=$((fails + 1)); }
 
 # Decision rows, one per scorecard category: an answered-and-agreed mode row, an answered-and-
 # overridden one, an answered count, a legacy route row with no `jev` field at all (unknown, its
-# override carries no jev answer either), an answered thinking row, and an in-flight row that is a
-# spawn cap rather than a jev answer. The two overridden rows name different slugs, only one of
-# which has a report.
+# override carries no jev answer either), an answered thinking row, a thinking row whose `defaults`
+# names two fields jev filled in under the caller, a permit row (jev's highest-consequence answer,
+# which used to be logged nowhere), and an in-flight row that is a spawn cap rather than a jev
+# answer. The two overridden rows name different slugs, only one of which has a report.
 now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 {
 	printf '{"timestamp":"%s","command":"ask","task":"q","decision":"yes","reason":"r","overridden":false,"jev":"yes"}\n' "$now"
@@ -39,6 +40,8 @@ now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 	printf '{"timestamp":"%s","command":"count","task":"q","decision":"1","reason":"r","overridden":false,"slug":"filled","jev":"1"}\n' "$now"
 	printf '{"timestamp":"%s","command":"route","task":"q","decision":"remote","reason":"legacy row, no jev recorded","overridden":true,"slug":"never-written"}\n' "$now"
 	printf '{"timestamp":"%s","command":"thinking","task":"q","decision":"low","reason":"r","overridden":false,"slug":"filled","jev":"low"}\n' "$now"
+	printf '{"timestamp":"%s","command":"thinking","task":"q","decision":"medium","reason":"weak answer, defaults stand in","overridden":false,"slug":"defaulted","jev":"medium","defaults":["count","thinking"]}\n' "$now"
+	printf '{"timestamp":"%s","command":"permit","task":"read README.md","decision":"allow","reason":"read-only","overridden":false,"slug":"perm","jev":"allow"}\n' "$now"
 	printf '{"timestamp":"%s","command":"in-flight","task":"q","decision":"blocked","reason":"queue","overridden":false,"slug":"waiting"}\n' "$now"
 } >"$PI_BOSS_ROOT/state/decisions.jsonl"
 
@@ -173,28 +176,69 @@ else
 fi
 
 # The scorecard: an unknown-answer row must never be counted as agreement, so the legacy route
-# row is unknown 1 with no agreement rate at all, and the in-flight row is a cap, not an unknown.
+# row is unknown 1 with no override rate; the rate is overrides over rows, not decision === jev,
+# which is the tautology `agreement_rate` used to print. A kind with no rows has a null rate, not 0.
 got=$(printf '%s' "$json" | jget jev_scorecard.kinds.mode.answered)
 [ "$got" = "2" ] && pass "scorecard: mode has 2 answered rows" || fail "jev_scorecard.kinds.mode.answered: got $got, wanted 2"
 
 got=$(printf '%s' "$json" | jget jev_scorecard.kinds.mode.unknown)
 [ "$got" = "0" ] && pass "scorecard: mode has no unknown rows" || fail "jev_scorecard.kinds.mode.unknown: got $got, wanted 0"
 
-got=$(printf '%s' "$json" | jget jev_scorecard.kinds.mode.agreement_rate)
-[ "$got" = "50" ] && pass "scorecard: mode agreement 50% (one overridden answer)" ||
-	fail "jev_scorecard.kinds.mode.agreement_rate: got $got, wanted 50"
+got=$(printf '%s' "$json" | jget jev_scorecard.kinds.mode.override_rate)
+[ "$got" = "50" ] && pass "scorecard: mode override rate 50% (one row overruled jev)" ||
+	fail "jev_scorecard.kinds.mode.override_rate: got $got, wanted 50"
+
+got=$(printf '%s' "$json" | jget jev_scorecard.kinds.mode.copied)
+[ "$got" = "1" ] && pass "scorecard: the copied row is counted as copied, not as agreement" ||
+	fail "jev_scorecard.kinds.mode.copied: got $got, wanted 1"
+
+got=$(printf '%s' "$json" | jget jev_scorecard.agreement.measurable)
+[ "$got" = "false" ] && pass "scorecard: no agreement rate is claimed" ||
+	fail "jev_scorecard.agreement.measurable: got $got, wanted false"
 
 got=$(printf '%s' "$json" | jget jev_scorecard.kinds.route.unknown)
 [ "$got" = "1" ] && pass "scorecard: a row without jev is unknown, not agreement" ||
 	fail "jev_scorecard.kinds.route.unknown: got $got, wanted 1"
 
-got=$(printf '%s' "$json" | jget jev_scorecard.kinds.route.agreement_rate)
-[ "$got" = "null" ] && pass "scorecard: no jev answer means no agreement rate, not 0%" ||
-	fail "jev_scorecard.kinds.route.agreement_rate: got $got, wanted null"
+got=$(printf '%s' "$json" | jget jev_scorecard.kinds.permit.override_rate)
+[ "$got" = "0" ] && pass "scorecard: a kind with rows and no overrides is 0%, not null" ||
+	fail "jev_scorecard.kinds.permit.override_rate: got $got, wanted 0"
 
 got=$(printf '%s' "$json" | jget jev_scorecard.kinds.in-flight.cap)
 [ "$got" = "1" ] && pass "scorecard: in-flight row counted as a cap, not a jev answer" ||
 	fail "jev_scorecard.kinds.in-flight.cap: got $got, wanted 1"
+
+# `defaults` was written and never read: the fields jev filled in under the caller are now named.
+got=$(printf '%s' "$json" | jget jev_scorecard.defaults.rows)
+[ "$got" = "1" ] && pass "scorecard: one row carried defaulted fields" ||
+	fail "jev_scorecard.defaults.rows: got $got, wanted 1"
+
+got=$(printf '%s' "$json" | jget jev_scorecard.defaults.by_field.count)
+[ "$got" = "1" ] && pass "scorecard: the defaulted field count is counted" ||
+	fail "jev_scorecard.defaults.by_field.count: got $got, wanted 1"
+
+got=$(printf '%s' "$json" | jget jev_scorecard.kinds.thinking.defaulted)
+[ "$got" = "1" ] && pass "scorecard: thinking has one defaulted row" ||
+	fail "jev_scorecard.kinds.thinking.defaulted: got $got, wanted 1"
+
+# permit: answered by jev, logged as a decision row, and scored as recorded-but-unscored.
+got=$(printf '%s' "$json" | jget jev_scorecard.permit.recorded)
+[ "$got" = "true" ] && pass "scorecard: permit rows are recorded" ||
+	fail "jev_scorecard.permit.recorded: got $got, wanted true"
+
+got=$(printf '%s' "$json" | jget jev_scorecard.permit.verdicts.allow)
+[ "$got" = "1" ] && pass "scorecard: the permit verdict is counted" ||
+	fail "jev_scorecard.permit.verdicts.allow: got $got, wanted 1"
+
+# A row with no `defaults` key at all must not crash or count: most rows above have none.
+got=$(printf '%s' "$json" | jget jev_scorecard.kinds.mode.defaulted)
+[ "$got" = "0" ] && pass "scorecard: rows without defaults contribute nothing" ||
+	fail "jev_scorecard.kinds.mode.defaulted: got $got, wanted 0"
+
+# A kind with no rows at all: no rate, not 0% — the empty-root fixture above has only an ask row.
+got=$(printf '%s' "$bare" | jget jev_scorecard.kinds.mode.override_rate)
+[ "$got" = "null" ] && pass "scorecard: a kind with no rows has no rate, not 0%" ||
+	fail "jev_scorecard.kinds.mode.override_rate with no mode rows: got $got, wanted null"
 
 # Overrides are per slug, not per row, and whether the worker reported decides which way they read.
 got=$(printf '%s' "$json" | jget jev_scorecard.overrides.slugs)
@@ -208,10 +252,25 @@ got=$(printf '%s' "$json" | jget jev_scorecard.overrides.entries.0.slug)
 [ "$got" = '"never-written"' ] && pass "scorecard: the no-report override is named first" ||
 	fail "jev_scorecard.overrides.entries.0.slug: got $got, wanted \"never-written\""
 
-if printf '%s' "$screen" | grep -qE '^  mode +2/2 +0 +1 +50%$'; then
+if printf '%s' "$screen" | grep -qE '^  mode +2/2 +0 +1 +50% +0$'; then
 	pass "screen carries the mode scorecard row"
 else
-	fail "screen has no 'mode 2/2 ... 50%' scorecard row"
+	fail "screen has no 'mode 2/2 ... 50% 0' scorecard row"
+fi
+if printf '%s' "$screen" | grep -qF "agreement: not measurable"; then
+	pass "screen says the agreement rate is not measurable"
+else
+	fail "screen does not say the agreement rate is not measurable"
+fi
+if printf '%s' "$screen" | grep -qF "defaults: jev filled in 1 decision rows (count 1, thinking 1)"; then
+	pass "screen names the defaulted fields"
+else
+	fail "screen does not name the defaulted fields"
+fi
+if printf '%s' "$screen" | grep -qF "permit: 1 row (allow 1)"; then
+	pass "screen carries the permit row"
+else
+	fail "screen does not carry the permit row"
 fi
 if printf '%s' "$screen" | grep -qF "no report  never-written"; then
 	pass "screen names the override with no report"

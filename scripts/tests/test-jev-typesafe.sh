@@ -327,6 +327,20 @@ printf '%s' '{"permission":{"type":"choice","choice":"deny","confidence":0.95,"p
 case_run "permit, deny is no" 1 "jev: no" - -- "$bin/jev" permit "read ~/.ssh/id_ed25519"
 printf '%s' '{"permission":{"type":"choice","choice":"ask","confidence":0.8,"probabilities":{"allow":0.1,"deny":0.1,"ask":0.8}}}' >"$answers_file"
 case_run "permit, ask is unsure" 3 "unsure" - -- "$bin/jev" permit "write outside the worker's directory"
+# Every permit answer leaves a decision row. A permission call is the highest-consequence decision
+# jev makes, and `delegate stats` can only count it if it is in the log; before this, permit was
+# answered and never recorded, so the scorecard had no row for it at all. `ask` is deliberately not
+# written here — `delegate ask` owns those rows, and two writers would count one question twice.
+permit_rows=$(node -e '
+	const fs = require("fs");
+	const rows = fs.readFileSync(process.argv[1], "utf8").split("\n").filter(Boolean)
+		.map((l) => { try { return JSON.parse(l); } catch { return null; } })
+		.filter((r) => r && r.command === "permit");
+	process.stdout.write(`${rows.length} ${rows.map((r) => r.decision).join(",")} ${rows.every((r) => r.jev === r.decision) ? "jev" : "no-jev"}`);' \
+	"$PI_BOSS_ROOT/state/decisions.jsonl" 2>/dev/null || echo missing)
+[ "$permit_rows" = "3 allow,deny,unsure jev" ] &&
+	pass "each permit answer is one decision row (allow, deny, unsure)" ||
+	fail "permit decision rows: got '$permit_rows', wanted '3 allow,deny,unsure jev'"
 
 # --- I. bin/local-run keeps its ollama transport -----------------------------------------------
 # The retired warm-model suite covered this and only this half still has a transport to cover: a

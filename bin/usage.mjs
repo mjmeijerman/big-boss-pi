@@ -24,6 +24,12 @@
  * info, and the full task text. A task can be long and can contain anything a person typed,
  * so only the first 200 characters survive, after the cheap redaction below. Recording must
  * never break the call it records: a failed write is swallowed.
+ *
+ * logDecision is the second, smaller writer: jev's permit answers go into state/decisions.jsonl in
+ * the same row shape `delegate` writes, because a sandbox permission is a decision with a
+ * consequence and a decision that is answered but never logged has no scorecard row at all. It
+ * lives here so the decisions path is resolved in one place, and it swallows its own failures for
+ * the same reason logUsage does.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -38,6 +44,7 @@ const ROOT =
 	path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 export const USAGE_FILE = path.join(ROOT, "state", "usage.jsonl");
+export const DECISIONS_FILE = path.join(ROOT, "state", "decisions.jsonl");
 
 // Cheap redaction: key-shaped tokens and Authorization headers go, everything else stays. It
 // is a guard against the obvious accident, not a classification of what is secret.
@@ -84,4 +91,30 @@ export function logUsage({ kind, command, model, started, latency_ms, ok, error,
 /** context — the caller's slug or context, passed down the environment, never invented. */
 export function context() {
 	return process.env.PI_BOSS_CONTEXT || "";
+}
+
+/**
+ * logDecision — append one decision row, in the shape `delegate spawn` writes: the answer, the
+ * reason, whether a person overruled jev, the slug, and jev's own answer. `extra` is merged last
+ * for a row that carries evidence of its own (a confidence, a sha). Never throws.
+ */
+export function logDecision({ command, task, decision, reason, overridden = false, slug, jev, extra }) {
+	const line = {
+		timestamp: new Date().toISOString(),
+		command: String(command || ""),
+		task: clipTask(task),
+		decision: decision === undefined || decision === null ? null : String(decision),
+		reason: reason ? clipTask(reason) : null,
+		overridden: overridden === true,
+		slug: slug || "",
+	};
+	if (jev !== undefined && jev !== null && jev !== "") line.jev = String(jev);
+	if (extra && typeof extra === "object") Object.assign(line, extra);
+	try {
+		fs.mkdirSync(path.dirname(DECISIONS_FILE), { recursive: true });
+		fs.appendFileSync(DECISIONS_FILE, `${JSON.stringify(line)}\n`);
+	} catch {
+		// Deliberate no-op; see the docstring.
+	}
+	return line;
 }

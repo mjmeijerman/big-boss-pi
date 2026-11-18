@@ -17,10 +17,19 @@
  *
  * The jev scorecard is the gap Radar blip 62 names: the decision log records what jev answered and
  * nothing scores it against what the human did. Per kind it splits the rows into answered / unknown /
- * overridden and states the agreement rate, then lists every override by slug with its reason and
+ * overridden and states the override rate, then lists every override by slug with its reason and
  * whether that worker produced a report at all. A row written before the `jev` field existed is
  * unknown, never agreement; a legacy spawn-wide flag is named as such instead of being scored. An
  * override that ended with no report is an override that ended with no PR — jev was right.
+ *
+ * It is an override count, not an agreement rate, and the distinction is the whole point: a spawn that
+ * does not pass --override-jev copies jev's answer into the decision (bin/delegate, `mode=$jev_mode`),
+ * so `decision === jev` on every such row by construction. There is no row shape in which a person's
+ * answer is recorded independently of jev's, so no agreement rate is computable and none is printed;
+ * the scorecard says so out loud (the `agreement.measurable` field) instead of letting a tautology be
+ * read as a score. The two things the tautology hid are printed instead: how many rows had a field
+ * jev defaulted (and which), and the permit answers — jev's highest-consequence calls — which used
+ * to be answered and never scored at all.
  *
  * The review queue is the other number worth having: how many workers have reported and nobody has
  * read the report, and how old the oldest one is. It is current state, not a windowed count — an
@@ -226,21 +235,32 @@ function collectFutures() {
 }
 
 /**
- * collectScorecard — per jev decision kind: answered, unknown, overridden, agreement; then every
- * override per slug with its reason and whether a report exists. Rows that predate the `jev` field
- * are unknown and stay out of the agreement rate (counting them as agreement is the bug blip 62
- * describes). `in-flight` is the spawn cap, not a jev answer, so its rows are never unknown.
+ * collectScorecard — per jev decision kind: answered, unknown, overridden, the override rate, and how
+ * many rows carried a field jev defaulted; then every override per slug with its reason and whether a
+ * report exists. Rows that predate the `jev` field are unknown, never agreement (counting them as
+ * agreement is the bug blip 62 describes). `in-flight` is the spawn cap, not a jev answer, so its rows
+ * are never unknown. `permit` is a jev answer with no person behind it, so it is counted like the rest
+ * and the verdict split is stated.
+ *
+ * `copied` is the tautology made visible: rows whose decision equals jev's answer without an override,
+ * i.e. rows where the two fields are equal because one was assigned from the other. It is printed as
+ * a count and never as a score, and `agreement` says in words that no real one is computable.
+ * `defaults` names the fields jev filled in under the caller without the caller saying so — the rows
+ * that most need a person's eyes, and the ones that were invisible until now.
  */
 function collectScorecard(rows) {
-	const KINDS = ["mode", "count", "route", "thinking", "in-flight"];
+	const KINDS = ["mode", "count", "route", "thinking", "permit", "in-flight"];
 	const answered = (r) =>
 		Object.prototype.hasOwnProperty.call(r, "jev") && r.jev !== undefined && r.jev !== null && r.jev !== "";
+	// A row written before `defaults` existed (or with an empty list) has nothing to count.
+	const defaultedFields = (r) => (Array.isArray(r.defaults) ? r.defaults.filter((f) => typeof f === "string") : []);
 	const kinds = {};
 	for (const kind of KINDS) {
 		const rs = rows.filter((r) => r.command === kind);
 		const withJev = rs.filter(answered);
-		const agreed = withJev.filter((r) => String(r.decision) === String(r.jev));
+		const copied = withJev.filter((r) => r.overridden !== true && String(r.decision) === String(r.jev));
 		const overridden = rs.filter((r) => r.overridden === true);
+		const defaulted = rs.filter((r) => defaultedFields(r).length > 0);
 		const isCap = kind === "in-flight";
 		kinds[kind] = {
 			rows: rs.length,
@@ -248,10 +268,22 @@ function collectScorecard(rows) {
 			unknown: isCap ? 0 : rs.length - withJev.length,
 			overridden: overridden.length,
 			overridden_with_jev: overridden.filter(answered).length,
-			agreed: agreed.length,
-			agreement_rate: withJev.length ? percent(agreed.length, withJev.length) : null,
+			// How often a person overruled jev, out of every row of this kind. This is the number the
+			// word "agreement" used to be printed on; `1 - rate` is the tautology, not the rate.
+			override_rate: rs.length ? percent(overridden.length, rs.length) : null,
+			copied: copied.length,
+			defaulted: defaulted.length,
+			defaulted_fields: tally(defaulted.flatMap(defaultedFields), (f) => f),
 		};
 		if (isCap) kinds[kind].cap = rs.length;
+	}
+	const permitRows = rows.filter((r) => r.command === "permit");
+	const permitVerdicts = tally(permitRows, (r) => (r.decision ? String(r.decision) : ""));
+	const defaultRows = rows.filter((r) => defaultedFields(r).length > 0);
+	const defaultsByKind = {};
+	for (const row of defaultRows) {
+		const kind = row.command || "(no command)";
+		defaultsByKind[kind] = (defaultsByKind[kind] || 0) + 1;
 	}
 
 	// One entry per slug, not per row: an old overridden spawn wrote the flag on all four lines.
@@ -282,6 +314,30 @@ function collectScorecard(rows) {
 
 	return {
 		kinds,
+		// No agreement rate exists in this log: a non-override row copies jev's answer into the
+		// decision, so the two fields are equal by construction. Said here rather than in a comment
+		// alone, because the screen is what people quote.
+		agreement: {
+			measurable: false,
+			rows_scored: 0,
+			measured_on: null,
+			why: "every row without --override-jev copies jev's answer into `decision` (bin/delegate), so decision === jev by construction; no row records a person's answer independently",
+		},
+		// The fields jev filled in under the caller, per kind and in total: jev deciding four things
+		// and defaulting two of them is the case that needs review, and it was invisible.
+		defaults: {
+			rows: defaultRows.length,
+			by_kind: defaultsByKind,
+			by_field: tally(defaultRows.flatMap(defaultedFields), (f) => f),
+		},
+		// jev's permit answers: allow / deny / ask. `recorded` false is the finding, not a zero.
+		permit: {
+			recorded: permitRows.length > 0,
+			rows: permitRows.length,
+			verdicts: permitVerdicts,
+			// Nobody's counter-answer is in the log, so nothing scores these yet.
+			human_counter_answers: 0,
+		},
 		overrides: {
 			rows: entries.reduce((n, e) => n + e.rows, 0),
 			slugs: entries.length,
@@ -451,16 +507,42 @@ function render(stats) {
 	// sits with the futures panel above the latency numbers.
 	const s = stats.jev_scorecard;
 	const hasScore = Object.values(s.kinds).some((k) => k.rows) || s.overrides.rows;
-	const scoreLines = hasScore ? ["jev scorecard (what jev answered, and whether it held):"] : ["jev scorecard: no scored decisions in this window"];
-	if (hasScore) scoreLines.push("  kind        answered/rows  unknown  overridden  agreement");
-	for (const kind of ["mode", "count", "route", "thinking", "in-flight"]) {
+	const scoreLines = hasScore
+		? ["jev scorecard (what jev answered, how often a person overruled it, and what it defaulted):"]
+		: ["jev scorecard: no scored decisions in this window"];
+	if (hasScore) scoreLines.push("  kind        answered/rows  unknown  overridden  override%  defaulted");
+	for (const kind of ["mode", "count", "route", "thinking", "permit", "in-flight"]) {
 		const k = s.kinds[kind];
 		if (!hasScore || !k.rows) continue;
 		const unknown = kind === "in-flight" ? `${k.cap} cap` : `${k.unknown}`;
 		scoreLines.push(
-			`  ${kind.padEnd(11)} ${String(`${k.answered}/${k.rows}`).padEnd(14)} ${String(unknown).padEnd(8)} ${String(k.overridden).padEnd(11)} ${k.agreement_rate === null ? "—" : `${k.agreement_rate}%`}`,
+			`  ${kind.padEnd(11)} ${String(`${k.answered}/${k.rows}`).padEnd(14)} ${String(unknown).padEnd(8)} ${String(k.overridden).padEnd(11)} ${String(k.override_rate === null ? "—" : `${k.override_rate}%`).padEnd(10)} ${k.defaulted}`,
 		);
 	}
+	// One line for the defaulted fields. Not one per kind: a spawn writes four rows and every row
+	// of it carries the same `defaults` list, so a per-kind breakdown would print the same sentence
+	// four times and count one defaulted field four times.
+	const defByField = Object.entries(s.defaults.by_field)
+		.sort((a, b) => b[1] - a[1])
+		.map(([f, n]) => `${f} ${n}`)
+		.join(", ");
+	if (hasScore && s.defaults.rows)
+		scoreLines.push(
+			`defaults: jev filled in ${s.defaults.rows} decision rows (${defByField}) — a spawn writes four, so one default shows up four times`,
+		);
+	// The word this block used to print was "agreement", and it was a tautology. Naming it costs two
+	// lines and stops the most-quoted number in the harness from being a lie told in good faith.
+	scoreLines.push(
+		"agreement: not measurable from this log — a spawn without --override-jev copies jev's answer",
+		"  into `decision` (bin/delegate), so decision === jev on those rows by construction. The column",
+		"  above is the override rate: how often a person overruled jev, out of rows of that kind.",
+	);
+	const pm = s.permit;
+	scoreLines.push(
+		pm.recorded
+			? `permit: ${pm.rows} row${pm.rows === 1 ? "" : "s"} (${pct(pm.verdicts)}) — jev's own answers; no person's counter-answer is recorded, so nothing scores them yet`
+			: "permit: 0 rows recorded — jev's permit answers never reached state/decisions.jsonl, so the highest-consequence calls have no score",
+	);
 	const o = s.overrides;
 	if (o.rows) scoreLines.push(
 		`override log: ${o.rows} of ${d.total} decision rows (${percent(o.rows, d.total)}%) over ${o.slugs} slug${o.slugs === 1 ? "" : "s"} — ` +
