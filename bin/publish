@@ -28,13 +28,22 @@
 #     trailing period or a reason after it; the body carries the bare word, never the decoration;
 #   - a branch with no commit carrying the `Agent-Slug:` trailer (nothing ties the branch to the
 #     worker that wrote the report);
-#   - `gh` not on PATH, and a tree that is not a git repo.
+#   - `gh` not on PATH, and a tree that is not a git repo;
+#   - a push whose result the remote does not confirm. The sha being pushed is read before the
+#     push and origin's head for the branch is read back afterwards with `git ls-remote`; a
+#     different sha, a missing branch or an unreadable answer is a refusal with both shas named,
+#     because a push that cannot be proved is not a publish (twice it printed a URL and exited 0
+#     while `git ls-remote` still showed the old head).
 #
 # What it does, in order: the target repo's own body gate (`make pr-check BODY=<file>`, else
 # `scripts/pr-gate.sh --body <file>`, else skipped with a line saying so) — a red gate stops the
 # publish before anything leaves the machine; then the branch's existing pull requests, asked once
 # across all states, so a branch that is already merged or already open never becomes a second PR;
-# then the branch is pushed to origin and the PR is opened against trunk.
+# then the branch is pushed to origin, the remote head is read back and has to be the commit that
+# was just pushed, and the PR is opened against trunk. A publish that stops earlier on the
+# duplicate guard's answer — the PR is already open, or the branch is already merged — prints what
+# origin holds for the branch and refuses when that is not the branch: nothing was pushed there, so
+# a URL on its own would read as a publish.
 #
 # What it carries from the report into the body: the Mission line, the bare review tier, the
 # Evidence block, the Thrown away section when there is one, and the worker's own `Test change:`
@@ -80,6 +89,46 @@ die() {
 	exit 1
 }
 note() { printf '%s: %s\n' "$prog" "$*" >&2; }
+
+# The push has to be proved by the remote, not believed from git's exit code. Twice this command
+# printed a URL and exited 0 while `git ls-remote origin <branch>` still showed the old head, and
+# pushing the same branch by hand worked immediately: the remote, the auth and the branch were all
+# fine, the publish had simply never confirmed that the commit it named was the commit origin has.
+# So the head is read back, in both places a publish can end: after the push, and on the guard's
+# answers — an "already open" or "already merged" publish pushed nothing, so what it prints as the
+# result must not read as one.
+local_head() { # <cwd> <branch> — the sha the branch is at here, empty when git cannot say
+	git -C "$1" rev-parse --verify --quiet "refs/heads/$2" 2>/dev/null || true
+}
+remote_head() { # <cwd> <branch> — the sha origin holds (empty: none); nonzero when the question failed
+	local out
+	out=$(git -C "$1" ls-remote origin "refs/heads/$2" 2>/dev/null) || return 3
+	printf '%s' "$out" | awk 'NR==1 { print $1 }'
+	return 0
+}
+
+# stopped_unpushed <why the publish stopped> — the guard answered, so nothing was pushed. When the
+# remote and the branch disagree, that answer is not a publish: the PR exists, the branch carries
+# commits the PR does not show, and closing the worker over it would throw the work away quietly.
+# Exit nonzero and name both shas, so `delegate finish` stops at step 1 instead of printing
+# `published`.
+stopped_unpushed() {
+	local here there ahead
+	here=$(local_head "$cwd" "$branch")
+	[ -n "$here" ] || return 0
+	if ! there=$(remote_head "$cwd" "$branch"); then
+		die "$1, and origin's head for $branch could not be read, so this publish is not confirmed"
+	fi
+	if [ -z "$there" ]; then
+		die "$1, and origin has no $branch at all, so the pull request's code is not this branch — push it and run this again"
+	fi
+	if [ "$there" = "$here" ]; then
+		return 0
+	fi
+	ahead=$(git -C "$cwd" rev-list --count "$there..$here" 2>/dev/null || printf '?')
+	note "not published: origin/$branch is at ${there:0:7}, the branch is at ${here:0:7} — $ahead commit(s) the pull request does not show"
+	die "$1, but origin/$branch is at ${there:0:7} and the branch is at ${here:0:7}, so the pull request does not carry this work — push the branch and run this again"
+}
 
 usage() {
 	printf 'usage: %s <slug> [--cwd DIR]\n' "$prog"
@@ -418,6 +467,7 @@ if [ -n "$pr_line" ]; then
 	case $pr_state in
 	OPEN)
 		note "#$pr_number is already open for $branch: $pr_url"
+		stopped_unpushed "#$pr_number is already open for $branch"
 		printf '%s\n' "$pr_url"
 		exit 0
 		;;
@@ -426,6 +476,7 @@ if [ -n "$pr_line" ]; then
 		case $ahead in
 		0)
 			note "$branch is already merged as #$pr_number — nothing to publish"
+			stopped_unpushed "$branch is already merged as #$pr_number"
 			exit 0
 			;;
 		unknown)
@@ -442,11 +493,25 @@ if [ -n "$pr_line" ]; then
 	esac
 fi
 
-# 8. Push the branch only. Never a force, never trunk.
+# 8. Push the branch only. Never a force, never trunk — and never on the push's own word: the sha
+# being pushed is read first, origin is asked for the branch's head afterwards, and a mismatch is
+# a refusal, not a warning. A push that cannot be confirmed must not end in a PR URL.
 note "pushing $branch to origin"
+pushed=$(local_head "$cwd" "$branch")
+[ -n "$pushed" ] || die "git cannot read the head of $branch in $cwd, so there is nothing to prove was pushed"
 if ! git -C "$cwd" push -u origin "$branch"; then
 	die "git push failed, so no pull request was opened"
 fi
+if ! there=$(remote_head "$cwd" "$branch"); then
+	die "$branch was pushed but its head could not be read back from origin (git ls-remote failed), so the push is unconfirmed — nothing was published"
+fi
+if [ -z "$there" ]; then
+	die "$branch was pushed but origin lists no branch of that name, so the push did not land — nothing was published"
+fi
+if [ "$there" != "$pushed" ]; then
+	die "the push reported success but origin/$branch is at ${there:0:7}, not ${pushed:0:7} (the commit just pushed), so nothing was published — the remote is not where this publish thinks it is"
+fi
+note "origin/$branch is at ${there:0:7}, the commit just pushed"
 
 title=$(git -C "$cwd" log -1 --format=%s "$branch" 2>/dev/null || true)
 [ -n "$title" ] || title="Worker $slug"
