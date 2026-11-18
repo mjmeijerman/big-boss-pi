@@ -19,6 +19,10 @@
 #   G. The third proof: a PR the host squash-merged deletes a branch the two patch proofs cannot see
 #      (the branch commits were rewritten on trunk), a commit written after that merge keeps the
 #      branch and is named, and a `gh` that answers nothing keeps it too.
+#   G4. The head comes from the pull request, not from `origin/<branch>`: a branch whose remote was
+#      deleted by the merge is deleted when its local head is the `headRefOid` the PR reports; a head
+#      that differs from it, a PR that reports no head sha, and two PRs on one head are all kept,
+#      each naming the clause that held it.
 #
 #   bash scripts/tests/test-prune-refs.sh      exit 0 = every case held
 set -uo pipefail
@@ -86,6 +90,9 @@ want_branch_in() { # <repo> <name> <present|gone>
 # The bulk `pr list` is what the script asks once for every branch. A `pr list --head BRANCH` is the
 # third proof's question about one branch, and the dates below are what its commit dates are measured
 # against: squash-clean's commits are older than its merge, squash-new has one written after it.
+# The fourth column is the pull request's `headRefOid`, read back from the fixture itself when it has
+# to equal the local head — the host deletes `origin/<branch>` on merge, so that sha, not the
+# remote-tracking ref, is what proves the merge saw this branch.
 stub=$work/stub
 mkdir -p "$stub"
 cat >"$stub/gh" <<'STUB'
@@ -102,11 +109,19 @@ for arg in "$@"; do
 done
 mode=${GH_MODE:-ok}
 if [ -n "$head" ]; then
+	local_head=$(git rev-parse --verify --quiet "refs/heads/$head" 2>/dev/null) || local_head=""
 	case $mode in
 	ok)
 		case $head in
-		squash-clean) printf '21\tMERGED\t2020-01-02T00:00:00Z\n' ;;
-		squash-new) printf '22\tMERGED\t2019-12-31T00:00:00Z\n' ;;
+		squash-clean) printf '21\tMERGED\t2020-01-02T00:00:00Z\t%s\n' "$local_head" ;;
+		squash-gone) printf '31\tMERGED\t2020-01-02T00:00:00Z\t%s\n' "$local_head" ;;
+		squash-new) printf '22\tMERGED\t2019-12-31T00:00:00Z\t%s\n' "$local_head" ;;
+		head-mismatch) printf '33\tMERGED\t2020-01-02T00:00:00Z\t0123456789abcdef0123456789abcdef01234567\n' ;;
+		head-none) printf '34\tMERGED\t2020-01-02T00:00:00Z\t\n' ;;
+		head-two)
+			printf '35\tMERGED\t2020-01-02T00:00:00Z\t%s\n' "$local_head"
+			printf '36\tMERGED\t2020-01-03T00:00:00Z\t%s\n' "$local_head"
+			;;
 		*) ;;
 		esac
 		;;
@@ -125,6 +140,10 @@ ok | head-empty | head-fail)
 	printf '13\tsquashed\tMERGED\n'
 	printf '21\tsquash-clean\tMERGED\n'
 	printf '22\tsquash-new\tMERGED\n'
+	printf '31\tsquash-gone\tMERGED\n'
+	printf '33\thead-mismatch\tMERGED\n'
+	printf '34\thead-none\tMERGED\n'
+	printf '35\thead-two\tMERGED\n'
 	;;
 *)
 	printf 'gh: HTTP 401: Bad credentials\n' >&2
@@ -351,6 +370,9 @@ git -C "$repo3" add README
 # commit written after the merge is what keeps a branch, and that is what these cases test.
 commit_at "2019-12-29T00:00:00 +0000" "base"
 git -C "$repo3" push -q origin main
+# The branches added below are cut from this commit, not from trunk's tip: a trunk commit dated after
+# a pull request merged is not new work on the branch (see "Still open" in the report).
+base_sha=$(git -C "$repo3" rev-parse main)
 
 # squash-clean: two commits in, one squashed commit on trunk, nothing written afterwards.
 git -C "$repo3" checkout -qb squash-clean
@@ -385,9 +407,36 @@ git -C "$repo3" push -q origin squash-new
 git -C "$repo3" checkout -q main
 late_sha=$(git -C "$repo3" rev-parse --short squash-new)
 
+# squash-gone: the ordinary end of a merged branch. The host deletes origin/<branch> when it merges,
+# so there is no remote-tracking ref left to compare the local head with; the pull request's own
+# `headRefOid` is the only witness that the merge saw this branch.
+git -C "$repo3" checkout -qb squash-gone "$base_sha"
+for step in one two; do
+	printf '%s\n' "$step" >"$repo3/gone-$step.file"
+	git -C "$repo3" add "gone-$step.file"
+	commit_at "2019-12-30T02:00:00 +0000" "squash-gone $step"
+done
+git -C "$repo3" push -q origin squash-gone
+git -C "$repo3" checkout -q main
+git -C "$repo3" merge -q --squash squash-gone
+git -C "$repo3" commit -qm "squash-gone one and two (#31)"
+git -C "$repo3" push -q origin main
+git -C "$repo3" push -q origin --delete squash-gone
+
+# head-mismatch, head-none and head-two: the three shapes where the pull request cannot say the head
+# here is the head it merged. None is pushed, so nothing on a remote can rescue them.
+for shape in mismatch none two; do
+	git -C "$repo3" checkout -qb "head-$shape" "$base_sha"
+	printf '%s\n' "$shape" >"$repo3/$shape.file"
+	git -C "$repo3" add "$shape.file"
+	commit_at "2019-12-30T03:00:00 +0000" "head-$shape work"
+done
+git -C "$repo3" checkout -q main
+mismatch_head=$(git -C "$repo3" rev-parse --short head-mismatch)
+
 run -- --cwd "$repo3"
 want_rc 0 "the third proof on a dry run"
-want_text "would delete branch squash-clean (squash-clean two): PR #21 MERGED 2020-01-02T00:00:00Z, head pushed, no commit after the merge" \
+want_text "would delete branch squash-clean (squash-clean two): PR #21 MERGED 2020-01-02T00:00:00Z, head is the merged head, no commit after the merge" \
 	"a branch whose pull request merged before its last commit is listed for deletion"
 want_text "kept branch squash-new (squash-new late step)" \
 	"a commit written after the merge keeps the branch"
@@ -405,13 +454,46 @@ for mode in head-fail head-empty; do
 		"a head gh cannot answer about is kept and says so ($mode)"
 done
 
+# --- G4. the merged head is read from the pull request, not from the ref the merge deletes -------
+
+# The host deletes origin/<branch> when it merges, so clause 2 has to be satisfied by the head the
+# pull request says it merged. squash-gone has no remote-tracking ref at all and is still deleted;
+# the three head-* branches are the ways that clause refuses to answer.
+run -- --cwd "$repo3"
+want_rc 0 "the head comes from the pull request"
+if git -C "$repo3" rev-parse --verify --quiet refs/remotes/origin/squash-gone >/dev/null; then
+	fail "origin/squash-gone still exists, so the case does not test a deleted remote"
+else
+	pass "the fixture has no origin/squash-gone, as a merged branch has none"
+fi
+want_text "would delete branch squash-gone (squash-gone two): PR #31 MERGED 2020-01-02T00:00:00Z, head is the merged head, no commit after the merge" \
+	"a merged branch whose remote is gone is deleted by the head the pull request reports"
+want_branch_in "$repo3" squash-gone present
+want_text "kept branch head-mismatch (head-mismatch work)" "a head that is not the merged head is kept"
+want_text "merged head 0123456 is not this branch's head $mismatch_head, so it carries work the merge never saw" \
+	"the refusal names both shas"
+want_text "kept branch head-none (head-none work)" "a pull request with no head sha keeps the branch"
+want_text "the pull request does not report a head sha" "the refusal says the head sha is missing"
+want_text "kept branch head-two (head-two work)" "two pull requests on one head keep the branch"
+want_text "2 pull requests on this head, so which one merged is ambiguous" \
+	"the refusal says the two pull requests are ambiguous"
+want_branch_in "$repo3" head-mismatch present
+want_branch_in "$repo3" head-none present
+want_branch_in "$repo3" head-two present
+
 # G3. and when it can answer, exactly that branch is deleted.
 run -- --cwd "$repo3" --apply --yes
 want_rc 0 "the third proof on --apply"
 want_text "deleted branch squash-clean (squash-clean two): PR #21 MERGED 2020-01-02T00:00:00Z" \
 	"the squash-merged branch is deleted with its pull request named"
+want_text "deleted branch squash-gone (squash-gone two): PR #31 MERGED 2020-01-02T00:00:00Z" \
+	"the branch with no remote-tracking ref is deleted by the same proof"
 want_branch_in "$repo3" squash-clean gone
+want_branch_in "$repo3" squash-gone gone
 want_branch_in "$repo3" squash-new present
+want_branch_in "$repo3" head-mismatch present
+want_branch_in "$repo3" head-none present
+want_branch_in "$repo3" head-two present
 
 printf '\n'
 if [ "$fails" = 0 ]; then
