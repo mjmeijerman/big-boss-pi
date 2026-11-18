@@ -13,8 +13,9 @@
 #   * ancestry: `git branch --merged origin/<trunk>` lists it; or
 #   * squash-equivalence: `git cherry origin/<trunk> <branch>` marks every one of its commits `-`,
 #     meaning the patch is already upstream under another sha; or
-#   * squash-merge: GitHub's pull request for that head is MERGED, the local head is the pushed
-#     head, and no commit on the branch was written after that merge.
+#   * squash-merge: GitHub's pull request for that head is MERGED, the local head is the head that
+#     pull request merged (its `headRefOid`), and no commit on the branch was written after that
+#     merge.
 # The second is not decoration: this repo squash-merges, so a branch merged through a PR is never an
 # ancestor of trunk. It is the same check bin/publish's duplicate guard and `delegate close --merged`
 # trust. One `+` line — a commit whose patch is not in trunk, pushed or not — and the branch stays.
@@ -23,7 +24,10 @@
 # squashed into one: a merge commit has no patch to match, and the squashed commits were rewritten on
 # trunk, so `git cherry` marks them `+` and the branch was kept forever. There the evidence is the
 # pull request itself, and it has to promise three things at once — MERGED, the head here is the
-# head there, and nothing was committed after the merge. Anything else the pull request cannot
+# head it merged, and nothing was committed after the merge. The head comes from the pull request,
+# not from `origin/<branch>`: the host deletes that remote branch when it merges, so a ref that is
+# gone proves nothing — a live remote-tracking ref that still equals the local head is accepted too,
+# because that is the common case and it means the same thing. Anything else the pull request cannot
 # settle (`gh` missing or silent, no pull request, two or more, a state that is not MERGED, an
 # unreadable `mergedAt`) keeps the branch and prints the clause that held it. It never falls through
 # to the delete path.
@@ -133,10 +137,10 @@ fi
 # `ok<TAB><proof>` when the branch is provably squash-merged, `no<TAB><reason>` otherwise. Every
 # ambiguity is a `no`, because guessing here deletes work.
 squash_evidence() {
-	local branch=$1 list n number state merged_at epoch local_head remote_head worst when after
-	local template='{{range .}}{{.number}}{{"\t"}}{{.state}}{{"\t"}}{{.mergedAt}}{{"\n"}}{{end}}'
+	local branch=$1 list n number state merged_at head_oid epoch local_head remote_head worst when after
+	local template='{{range .}}{{.number}}{{"\t"}}{{.state}}{{"\t"}}{{.mergedAt}}{{"\t"}}{{.headRefOid}}{{"\n"}}{{end}}'
 	if ! list=$(cd "$cwd" && gh pr list --head "$branch" --state all --limit 100 \
-		--json number,state,mergedAt --template "$template" 2>&1); then
+		--json number,state,mergedAt,headRefOid --template "$template" 2>&1); then
 		printf 'no\tgh gave nothing for this head: %s' "$(printf '%s' "$list" | head -n 1)"
 		return 0
 	fi
@@ -149,7 +153,7 @@ squash_evidence() {
 		printf 'no\t%s pull requests on this head, so which one merged is ambiguous' "$n"
 		return 0
 	fi
-	IFS=$'\t' read -r number state merged_at <<<"$list"
+	IFS=$'\t' read -r number state merged_at head_oid <<<"$list"
 	if [ "$state" != MERGED ]; then
 		printf 'no\tPR #%s is %s, not MERGED' "$number" "${state:-unknown}"
 		return 0
@@ -159,15 +163,20 @@ squash_evidence() {
 		printf 'no\tPR #%s has no readable mergedAt (%s)' "$number" "${merged_at:-empty}"
 		return 0
 	fi
-	remote_head=$(git -C "$cwd" rev-parse --verify --quiet "refs/remotes/origin/$branch") || remote_head=""
-	if [ -z "$remote_head" ]; then
-		printf 'no\tnothing pushed to origin/%s, so the merge does not cover this head' "$branch"
-		return 0
-	fi
+	# The head the pull request merged is the witness, because the merge deletes origin/<branch>.
+	# A live remote-tracking ref that still equals the local head is the same clause by another road.
 	local_head=$(git -C "$cwd" rev-parse --verify --quiet "refs/heads/$branch") || local_head=""
-	if [ "$local_head" != "$remote_head" ]; then
-		printf 'no\tlocal head %s is not the pushed head, so it carries work the merge never saw' \
-			"$(printf '%s' "$local_head" | cut -c1-7)"
+	remote_head=$(git -C "$cwd" rev-parse --verify --quiet "refs/remotes/origin/$branch") || remote_head=""
+	if [ -n "$head_oid" ] && [ "$local_head" = "$head_oid" ]; then
+		:
+	elif [ -n "$remote_head" ] && [ "$local_head" = "$remote_head" ]; then
+		:
+	elif [ -z "$head_oid" ]; then
+		printf 'no\tthe pull request does not report a head sha, so the merge cannot be matched to this head'
+		return 0
+	else
+		printf "no\tmerged head %s is not this branch's head %s, so it carries work the merge never saw" \
+			"$(printf '%s' "$head_oid" | cut -c1-7)" "$(printf '%s' "$local_head" | cut -c1-7)"
 		return 0
 	fi
 	worst=$(git -C "$cwd" log --format='%ct %H' "$branch" 2>/dev/null |
@@ -180,7 +189,8 @@ squash_evidence() {
 			"$number" "$merged_at"
 		return 0
 	fi
-	printf 'ok\tPR #%s %s %s, head pushed, no commit after the merge' "$number" "$state" "$merged_at"
+	printf 'ok\tPR #%s %s %s, head is the merged head, no commit after the merge' \
+		"$number" "$state" "$merged_at"
 }
 
 declare -A by_ancestry=()
