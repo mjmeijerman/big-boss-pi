@@ -384,6 +384,29 @@ run worker
 check "  ...and no --branch when the checkout is the branch" bash -c "! grep -q -- '--branch' '$GATE_LOG'"
 rm -rf "$REPO/scripts"
 
+# --- a target repo's test-change gate gets the worker's own reason ---------------------------------
+#
+# `make pr-check` here (and in /home/mark/.pi) asks why a test changed beside its source, and a
+# body with that line is the only thing that answers it. The worker is the only one who knows, so
+# the report's line is carried into the body; when the report has none, the body has none, and the
+# gate that wants one still refuses. Nothing here invents a reason.
+
+new_case test-change-carried
+export FAKE_HEAD_BRANCH=trunk GATE_LOG=$CASE/gate.log
+gate_makefile
+sed -i 's|^Review tier:|**Test change:** the retry needed a fake clock, so the retry test fakes one.\n\nReview tier:|' "$REPORTER"
+run worker
+if [ "$rc" -eq 0 ]; then pass "a report with a Test change line publishes"; else fail "a report with a Test change line publishes (exit $rc: $err)"; fi
+check "  ...the body carries the bare label and the reason" bash -c "grep -qxF 'Test change: the retry needed a fake clock, so the retry test fakes one.' '$FAKE_BODY_OUT'"
+check "  ...and only once" bash -c "[ \$(grep -c '^Test change:' '$FAKE_BODY_OUT') -eq 1 ]"
+
+new_case test-change-absent
+export FAKE_HEAD_BRANCH=trunk GATE_LOG=$CASE/gate.log
+gate_makefile
+run worker
+if [ "$rc" -eq 0 ]; then pass "a report with no Test change line still publishes"; else fail "a report with no Test change line still publishes (exit $rc: $err)"; fi
+check "  ...and puts no Test change line in the body" bash -c "! grep -q '^Test change:' '$FAKE_BODY_OUT'"
+
 new_case red-gate
 mkdir -p "$REPO/scripts"
 cat >"$REPO/scripts/pr-gate.sh" <<'EOF'

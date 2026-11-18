@@ -30,6 +30,11 @@
 #     worker that wrote the report);
 #   - `gh` not on PATH, and a tree that is not a git repo.
 #
+# What it carries from the report into the body: the Mission line, the bare review tier, the
+# Evidence block, the Thrown away section when there is one, and the worker's own `Test change:`
+# line when the report has one (a target repo may require a reason for a test changed beside its
+# source; the worker knows it, so it is carried verbatim and never invented).
+#
 # What it does, in order: the target repo's own body gate (`make pr-check BODY=<file>`, else
 # `scripts/pr-gate.sh --body <file>`, else skipped with a line saying so; when the checkout is not
 # on the branch being published the branch is named to the gate, because a gate reading the
@@ -255,12 +260,26 @@ section_body() { # <report> <heading text>
 }
 evidence=$(section_body "$report" "Evidence")
 thrown=$(section_body "$report" "Thrown away")
+# A target repo may ask why a test changed beside its source (this repo's own test-change gate does).
+# The worker is the only one who knows, so the report's line is carried into the body verbatim,
+# label and all, and only when the report has one: a body with no line is a body the gate refuses,
+# which is the right answer for a report that never said why. **Test change:** and a trailing
+# period are the markdown the worker wrote; the label is reduced to the bare form the gate reads.
+test_change=$(grep -m1 -iE '^[[:space:]]*(\*\*)?Test change(\*\*)?:' "$report" || true)
+if [ -n "$test_change" ]; then
+	test_change=$(printf '%s' "$test_change" | tr -d '*' |
+		sed -e 's/^[[:space:]]*[Tt][Ee][Ss][Tt][[:space:]][Cc][Hh][Aa][Nn][Gg][Ee][[:space:]]*:[[:space:]]*//')
+	test_change="Test change: $test_change"
+fi
 
 body=$(mktemp "${TMPDIR:-/tmp}/publish-body.XXXXXX")
 trap 'rm -f "$body"' EXIT
 {
 	printf '%s\n\n' "$mission"
 	printf 'Review tier: %s\n\n' "$tier"
+	if [ -n "$test_change" ]; then
+		printf '%s\n\n' "$test_change"
+	fi
 	printf '## Evidence\n\n%s\n' "$evidence"
 	if [ -n "$thrown" ]; then
 		printf '\n## Thrown away\n\n%s\n' "$thrown"
