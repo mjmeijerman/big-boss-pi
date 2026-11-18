@@ -1396,7 +1396,7 @@ You are the genie. Prove it runs.
 - Work in: \`$cwd\`. Report file: \`$report\`.
 - Mode: \`$mode\` ($mode_src$overridden_note), route: $jev_route ($route_src), thinking: \`$jev_level\` ($thinking_src: $jev_effort)
 - Mission: who is better off and what shows it, in one line. Effort counts are cost, not progress.
-- Iteration: expect two or more cycles; you may throw this away.
+- Iteration: expect at least two cycles; you may throw this away.
 - Spec history: read the newest \`specs/archive/\` spec for this area first; it is the previous
   decision, or say there is none.
 
@@ -1409,23 +1409,24 @@ $acceptance_block
 
 1. Do the task in \`$cwd\`; write nothing in \`$ROOT\` but the report.
 2. Never switch \`$cwd\` (the boss reads it). Cut a worktree inside the repo:
-   \`git worktree add .worktrees/SLUG -b BRANCH\` from its root — the sandbox binds the repo,
-   not its parent. No \`git checkout\`, \`switch\`, \`stash\` or \`reset\` in it.
-3. Ask the route first: \`jev route "<the task>"\`. If \`local\`, run \`local-run\` with the
-   text instead and put the answer in the report.
-4. Do not spawn agents or spaces or rename, move, close one; need more hands: say so.
-5. Commit on your branch and stop: no upload, no pull request, no fallback — the boss publishes.
-   Put the branch, the sha and the tier in the report (low: docs, comments, formatting; medium:
-   code, tests, migrations; high: extensions, AGENTS.md, .github/, git-hooks/, sandbox/, auth,
-   secrets, money, deletion). Never merge, never commit on trunk. You stay sandboxed:
-   publishing is the boss's
+   \`git worktree add .worktrees/SLUG -b BRANCH\` from its root: the sandbox binds the repo, not
+   its parent. No \`git checkout\`, \`switch\`, \`stash\` or \`reset\` in it.
+3. Route first: \`jev route "<the task>"\`; \`local\`: run \`local-run\`, answer in the report.
+4. Do not spawn, rename, move or close a space; need more hands: say so.
+5. Commit on your branch and stop: no push, no PR, no merge, never on trunk — the boss publishes.
+   You stay sandboxed: publishing is the boss's
    job, so it never needs host access from you.
 6. End every commit message with two trailers: \`Agent-Slug: $spawn_slug\` and \`Spec: $SPECS/$spawn_slug.md\`.
    The commit-msg hook stamps both; check \`git log -1 --format=%B\` before you report.
-7. Write the report before you stop:
+7. Write the report before you stop, in the form \`bin/publish\` reads:
    - Mission: the one-liner above, updated with what actually happened.
+   - \`Review tier: High\` — plain label, tier first: low (docs, comments, formatting), medium (code,
+     tests, migrations), high (extensions, AGENTS.md, .github/, git-hooks/, sandbox/, auth, secrets,
+     money, deletion). Prose after the word is fine.
+   - \`Test change: <why>\` — required when one diff changes a test and the source it tests; say what
+     the test now pins. No test can tell it apart: say that instead.
    - What now works: a command, a path, a passing test.
-   - What changed: one \`Commit: <sha>\` line, the files, the PR branch.
+   - What changed: one \`Commit: <sha>\`, the files, the PR branch.
    - Still open, and the one next action.
    - \`## Evidence\`: the exact command and its last 20 lines, fenced. No block, no close.
    - \`## Thrown away\`: what you deleted on purpose, and why. "nothing" is fine.
@@ -1433,10 +1434,10 @@ $acceptance_block
    Keep it short.
 8. No claim without the output; "not run" names what would run it.
 9. Then stay idle: the boss relays the report and closes the space — do not close it yourself.
-10. If the user must decide before work goes on, make the first line "DECISION NEEDED: <the
-    question>" and stop — only that keeps the space open.
+10. Must the user decide first? Make the first line "DECISION NEEDED: <the question>" and stop —
+    only that keeps the space open.
 
-Evidence scaffold (replace both pointy-bracket lines):
+Evidence scaffold:
 
 \`\`\`\`markdown
 ## Evidence
@@ -1450,7 +1451,7 @@ Output (last 20 lines):
 \`\`\`
 \`\`\`\`
 
-\`delegate close\` refuses a report with no Evidence block or with placeholders left in.
+\`delegate close\` refuses a report with no Evidence block or with a placeholder left in.
 EOF
 
 	argv=$(node -e 'process.stdout.write(JSON.stringify(["sh","-lc",process.argv[1]]))' \
