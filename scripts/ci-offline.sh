@@ -167,6 +167,14 @@ expect "delegate finish publishes, wipes and closes in order" 0 "finish: ok" -- 
 #     checkouts; it only ever asks ci-local for the jobs that cannot recurse back into here.
 expect "ci-local: four jobs, planted failures, no silent skip" 0 "ci-local: ok" -- \
 	bash "$root/scripts/tests/test-ci-local.sh"
+# 5j. Dead refs and two proofs before anything is deleted: a branch merged into trunk and a
+#     squash-merged branch go (the second is not an ancestor, so ancestry alone would keep it); an
+#     unpushed commit, a partially merged branch, an open PR and the current branch stay with their
+#     reason; a worktree whose directory is gone is pruned while the live one stays; and `--apply`
+#     without `--yes` on a non-interactive stdin refuses with exit 2. Throwaway repos with a bare
+#     origin and a stub gh, so no real branch and no network.
+expect "prune-refs: two proofs, a stub gh and a second yes" 0 "prune-refs: ok" -- \
+	bash "$root/scripts/tests/test-prune-refs.sh"
 
 # 6. Routing is a refusal, not a warning. delegate reads jev from $PI_BOSS_ROOT/bin, so a
 #    fake jev there answers route=local without a model and without touching the real tree.
