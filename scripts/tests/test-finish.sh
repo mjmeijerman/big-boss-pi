@@ -364,6 +364,44 @@ else
 	pass "DELEGATE_NO_REAP=1 makes no close call and says nothing"
 fi
 
+# 14. `space.close` answering ok is not the space being gone. This is the exact shape that bit a
+#     person: `delegate close ci-wiring` printed `closed`, `finish` printed `3/3 close`, the
+#     delegation entry was deleted — and the Herdr space was still there with a live idle pi in it.
+#     So the close is confirmed against `herdr-app ls`, the window's own list, and a space still on
+#     that list is a warning that names its id, with the worker kept so closing it again is possible.
+reset
+export FAKE_HERDR_LS='{"spaces":[{"id":"space-w1","name":"w1","folder":"/home/mark/big-boss-pi"}]}'
+run finish w1
+if [ "$RC" = 0 ]; then
+	fail "finish called a worker closed while herdr still listed its space, wanted a refusal — $OUT"
+elif ! printf '%s' "$OUT" | grep -qE 'step 3 of 3 \(close\)'; then
+	fail "finish did not name the close step as the failing one — $OUT"
+elif ! printf '%s' "$OUT" | grep -qF "space space-w1 (w1) is still open"; then
+	fail "the warning does not name the space and its id — $OUT"
+elif [ "$(grep -cF 'space.close --id space-w1 --confirmed true' "$work/herdr-calls")" -lt 2 ]; then
+	fail "the stubborn space was not retried: $(tr '
+' ';' <"$work/herdr-calls")"
+elif [ "$(open_workers)" != 1 ]; then
+	fail "a close that could not confirm the space dropped the delegation entry anyway, so it cannot be closed again"
+else
+	pass "a space herdr still lists is a warning naming its id, and the worker stays closeable"
+fi
+
+# 15. And the confirmation does not block the ordinary close: a space herdr no longer lists is gone,
+#     whatever space.close's own exit code said.
+reset
+export FAKE_HERDR_LS='{"spaces":[{"id":"sp-other","name":"somebody-else","folder":"/home/mark/.pi"}]}'
+run finish w1
+if [ "$RC" != 0 ]; then
+	fail "finish with a space herdr no longer lists exited $RC — $OUT"
+elif printf '%s' "$OUT" | grep -qF "is still open"; then
+	fail "a space herdr no longer lists was reported as still open — $OUT"
+elif [ "$(open_workers)" != 0 ]; then
+	fail "the confirmed close kept the delegation entry"
+else
+	pass "a space herdr no longer lists is a confirmed close"
+fi
+
 if [ "$fails" != 0 ]; then
 	printf '\nfinish: %d case(s) failed\n' "$fails" >&2
 	exit 1

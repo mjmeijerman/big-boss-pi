@@ -1722,6 +1722,36 @@ fi
 	say "state/decisions.jsonl: wipe done for $slug — close goes through:  $BIN/delegate close $slug"
 }
 
+# space_close <id> <name> — close one herdr space and prove it is gone.
+#
+# `herdr-app do space.close` answering 0 is not the space being gone. A `delegate close ci-wiring`
+# printed `closed`, `delegate finish` printed `3/3 close`, the delegation entry was deleted — and
+# the space was still there with a live idle `pi` in it. Only a person asking why found it, and by
+# then nothing recorded the space any more. So the close is confirmed against `herdr-app ls`, the
+# window's own list and the same one `reap` reads, with one retry for a space whose close has not
+# landed yet. An answer this side cannot read (no herdr-app, an empty list, a component that
+# refuses) is silence, not a finding: the close then stands on the record, as it always has.
+# Returns 1, with a warning naming the id and the name, only when herdr still lists the space.
+space_close() {
+	local id=$1 name=$2 attempt spaces
+	[ -n "$id" ] || return 0
+	command -v herdr-app >/dev/null 2>&1 || return 0
+	for attempt in 1 2; do
+		herdr-app do space.close --id "$id" --confirmed true >/dev/null 2>&1 || true
+		spaces=$(herdr-app ls 2>/dev/null) || return 0
+		[ -n "$spaces" ] || return 0
+		# The id is matched as a JSON token, never parsed out of a shape this side does not own.
+		if ! printf '%s' "$spaces" | grep -qF "\"$id\""; then
+			return 0
+		fi
+		[ "$attempt" = 1 ] && sleep 1
+	done
+	printf '%s: warning: space %s%s is still open after space.close answered — herdr still lists it, so the worker is not closed. Close it by hand:\n' \
+		"$prog" "$id" "${name:+ ($name)}" >&2
+	printf '  herdr-app do space.close --id %s --confirmed true\n' "$id" >&2
+	return 1
+}
+
 cmd_close() {
 	local slug=${1:-} merged="" nothing="" nothing_given=""
 	[ "$#" -ge 1 ] || die 'usage: delegate close <slug> [--merged <pr-url-or-number>] [--nothing "<why nothing landed>"]'
@@ -1870,8 +1900,14 @@ fi
 		record_decision nothing "$slug" accepted "$nothing" false "$slug"
 	fi
 
-	herdr-app do space.close --id "$space" --confirmed true >/dev/null 2>&1 \
-		|| printf '%s: warning: space.close failed for %s\n' "$prog" "$space" >&2
+	# A close that cannot confirm the space is gone is not a close: the delegation entry is what
+	# a retry reads, so it stays, and `finish` stops at step 3 saying the space is still open.
+	if ! space_close "$space" "$slug"; then
+		printf '%s: refusing to close %s: its space %s would not close, and herdr still lists it. The delegation entry is kept, so this is the fix once the space is gone:\n' \
+			"$prog" "$slug" "$space" >&2
+		printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
+		return 1
+	fi
 	node -e '
 		const fs=require("fs");let j={};try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"))}catch{}
 		delete j[process.argv[2]];
@@ -2008,7 +2044,7 @@ cmd_sweep() {
 			say "closed $slug"
 			closed=$((closed + 1))
 		else
-			say "keep   $slug (close refused: no evidence block, placeholders left, or no wipe step recorded)"
+			say "keep   $slug (close refused: no evidence block, placeholders left, no wipe step recorded, or its space would not close)"
 			kept=$((kept + 1))
 		fi
 	done <<<"$slugs"
