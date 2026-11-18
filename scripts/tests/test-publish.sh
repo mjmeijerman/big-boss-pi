@@ -42,8 +42,17 @@ case " $* " in
 	;;
 *" rev-parse --verify "*)
 	[ "${FAKE_NO_BRANCH:-0}" = 1 ] && exit 1
-	# The branch's own head: publish reads it before the push and compares it with what origin
-	# answers afterwards, so a silent no-op push is caught.
+	# A commit asked for by sha is that sha; any other ref is the branch's own head. The head is
+	# what publish reads before the push and compares with what origin answers afterwards, so a
+	# silent no-op push is caught; the sha is what commit_in_trunk resolves a report's commit to.
+	for a in "$@"; do
+		case $a in
+		*"^{commit}")
+			printf '%s\n' "${a%"^{commit}"}"
+			exit 0
+			;;
+		esac
+	done
 	printf '%s\n' "${FAKE_LOCAL_HEAD:-0123456789abcdef0123456789abcdef01234567}"
 	;;
 *" ls-remote "*)
@@ -90,6 +99,18 @@ case " $* " in
 	# squash-merges and a merged branch is never an ancestor of trunk.
 	[ "${FAKE_CHERRY_FAIL:-0}" = 1 ] && exit 128
 	printf '0\n'
+	;;
+*" merge-base --is-ancestor "*)
+	# A commit that is in trunk by ancestry is the one shape the fakes cannot show through `git
+	# cherry`; the default is "not an ancestor", which is what a squash merge looks like.
+	exit "${FAKE_ANCESTOR_RC:-1}"
+	;;
+*" rev-list "*)
+	# The commits the branch has that trunk does not — the same set `git cherry` lists, which is
+	# what commit_in_trunk asks about one commit at a time.
+	[ "${FAKE_CHERRY_FAIL:-0}" = 1 ] && exit 128
+	printf '%s\n' "${FAKE_CHERRY:-- 0123456789abcdef0123456789abcdef01234567}" |
+		awk 'NF > 1 { print $2 }'
 	;;
 *" cherry "*)
 	[ "${FAKE_CHERRY_FAIL:-0}" = 1 ] && exit 128
@@ -812,6 +833,27 @@ new_closed_case closed-no-branch
 export FAKE_BRANCHES='feat/other' FAKE_TRAILERS=''
 run closed --cwd "$REPO"
 refused "a closed slug no branch carries is refused" "no branch in"
+check "  ...and nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
+
+# The branch is gone, not the work: prune-refs deletes a branch whose pull request merged, and a
+# close dropped the delegation entry, so a second `delegate finish` finds only the report. The
+# report's own `Commit:` line plus trunk answers it — the same commit_in_trunk the merged-PR guard
+# uses — instead of a refusal that reads as a broken worker.
+new_closed_case closed-branch-gone-already-merged
+printf '\nCommit: 0123456789abcdef0123456789abcdef01234567\n' >>"$ROOTDIR/reports/closed.md"
+export FAKE_BRANCHES='feat/other' FAKE_TRAILERS=''
+run closed --cwd "$REPO"
+if [ "$rc" -eq 0 ]; then pass "a closed slug whose branch is gone and whose change is in trunk exits 0"; else fail "a closed slug whose branch is gone and whose change is in trunk exits 0 (exit $rc: $err)"; fi
+check "  ...it says the branch is gone, not the work" said "no local branch in $REPO carries"
+check "  ...and that the change is already in trunk" said 'already in origin/main — nothing to publish'
+check "  ...nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
+check "  ...and no PR was created" bash -c '! grep -q "pr create" "$FAKE_LOG"'
+
+new_closed_case closed-branch-gone-not-merged
+printf '\nCommit: 1111111111111111111111111111111111111111\n' >>"$ROOTDIR/reports/closed.md"
+export FAKE_BRANCHES='feat/other' FAKE_TRAILERS='' FAKE_CHERRY='+ 1111111111111111111111111111111111111111'
+run closed --cwd "$REPO"
+refused "a closed slug whose branch is gone and whose change is not in trunk is still refused" "no branch in"
 check "  ...and nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
 
 new_closed_case closed-ambiguous
