@@ -240,7 +240,9 @@ function collectFutures() {
  * report exists. Rows that predate the `jev` field are unknown, never agreement (counting them as
  * agreement is the bug blip 62 describes). `in-flight` is the spawn cap, not a jev answer, so its rows
  * are never unknown. `permit` is a jev answer with no person behind it, so it is counted like the rest
- * and the verdict split is stated.
+ * and the verdict split is stated. The `in-flight` row is the spawn cap, which jev does not answer:
+ * it is printed as its own line with the number of cap checks recorded, what each decided, and how
+ * many refused a spawn, because folded into answered/rows it reads as a guard that never decides.
  *
  * `copied` is the tautology made visible: rows whose decision equals jev's answer without an override,
  * i.e. rows where the two fields are equal because one was assigned from the other. It is printed as
@@ -275,7 +277,15 @@ function collectScorecard(rows) {
 			defaulted: defaulted.length,
 			defaulted_fields: tally(defaulted.flatMap(defaultedFields), (f) => f),
 		};
-		if (isCap) kinds[kind].cap = rs.length;
+		if (isCap) {
+			// The cap row is not a jev answer — the collision guard is the branch diff (worker_paths vs
+			// task_paths in bin/delegate) — so the row carries what it is instead: how many cap checks
+			// were recorded, what each decided, and how many refused a spawn.
+			kinds[kind].cap = rs.length;
+			kinds[kind].jev_answers = false;
+			kinds[kind].decisions = tally(rs, (r) => (r.decision ? String(r.decision) : ""));
+			kinds[kind].blocked = rs.filter((r) => r.decision === "blocked").length;
+		}
 	}
 	const permitRows = rows.filter((r) => r.command === "permit");
 	const permitVerdicts = tally(permitRows, (r) => (r.decision ? String(r.decision) : ""));
@@ -506,17 +516,31 @@ function render(stats) {
 	// The scorecard: the one block that says whether the local model is worth its place, so it
 	// sits with the futures panel above the latency numbers.
 	const s = stats.jev_scorecard;
-	const hasScore = Object.values(s.kinds).some((k) => k.rows) || s.overrides.rows;
+	// `in-flight` is not a jev answer: it is the spawn cap, decided from the branch diff, and folded
+	// into answered/rows it read as "jev never answered" on a guard that decides on every spawn.
+	const jevKinds = ["mode", "count", "route", "thinking", "permit"];
+	const hasJevRows = jevKinds.some((k) => s.kinds[k] && s.kinds[k].rows);
+	const cap = s.kinds["in-flight"] || { rows: 0, decisions: {}, blocked: 0 };
+	const hasScore = hasJevRows || cap.rows || s.overrides.rows;
 	const scoreLines = hasScore
 		? ["jev scorecard (what jev answered, how often a person overruled it, and what it defaulted):"]
 		: ["jev scorecard: no scored decisions in this window"];
-	if (hasScore) scoreLines.push("  kind        answered/rows  unknown  overridden  override%  defaulted");
-	for (const kind of ["mode", "count", "route", "thinking", "permit", "in-flight"]) {
+	if (hasJevRows) scoreLines.push("  kind        answered/rows  unknown  overridden  override%  defaulted");
+	for (const kind of jevKinds) {
 		const k = s.kinds[kind];
-		if (!hasScore || !k.rows) continue;
-		const unknown = kind === "in-flight" ? `${k.cap} cap` : `${k.unknown}`;
+		if (!hasJevRows || !k.rows) continue;
 		scoreLines.push(
-			`  ${kind.padEnd(11)} ${String(`${k.answered}/${k.rows}`).padEnd(14)} ${String(unknown).padEnd(8)} ${String(k.overridden).padEnd(11)} ${String(k.override_rate === null ? "—" : `${k.override_rate}%`).padEnd(10)} ${k.defaulted}`,
+			`  ${kind.padEnd(11)} ${String(`${k.answered}/${k.rows}`).padEnd(14)} ${String(k.unknown).padEnd(8)} ${String(k.overridden).padEnd(11)} ${String(k.override_rate === null ? "—" : `${k.override_rate}%`).padEnd(10)} ${k.defaulted}`,
+		);
+	}
+	if (cap.rows) {
+		const split = Object.entries(cap.decisions)
+			.sort((a, b) => b[1] - a[1])
+			.map(([decision, n]) => `${n} ${decision}`)
+			.join(", ");
+		scoreLines.push(
+			`in-flight: ${cap.rows} cap check${cap.rows === 1 ? "" : "s"} recorded (${split}) — decided from the branch diff`,
+			`  (bin/delegate worker_paths vs task_paths), not by jev, so this row has no answered/rows. ${cap.blocked} of ${cap.rows} refused a spawn.`,
 		);
 	}
 	// One line for the defaulted fields. Not one per kind: a spawn writes four rows and every row

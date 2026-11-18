@@ -491,6 +491,12 @@ report_has_evidence() {
 # backticks or tildes; a fence closes with the same character and at least the same length).
 # A fence opened and never closed is read as fenced to end of file — a report is never refused
 # over pasted output — and one warning line goes to stderr, so the typo is still seen.
+#
+# An inline code span is the same claim one step smaller: a report that says "the scaffold's own
+# `Command: <fill in: ...>` line, slim-plain.md:88" is quoting the template it deleted, with the
+# citation beside it, and refusing it called an honest report unfinished. So the code spans are
+# removed before the scan, and the rest of the line is read as prose — the placeholder still
+# refuses when it is not inside backticks, or when it sits beside a span on the same line.
 report_placeholders() {
 	local report=${1:-}
 	[ -f "$report" ] || return 0
@@ -510,7 +516,12 @@ report_placeholders() {
 				ch = substr(m, 1, 1); len = length(m); infence = 1; openline = NR; openrun = m
 				next
 			}
-			if (tolower($0) ~ /<[[:space:]]*(fill|insert|your|add|paste|todo|tbd)|(^|[^[:alpha:]])(todo|tbd|fixme)([^[:alpha:]]|$)/) {
+			# A quoted placeholder is a quotation, not an unfinished sentence: strip inline code spans
+			# (double backticks first, so ``x`` is one span and not two empty ones) and scan the rest.
+			code = $0
+			while (match(code, /``[^`]*``/)) code = substr(code, 1, RSTART - 1) " " substr(code, RSTART + RLENGTH)
+			while (match(code, /`[^`]*`/)) code = substr(code, 1, RSTART - 1) " " substr(code, RSTART + RLENGTH)
+			if (tolower(code) ~ /<[[:space:]]*(fill|insert|your|add|paste|todo|tbd)|(^|[^[:alpha:]])(todo|tbd|fixme)([^[:alpha:]]|$)/) {
 				printf "%d:%s\n", NR, $0
 			}
 		}

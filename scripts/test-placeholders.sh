@@ -145,6 +145,54 @@ Mission: the scan picks up where the fence ends.
 TODO paste the commit sha here
 REPORT
 
+# 7b. The case that refused `delegate close ci-wiring` for hours: a report quoting the scaffold
+#     it deleted, with the file:line right beside it. The placeholder is inside an inline code
+#     span, so it is a quotation of the template, not an unfinished sentence.
+report_case "quoted scaffold in a code span passes" 0 - <<'REPORT'
+# Report
+
+Mission: the report says which template line it is talking about, and closes.
+
+## Thrown away
+
+The first version of the lint flagged every column-0 line that starts no block
+(the evidence scaffold's own `Command: <fill in: the exact command you ran, flags and all>` line,
+`slim-plain.md:88`), which is the scaffold, not template damage. Deleted.
+
+## Evidence
+
+$ delegate close w8 — closed
+REPORT
+
+# 7c. The same sentence without the backticks is the report using the template, and still refuses:
+#     the fix above narrows the scan, it does not silence it.
+report_case "the same line unquoted still refuses" 1 "still has fill-in placeholders" <<'REPORT'
+# Report
+
+Mission: the report says which template line it is talking about, and does not close.
+
+## Thrown away
+
+The first version of the lint flagged the evidence scaffold's own
+Command: <fill in: the exact command you ran, flags and all> line, `slim-plain.md:88`.
+
+## Evidence
+
+$ delegate close w9 — closed
+REPORT
+
+# 7d. One placeholder quoted and one used on the same line: the used one is still found, because
+#     the scan removes the code span and reads the rest of the line.
+report_case "prose beside a code span still refuses" 1 "still has fill-in placeholders" <<'REPORT'
+# Report
+
+Mission: `slim-plain.md:88` is quoted, <paste the tail of the run here> is not.
+
+## Evidence
+
+$ delegate close w10 — closed
+REPORT
+
 # 8. The wipe step is mandatory, and the close guard is where it bites: a written-out report
 #    still refuses when no wipe line names the worker, and the refusal names the command.
 rm -f "$PI_BOSS_ROOT/state/decisions.jsonl"

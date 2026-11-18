@@ -418,6 +418,54 @@ else
 	fail "stats, oldest unread age: got '${oldest}', wanted about 7200"
 fi
 
+# 7b. `in-flight` is the spawn cap, not a jev answer: the branch diff decides it (worker_paths vs
+#     task_paths in bin/delegate), so a row printed as answered/rows read `0/24 … —` and an auditor
+#     concluded jev had never answered the by-path question. It gets its own line carrying the
+#     number of cap checks, what each decided and how many refused a spawn, and no table row.
+cap_root=$work/caproot
+mkdir -p "$cap_root/state"
+cat >"$cap_root/state/decisions.jsonl" <<EOF
+{"timestamp":"$now","command":"route","task":"t","decision":"remote","reason":"r","overridden":false,"slug":"a","jev":"remote"}
+{"timestamp":"$now","command":"in-flight","task":"t","decision":"allowed","reason":"no overlap","overridden":false,"slug":"a"}
+{"timestamp":"$now","command":"in-flight","task":"t","decision":"allowed","reason":"no overlap","overridden":false,"slug":"b"}
+{"timestamp":"$now","command":"in-flight","task":"t","decision":"blocked","reason":"unread report","overridden":false,"slug":""}
+EOF
+cap_out=$(env PI_BOSS_ROOT=$cap_root "$bin/delegate" stats 2>&1) || true
+if ! printf '%s' "$cap_out" | grep -qF 'in-flight: 3 cap checks recorded (2 allowed, 1 blocked)'; then
+	fail "stats, in-flight line names the cap checks and their split — $(printf '%s' "$cap_out" | grep -F 'in-flight' || echo 'no in-flight line')"
+elif ! printf '%s' "$cap_out" | grep -qF 'decided from the branch diff'; then
+	fail "stats, in-flight line does not say the answer is the branch diff"
+elif ! printf '%s' "$cap_out" | grep -qF '1 of 3 refused a spawn'; then
+	fail "stats, in-flight line does not count the blocked checks"
+elif printf '%s' "$cap_out" | grep -qE 'in-flight +[0-9]+/[0-9]+'; then
+	fail "stats, in-flight is still printed as an answered/rows table row"
+else
+	pass "stats, in-flight reads as the spawn cap, with its split and its refusals"
+fi
+cap_json=$(env PI_BOSS_ROOT=$cap_root "$bin/delegate" stats --json 2>&1) || true
+if msg=$(printf '%s' "$cap_json" | assert_stats '{
+	"jev_scorecard.kinds.in-flight.cap":3,
+	"jev_scorecard.kinds.in-flight.blocked":1,
+	"jev_scorecard.kinds.in-flight.jev_answers":false,
+	"jev_scorecard.kinds.in-flight.decisions.allowed":2,
+	"jev_scorecard.kinds.in-flight.decisions.blocked":1
+}'); then
+	pass "stats --json names the in-flight count, its split and that jev did not answer it"
+else
+	fail "stats --json in-flight fields: $msg"
+fi
+# And with no cap checks at all there is no line to misread: the scorecard says so in one sentence.
+zero_root=$work/zeroroot
+mkdir -p "$zero_root/state"
+: >"$zero_root/state/decisions.jsonl"
+zero_out=$(env PI_BOSS_ROOT=$zero_root "$bin/delegate" stats 2>&1) || true
+if printf '%s' "$zero_out" | grep -qF 'jev scorecard: no scored decisions in this window' &&
+	! printf '%s' "$zero_out" | grep -q '^in-flight:'; then
+	pass "stats, 0 cap checks print no in-flight line"
+else
+	fail "stats, 0 cap checks: $(printf '%s' "$zero_out" | grep -E 'scorecard|^in-flight:')"
+fi
+
 # 8. The wipe step between features: five questions on stdout, the run recorded in the log, a
 #    skip recorded with its reason, and a skip with no reason refused. `delegate close` enforces
 #    this, so a silent regression here lets every finished worker through unconsolidated.
