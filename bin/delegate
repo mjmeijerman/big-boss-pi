@@ -1419,7 +1419,7 @@ $acceptance_block
    code, tests, migrations; high: extensions, AGENTS.md, .github/, git-hooks/, sandbox/, auth,
    secrets, money, deletion). Never merge, never commit on trunk. You stay sandboxed:
    publishing is the boss's
-job, so it never needs host access from you.
+   job, so it never needs host access from you.
 6. End every commit message with two trailers: \`Agent-Slug: $spawn_slug\` and \`Spec: $SPECS/$spawn_slug.md\`.
    The commit-msg hook stamps both; check \`git log -1 --format=%B\` before you report.
 7. Write the report before you stop:

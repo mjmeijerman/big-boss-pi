@@ -175,6 +175,17 @@ expect "ci-local: four jobs, planted failures, no silent skip" 0 "ci-local: ok" 
 #     origin and a stub gh, so no real branch and no network.
 expect "prune-refs: two proofs, a stub gh and a second yes" 0 "prune-refs: ok" -- \
 	bash "$root/scripts/tests/test-prune-refs.sh"
+# 5k. A worker that legitimately landed nothing: `close --nothing` takes a 20-character reason, still
+#     wants an Evidence block, refuses a report that names a sha, and still runs the wipe step. Same
+#     shape as the others: throwaway repo, stub herdr-app, temporary root.
+expect "close --nothing: reason, evidence, and no sha" 0 "nothing: ok" -- \
+	bash "$root/scripts/test-nothing.sh"
+# 5l. `bin/publish` is what the boss runs on every finished worker, and nothing else in this script
+#     reaches it. Its fake `git` and `gh` log every call, so the cases read what the command did —
+#     no network and no gh auth are involved, which is why this one needs no gate: it runs the same
+#     on a fresh clone.
+expect "publish: refusals, body gates and the push it reports" 0 "test-publish: ok" -- \
+	bash "$root/scripts/tests/test-publish.sh"
 
 # 6. Routing is a refusal, not a warning. delegate reads jev from $PI_BOSS_ROOT/bin, so a
 #    fake jev there answers route=local without a model and without touching the real tree.

@@ -589,5 +589,33 @@ else
 fi
 unset JEV_STUB_MODE
 
+# G. The spec template is a heredoc, so a stray newline inside it splits a sentence and every
+#    worker after that reads the broken line. The cheap version of the check: in a plain spec, a
+#    line at column 0 has to start a block — heading, list item, fence, table row, quote, blank.
+#    Anything else is prose that was cut in half by the template, not by the task. A deliberate
+#    paragraph always follows a blank line; a wrapped break does not, which is what separates the
+#    two without teaching the check to read English.
+spec_strays() { # <spec> — the column-0 lines that split prose instead of starting a block
+	awk '
+		function block(l) {
+			return l ~ /^[[:space:]]/ || l == "" || l ~ /^#/ || l ~ /^[-*+] / ||
+			       l ~ /^[0-9]+\. / || l ~ /^```/ || l ~ /^\|/ || l ~ /^>/
+		}
+		/^```/ { fence = !fence; prev = ""; next }
+		{ if (!fence && !block($0) && prev != "") printf "%d: %s\n", NR, $0; prev = $0 }
+	' "$1"
+}
+for generated in "$PI_BOSS_ROOT/specs/slim-plain.md" "$PI_BOSS_ROOT/specs/weak-plan.md"; do
+	if [ ! -f "$generated" ]; then
+		fail "the lint fixture $generated was never written"
+		continue
+	fi
+	if strays=$(spec_strays "$generated") && [ -z "$strays" ]; then
+		pass "$(basename "$generated") has no column-0 line that starts no block"
+	else
+		fail "$(basename "$generated") has prose split across lines by the template: $strays"
+	fi
+done
+
 printf '\n%s\n' "$([ "$fails" = 0 ] && echo "spawn speed: ok" || echo "spawn speed: $fails failure(s)")"
 [ "$fails" = 0 ]
