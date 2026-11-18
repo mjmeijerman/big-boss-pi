@@ -197,6 +197,81 @@ json_field() { node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
 
 valid_slug() { case $1 in [a-z0-9]*) ;; *) return 1 ;; esac; printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9-]{0,30}$'; }
 
+# delegation_field <slug> <field> — a recorded value, empty when the entry or the field is missing.
+delegation_field() {
+	node -e '
+		const fs = require("fs");
+		let j = {};
+		try { j = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch {}
+		const r = j[process.argv[2]];
+		if (r && r[process.argv[3]]) process.stdout.write(String(r[process.argv[3]]));' \
+		"$DELEGATIONS" "${1:-}" "${2:-}"
+}
+
+# herdr_terminals — herdr's own list of terminals (`hc ls --all --json`), read once per run.
+# state/delegations.json is the record of what was started; this is what herdr still runs.
+# Nonzero when hc is missing or refuses, and every caller then trusts the record instead: a herdr
+# that is down is not a worker that died, and guessing `gone` would close a live space.
+# Declared here because the script runs under `set -u`: the first caller may be any of list, wait
+# or sweep, and none of them may have written these yet.
+herdr_terminals_read=""
+herdr_terminals_out=""
+herdr_terminals_ok=""
+herdr_terminals() {
+	if [ -z "$herdr_terminals_read" ]; then
+		herdr_terminals_read=1
+		herdr_terminals_out=""
+		herdr_terminals_ok=""
+		if command -v hc >/dev/null 2>&1 && herdr_terminals_out=$(hc ls --all --json 2>/dev/null) && [ -n "$herdr_terminals_out" ]; then
+			herdr_terminals_ok=1
+		else
+			herdr_terminals_out=""
+		fi
+	fi
+	[ -n "$herdr_terminals_ok" ] || return 1
+	printf '%s' "$herdr_terminals_out"
+}
+
+# herdr_terminals_none — true when herdr answered and listed no terminal at all.
+herdr_terminals_none() {
+	local terms
+	terms=$(herdr_terminals) || return 1
+	printf '%s' "$terms" | grep -qE '"terminals"[[:space:]]*:[[:space:]]*\[[[:space:]]*\]'
+}
+
+# worker_state <slug> — `reported`, `gone` or `working`.
+#
+# `delegate list` used to read state/delegations.json alone, so a worker whose space was closed
+# (space.close answered ok, its terminal was gone, `hc ls --json` had nothing for it) went on
+# printing `working` for minutes; `delegate wait` then sat out its whole timeout, and `delegate
+# sweep` kept the entry forever. The record is what spawn wrote, not what herdr runs. A slug whose
+# recorded terminal herdr no longer lists and which never wrote a report is `gone`: not working,
+# and nothing to report. A report is still `reported` whatever herdr says — the report is the
+# thing the boss acts on, and a closed space after a report is the normal end of a worker.
+worker_state() {
+	local slug=${1:-} report terminal terms
+	report=$REPORTS/$slug.md
+	if [ -s "$report" ]; then
+		printf 'reported'
+		return 0
+	fi
+	terminal=$(delegation_field "$slug" terminal)
+	# The state is only decided when herdr names at least one terminal. An answer of `[]` while the
+	# record names terminals is not "every worker died": it is a herdr this side cannot see — another
+	# core, a socket from inside a sandbox — and reading it as `gone` would call live workers dead.
+	# Same fallback as no answer at all: the record stands.
+	if [ -n "$terminal" ] && terms=$(herdr_terminals) &&
+		printf '%s' "$terms" | grep -qE '"terminals"[[:space:]]*:[[:space:]]*\[[[:space:]]*[{"]'; then
+		# The id is matched as a JSON token, not parsed out of a shape this side does not own:
+		# `"t16r"` in herdr's answer means herdr knows the terminal, whatever else is in there.
+		if ! printf '%s' "$terms" | grep -qF "\"$terminal\""; then
+			printf 'gone'
+			return 0
+		fi
+	fi
+	printf 'working'
+}
+
 # report_needs_decision <report> -- true when the report opens with a DECISION NEEDED line.
 # That marker is the only thing that keeps a worker space open once the report exists. A report
 # that is absent or empty means the worker is still working: a keep for the sweep, never a close.
@@ -1337,6 +1412,11 @@ cmd_wait() {
 		esac
 	done
 	local report=$REPORTS/$slug.md
+	# A worker whose terminal is gone will never write that report: waiting the timeout out is the
+	# bug this state exists to name, so it is said once and now, not after ten minutes.
+	if [ ! -s "$report" ] && [ "$(worker_state "$slug")" = gone ]; then
+		die "$slug is gone: its recorded herdr terminal $(delegation_field "$slug" terminal) is no longer listed and it never wrote $report — waiting cannot make it report. Check the space, then spawn the task again or write the report by hand"
+	fi
 	command -v timeout >/dev/null 2>&1 || die "timeout not found"
 	local waited=0
 	while [ "$waited" -lt "$timeout" ]; do
@@ -1362,7 +1442,19 @@ cmd_wait() {
 
 cmd_list() {
 	[ -f "$DELEGATIONS" ] || { say "no workers"; return 0; }
-	node -e '
+	# Reconcile against herdr before anything is printed: the state of each row is read from what
+	# herdr still runs, not only from the entry spawn wrote (see worker_state). A herdr that does
+	# not answer leaves the record standing and says so on stderr, once.
+	local slug states=""
+	while IFS= read -r slug; do
+		[ -n "$slug" ] || continue
+		states="$states$slug=$(worker_state "$slug")"$'\n'
+	done <<<"$(node -e '
+		const fs = require("fs");
+		let j = {};
+		try { j = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch {}
+		Object.keys(j).forEach((k) => console.log(k));' "$DELEGATIONS")"
+	DELEGATE_STATES=$states node -e '
 		const fs=require("fs");
 		let j={};try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"))}catch{}
 		let decisions=[];
@@ -1375,16 +1467,32 @@ cmd_list() {
 			by.get(d.slug).set(d.command,d);
 		}
 		const pick=(slug,cmd)=>{const m=by.get(slug);return m?m.get(cmd):undefined};
-		const rows=Object.values(j);
+		// The entry key, because a hand-written or older entry has no slug field and the state
+		// map is keyed the way `delegate list` walks the file.
+		const rows=Object.entries(j).map(([k,v])=>({key:k,...v}));
 		if(!rows.length){console.log("no workers");process.exit(0)}
+		// worker_state told this process what herdr says: reported, gone or working.
+		const states=new Map(String(process.env.DELEGATE_STATES||"").split("\n").filter(Boolean).map(l=>{const i=l.indexOf("=");return [l.slice(0,i),l.slice(i+1)]}));
 		for(const r of rows){
 			let size=0;try{size=fs.statSync(r.report).size}catch{}
-			const mode=pick(r.slug,"mode"),route=pick(r.slug,"route"),think=pick(r.slug,"thinking");
+			const state=states.get(r.slug||r.key)||(size?"reported":"working");
+			const who=r.slug||r.key;
+			const mode=pick(who,"mode"),route=pick(who,"route"),think=pick(who,"thinking");
 			const level=(think?think.decision:r.thinking)||"?";
 			const overridden=(mode&&mode.overridden)||(think&&think.overridden)||r.overridden;
-			const jev=`mode=${r.mode} route=${route?route.decision:"?"} thinking=${level}${overridden?" (overridden)":""}`;
-			console.log([r.slug.padEnd(22),r.mode.padEnd(10),level.padEnd(8),(size?"reported":"working").padEnd(9),jev.padEnd(44),r.space,"cwd="+r.cwd].join(" "));
+			const jev=`mode=${r.mode||"?"} route=${route?route.decision:"?"} thinking=${level}${overridden?" (overridden)":""}`;
+			// Every column is defaulted: a delegations entry written by hand, or by an older version
+			// of spawn, has no mode or space, and `list` must print that row rather than crash on it.
+			console.log([String(who).padEnd(22),String(r.mode||"").padEnd(10),String(level).padEnd(8),state.padEnd(9),jev.padEnd(44),String(r.space||"-"),"cwd="+String(r.cwd||"-")].join(" "));
 		}' "$DELEGATIONS" "$DECISIONS"
+	if ! herdr_terminals >/dev/null; then
+		printf '%s: herdr did not answer, so reported/working is what state/delegations.json records, not what herdr still runs\n' "$prog" >&2
+	elif herdr_terminals_none && grep -q '"terminal"' "$DELEGATIONS"; then
+		# Not the same thing as one worker gone: a herdr that lists nothing at all while the record
+		# names terminals is a herdr this side cannot see, and saying so is cheaper than a boss
+		# believing `working`.
+		printf '%s: herdr lists no terminals at all, so reported/working is what state/delegations.json records, not what herdr still runs\n' "$prog" >&2
+	fi
 }
 
 # ask — put a question to Jev before it reaches the user. The question is not the person's to
@@ -1775,7 +1883,10 @@ cmd_sweep() {
 		[ -n "$slug" ] || continue
 		report=$REPORTS/$slug.md
 		if [ ! -s "$report" ]; then
-			say "keep   $slug (still working)"
+			case $(worker_state "$slug") in
+			gone) say "keep   $slug (gone: its herdr terminal is no longer listed and it never reported — nothing to publish, nothing to close)" ;;
+			*) say "keep   $slug (still working)" ;;
+			esac
 			kept=$((kept + 1))
 			continue
 		fi
