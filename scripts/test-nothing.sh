@@ -106,6 +106,7 @@ Nothing landed on purpose: the pull request merged before the work finished.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 \$ git -C /home/mark/.pi log --oneline -1 origin/trunk
 1c624f1 ci(scripts-test): run every bash gate test from make scripts-test (#68)
 REPORT
@@ -130,6 +131,7 @@ Mission: nothing landed and nobody said why.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 $ true
 REPORT
 if [ "$RC" != 1 ] || ! printf '%s' "$OUT" | grep -qF -- "--nothing needs a reason"; then
@@ -148,6 +150,7 @@ Mission: a reason is a sentence, not a shrug.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 $ true
 REPORT
 if [ "$RC" != 1 ] || ! printf '%s' "$OUT" | grep -qF "no-op close needs 20 or more"; then
@@ -170,6 +173,7 @@ Commit: $sha
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 \$ git log -1 --format=%H
 $sha
 REPORT
@@ -196,6 +200,7 @@ Commit: ffffffffffffffffffffffffffffffffffffffff
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 $ git log -1 --format=%H
 REPORT
 if [ "$RC" != 1 ] || ! printf '%s' "$OUT" | grep -qF "names commit"; then
@@ -232,6 +237,7 @@ Mission: a no-op worker is still a space that has to be consolidated.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 $ true
 REPORT
 if [ "$RC" != 1 ] || ! printf '%s' "$OUT" | grep -qF "no wipe step recorded"; then
@@ -254,6 +260,7 @@ Mission: a worker in a folder with no repo can also close with nothing landed.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 $ ls
 REPORT
 if [ "$RC" != 0 ]; then
@@ -271,6 +278,7 @@ Mission: the two escapes cannot both be true.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 $ true
 REPORT
 if [ "$RC" != 1 ] || ! printf '%s' "$OUT" | grep -qF "cannot be combined"; then
@@ -289,6 +297,7 @@ Mission: the no-op exit does not replace the provenance check.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 $ true
 REPORT
 if [ "$RC" != 1 ] || ! printf '%s' "$OUT" | grep -qF "records no commit sha"; then

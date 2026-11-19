@@ -198,6 +198,12 @@ expect "publish: refusals, body gates and the push it reports" 0 "test-publish: 
 #     throwaway repo and on the trailer each of them carries.
 expect "close reads the sha that belongs to this worker" 0 "close-provenance: ok" -- \
 	bash "$root/scripts/tests/test-close-provenance.sh"
+# 5n. The gate before the publish (bin/preflight): a syntax error, a semgrep finding and a test that
+#     needs the developer's PATH each stop `delegate finish` before the push; a docs-only diff takes
+#     the fast path and still refuses a bad tier; --skip-preflight publishes and records its reason.
+#     Throwaway repos with a bare origin and stub gh/herdr-app, so nothing is pushed and no PR exists.
+expect "preflight: the checks CI would run, before the push" 0 "preflight: ok" -- \
+	bash "$root/scripts/tests/test-preflight.sh"
 
 # 6. Routing is a refusal, not a warning. delegate reads jev from $PI_BOSS_ROOT/bin, so a
 #    fake jev there answers route=local without a model and without touching the real tree.

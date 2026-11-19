@@ -169,6 +169,7 @@ Nothing.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 ```
 $ bash scripts/tests/test-publish.sh
   ok    a case
@@ -259,7 +260,7 @@ tier_case() { # <name> <tier line> — the good report with exactly that review-
 	{
 		printf '**Mission**: the tier survives the markdown it was written in.\n\n'
 		printf 'Review tier: %s\n\n' "$2"
-		printf '## Evidence\n\n```\ntest-publish: ok\n```\n'
+		printf '## Evidence\n\n$ bin/preflight — 5/5 passed\n\n```\ntest-publish: ok\n```\n'
 	} >"$REPORTER"
 	run worker
 }
@@ -300,7 +301,7 @@ tier_label_case() { # <name> <the tier line as the worker wrote it> <the bare wo
 	{
 		printf '**Mission**: the label survives the markdown it was written in.\n\n'
 		printf '%s\n\n' "$2"
-		printf '## Evidence\n\n```\ntest-publish: ok\n```\n'
+		printf '## Evidence\n\n$ bin/preflight — 5/5 passed\n\n```\ntest-publish: ok\n```\n'
 	} >"$REPORTER"
 	run worker
 	if [ "$rc" -eq 0 ]; then pass "a report writing '$2' publishes"; else fail "a report writing '$2' publishes (exit $rc: $err)"; fi
@@ -321,7 +322,7 @@ near_miss_case() { # <name> <the line that is not the tier line>
 	{
 		printf '**Mission**: a near miss names its own line.\n\n'
 		printf 'Some prose.\n\n%s\n\n' "$2"
-		printf '## Evidence\n\n```\ntest-publish: ok\n```\n'
+		printf '## Evidence\n\n$ bin/preflight — 5/5 passed\n\n```\ntest-publish: ok\n```\n'
 	} >"$REPORTER"
 	run worker
 }
@@ -342,7 +343,7 @@ new_case mission-labelled-bold
 {
 	printf '**Mission:** the body gate reads a bare Mission line.\n\n'
 	printf 'Review tier: Medium\n\n'
-	printf '## Evidence\n\n```\ntest-publish: ok\n```\n'
+	printf '## Evidence\n\n$ bin/preflight — 5/5 passed\n\n```\ntest-publish: ok\n```\n'
 } >"$REPORTER"
 cat >"$REPO/Makefile" <<'EOF'
 pr-check:
@@ -698,7 +699,7 @@ now_case() { # <name> <tier> <the Now possible line, or ->
 		printf '**Mission**: the reviewer sees what now works before the diff.\n\n'
 		printf 'Review tier: %s\n\n' "$2"
 		[ "$3" = - ] || printf '%s\n\n' "$3"
-		printf '## Evidence\n\n```\ntest-publish: ok\n```\n'
+		printf '## Evidence\n\n$ bin/preflight — 5/5 passed\n\n```\ntest-publish: ok\n```\n'
 	} >"$REPORTER"
 	run worker
 }

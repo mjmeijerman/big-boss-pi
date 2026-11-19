@@ -491,6 +491,50 @@ report_has_evidence() {
 	' "$report"
 }
 
+# report_has_preflight_evidence <report> [slug] -- true when the report's Evidence block names a
+# `bin/preflight` run, so the green it claims is a green somebody saw.
+#
+# Red CI rounds are this workspace's biggest cost (#177 three rebases, #180 three rounds, #183 two,
+# #66 one, #184 one) and every one of those failures was a check this machine answers in seconds.
+# The gate that runs them is `bin/preflight`; the Evidence block is where a report proves it ran,
+# and a report that proves everything except that one thing is a report claiming a verdict it never
+# saw. The block is read the same way report_has_evidence reads it — the heading, then the lines
+# under it, stopping at the next section — and one recorded `--skip-preflight` reason for this slug
+# stands in for the run: a check that is genuinely broken here is the one case where it cannot run.
+report_has_preflight_evidence() {
+	local report=${1:-} slug=${2:-}
+	[ -f "$report" ] || return 1
+	if awk '
+		{
+			line = $0
+			t = line
+			gsub(/[#*]/, "", t)
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", t)
+			if (!inblock) {
+				if (tolower(t) ~ /^evidence([[:space:]]+block)?$/) { inblock = 1 }
+				next
+			}
+			if (line ~ /^##[[:space:]]/) exit
+			if (tolower(t) ~ /^(thrown away|what i would do differently)/) exit
+			print
+		}' "$report" | grep -qiE 'preflight'; then
+		return 0
+	fi
+	[ -n "$slug" ] || return 1
+	[ -f "$DECISIONS" ] || return 1
+	node -e '
+		const fs = require("fs");
+		let lines = [];
+		try { lines = fs.readFileSync(process.argv[1], "utf8").split("\n"); } catch { process.exit(1); }
+		for (const l of lines) {
+			if (!l.trim()) continue;
+			let j = {};
+			try { j = JSON.parse(l); } catch { continue; }
+			if (j.command === "preflight" && j.decision === "skipped" && (j.slug || "") === process.argv[2]) process.exit(0);
+		}
+		process.exit(1);' "$DECISIONS" "$slug"
+}
+
 # report_placeholders <report> -- the fill-in placeholders still left in the report, as
 # "LINE:TEXT" lines, empty when the report is written out in full. Narrow on purpose: a report
 # may quote a literal <slug> in a code fence, so only the words that mean "I did not fill this
@@ -2053,6 +2097,17 @@ cmd_close() {
 			printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
 			return 1
 		fi
+		# After the placeholders: an unfilled scaffold is an unfinished report, and its own refusal
+		# names the line to fill in. The gate is asked about once the report is a report.
+		if ! report_has_preflight_evidence "$report" "$slug"; then
+			printf '%s: refusing to close %s: %s names no bin/preflight run under ## Evidence, so the checks CI would run were never proved here.\n' "$prog" "$slug" "$report" >&2
+			printf 'Fix: run the gate, then paste its last lines into the Evidence block and close again:\n' >&2
+			printf '  %s/preflight --slug %s\n' "$BIN" "$slug" >&2
+			printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
+			printf 'If the gate itself is broken on this machine, record why instead and publish anyway:\n' >&2
+			printf '  %s/delegate finish %s --skip-preflight "<why the gate cannot run>"\n' "$BIN" "$slug" >&2
+			return 1
+		fi
 	fi
 
 	# --nothing (a worker that legitimately landed no commit): a PR merged before the work finished,
@@ -2070,6 +2125,12 @@ cmd_close() {
 			printf '%s: refusing to close %s with --nothing: %s has no Evidence block, so nothing shows the work was tried.\n' "$prog" "$slug" "$report" >&2
 			printf 'Fix: add a "## Evidence" heading with the exact command you ran and the last 20 lines of its output, then close again:\n' >&2
 			printf '  %s close %s --nothing "<why nothing landed>"\n' "$BIN/delegate" "$slug" >&2
+			return 1
+		fi
+		if ! report_has_preflight_evidence "$report" "$slug"; then
+			printf '%s: refusing to close %s with --nothing: %s names no bin/preflight run under ## Evidence, so the checks CI would run were never proved here.\n' "$prog" "$slug" "$report" >&2
+			printf 'Fix: run the gate, paste its last lines under ## Evidence, then close again:\n' >&2
+			printf '  %s/preflight --slug %s\n' "$BIN" "$slug" >&2
 			return 1
 		fi
 		if [ "${#nothing}" -lt 20 ]; then
@@ -2211,8 +2272,8 @@ fi
 # Rerunning after a close refusal is clean: publish prints the existing PR instead of opening a
 # second one, and a wipe already recorded is kept rather than recorded twice.
 cmd_finish() {
-	local slug=${1:-} lookup_cwd="" skip="" skip_given="" pub
-	[ -n "$slug" ] || die 'usage: delegate finish <slug> [--cwd DIR] [--skip "<reason>"]'
+	local slug=${1:-} lookup_cwd="" skip="" skip_given="" pf="" preflight_skip="" preflight_skip_given="" pub
+	[ -n "$slug" ] || die 'usage: delegate finish <slug> [--cwd DIR] [--skip "<reason>"] [--skip-preflight "<reason>"]'
 	shift || true
 	while [ "$#" -gt 0 ]; do
 		case $1 in
@@ -2226,15 +2287,23 @@ cmd_finish() {
 			skip_given=1
 			if [ "$#" -ge 2 ]; then shift 2; else shift 1; fi
 			;;
-		*) die "unknown option $1 — usage: delegate finish <slug> [--cwd DIR] [--skip \"<reason>\"]" ;;
+		--skip-preflight)
+			preflight_skip=${2:-}
+			preflight_skip_given=1
+			if [ "$#" -ge 2 ]; then shift 2; else shift 1; fi
+			;;
+		*) die "unknown option $1 — usage: delegate finish <slug> [--cwd DIR] [--skip \"<reason>\"] [--skip-preflight \"<reason>\"]" ;;
 		esac
 	done
-	[ -n "$slug" ] || die 'usage: delegate finish <slug> [--cwd DIR] [--skip "<reason>"]'
+	[ -n "$slug" ] || die 'usage: delegate finish <slug> [--cwd DIR] [--skip "<reason>"] [--skip-preflight "<reason>"]'
 	# A skip with no reason is the one thing a skip may not be: it says the step does not apply,
 	# and only the sentence says why. Refused before the report is published, so a typo costs
 	# nothing (the wipe refuses it too; this is the cheap, first refusal).
 	if [ -n "$skip_given" ] && [ -z "${skip// /}" ]; then
 		die "--skip needs a reason: delegate finish $slug --skip \"<why the step does not apply>\""
+	fi
+	if [ -n "$preflight_skip_given" ] && [ -z "${preflight_skip// /}" ]; then
+		die "--skip-preflight needs a reason: delegate finish $slug --skip-preflight \"<why the gate cannot run on this machine>\""
 	fi
 
 	pub=$(command -v publish 2>/dev/null || true)
@@ -2245,36 +2314,66 @@ cmd_finish() {
 	# without a new command to remember. It never changes the exit status and never blocks.
 	reap_finished_learners
 
-	say "finish: $slug — 1/3 publish"
+	# 0/4. The gate, before anything leaves the machine: the checks CI would run, on this branch,
+	# here. Red CI rounds are what this workspace pays most for — #177 three rebases, #180 three
+	# rounds, #183 two, #66 and #184 one each — and every one of those was a check that runs in
+	# seconds locally. A failing check stops the run here, so the report stays for a follow-up
+	# worker instead of a PR that CI will refuse ten minutes later. Escape hatch, recorded the way
+	# a wipe skip is: --skip-preflight "<why>" in state/decisions.jsonl.
+	if [ -n "$preflight_skip_given" ]; then
+		record_decision preflight "$slug" skipped "$preflight_skip" false "$slug"
+		say "finish: $slug — 1/4 preflight: skipped, reason recorded in state/decisions.jsonl: $preflight_skip"
+	else
+		pf=$(command -v preflight 2>/dev/null || true)
+		[ -n "$pf" ] || pf=$self_bin/preflight
+		if [ ! -x "$pf" ]; then
+			printf '%s: finish stopped at step 1 of 4 (preflight) for %s: no preflight command on PATH and none at %s, so the gate CI would run cannot be proved here. Nothing was published, wiped or closed.\n' \
+				"$prog" "$slug" "$self_bin/preflight" >&2
+			printf 'Fix: restore %s, or say why the gate does not apply and run this again:\n' "$self_bin/preflight" >&2
+			printf '  %s finish %s --skip-preflight "<why the gate cannot run>"\n' "$BIN/delegate" "$slug" >&2
+			return 1
+		fi
+		say "finish: $slug — 1/4 preflight"
+		if ! "$pf" --slug "$slug" ${lookup_cwd:+--cwd "$lookup_cwd"}; then
+			printf '%s: finish stopped at step 1 of 4 (preflight) for %s: nothing was pushed, the PR body was not touched, nothing was wiped, nothing was closed, and the space is still open.\n' "$prog" "$slug" >&2
+			printf 'Fix: the FAIL line above names the check and the exact command that reproduces it — run that, fix it, commit, then run this again:\n' >&2
+			printf '  %s finish %s\n' "$BIN/delegate" "$slug" >&2
+			printf 'If the check itself is broken on this machine, record why and publish anyway:\n' >&2
+			printf '  %s finish %s --skip-preflight "<why the gate cannot run>"\n' "$BIN/delegate" "$slug" >&2
+			return 1
+		fi
+	fi
+
+	say "finish: $slug — 2/4 publish"
 	if ! "$pub" "$slug" ${lookup_cwd:+--cwd "$lookup_cwd"}; then
-		printf '%s: finish stopped at step 1 of 3 (publish) for %s: nothing was wiped, nothing was closed, and the space is still open.\n' "$prog" "$slug" >&2
+		printf '%s: finish stopped at step 2 of 4 (publish) for %s: nothing was wiped, nothing was closed, and the space is still open.\n' "$prog" "$slug" >&2
 		printf 'Fix: the refusal above names what the report is missing. Once it is fixed, run this again:\n' >&2
 		printf '  %s finish %s\n' "$BIN/delegate" "$slug" >&2
 		return 1
 	fi
 
 	if wipe_recorded "$slug"; then
-		say "finish: $slug — 2/3 wipe: already recorded, keeping that line"
+		say "finish: $slug — 3/4 wipe: already recorded, keeping that line"
 	else
-		say "finish: $slug — 2/3 wipe"
+		say "finish: $slug — 3/4 wipe"
 		local wipe_args=( "$slug" )
 		[ -z "$skip_given" ] || wipe_args+=( --skip "$skip" )
 		if ! ( cmd_wipe "${wipe_args[@]}" ); then
-			printf '%s: finish stopped at step 2 of 3 (wipe) for %s: the report is published, so its PR exists, but nothing was wiped, nothing was closed, and the space is still open.\n' "$prog" "$slug" >&2
+			printf '%s: finish stopped at step 3 of 4 (wipe) for %s: the report is published, so its PR exists, but nothing was wiped, nothing was closed, and the space is still open.\n' "$prog" "$slug" >&2
 			printf 'Fix: write the five answers under "## Thrown away" in %s — or say why the step does not apply — then run this again:\n' "$REPORTS/$slug.md" >&2
 			printf '  %s finish %s\n' "$BIN/delegate" "$slug" >&2
 			return 1
 		fi
 	fi
 
-	say "finish: $slug — 3/3 close"
+	say "finish: $slug — 4/4 close"
 	if ! ( cmd_close "$slug" ); then
-		printf '%s: finish stopped at step 3 of 3 (close) for %s: the report is published and the wipe is recorded, but the space is still open.\n' "$prog" "$slug" >&2
+		printf '%s: finish stopped at step 4 of 4 (close) for %s: the report is published and the wipe is recorded, but the space is still open.\n' "$prog" "$slug" >&2
 		printf 'Fix: the refusal above names what the report still needs; then run this again — the wipe is kept and the PR is not opened twice:\n' >&2
 		printf '  %s finish %s\n' "$BIN/delegate" "$slug" >&2
 		return 1
 	fi
-	say "finish: $slug — published, wiped, closed"
+	say "finish: $slug — preflighted, published, wiped, closed"
 }
 
 # cmd_sweep -- close every worker whose report exists and does not need a user decision.

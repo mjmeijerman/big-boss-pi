@@ -1,0 +1,29 @@
+# semgrep-rules.yml — the harness's own pinned rules, run by `bin/preflight` on the changed files.
+#
+# Pinned, not fetched: a registry ruleset changes under the same name, and a check whose verdict
+# moves while the diff does not is a check nobody can trust. These are the failures that reached CI
+# in this workspace — a `new RegExp()` compiled out of a variable (mjmeijerman/pi#183), and a shell
+# command whose code is assembled from variables — so the preflight catches them in seconds instead
+# of a worker round trip.
+rules:
+  - id: preflight-non-literal-regexp
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      `new RegExp()` built from a variable compiles whatever the input says. Escape it
+      (`escapeRe`) or use a literal pattern — the same shape reached CI as pi#183.
+    patterns:
+      - pattern: new RegExp(...)
+      - pattern-not: new RegExp("...")
+      - pattern-not: new RegExp('...')
+      - pattern-not: new RegExp(/.../)
+
+  - id: preflight-eval-var
+    languages: [bash]
+    severity: ERROR
+    message: >-
+      `eval` of an unquoted variable runs whatever the variable holds. Quote it, or use an array
+      and run the elements.
+    patterns:
+      - pattern: eval $X
+      - pattern-not: eval "$X"

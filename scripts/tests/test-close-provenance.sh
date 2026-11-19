@@ -114,6 +114,7 @@ The learner published its proposal as commit $learner, which is the evidence tha
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 \$ git -C /home/mark/.pi log --oneline -1 learn/learn-17-01
 $learner chore(learn): the learner publishes its own proposal
 REPORT
@@ -143,6 +144,7 @@ Commit: $own_quoted
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 \$ bash scripts/tests/test-close-provenance.sh — ok
 REPORT
 if [ "$RC" != 0 ]; then
@@ -168,6 +170,7 @@ What changed
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 \$ bash scripts/tests/test-close-provenance.sh — ok
 REPORT
 if [ "$RC" != 0 ]; then
@@ -190,6 +193,7 @@ Two other workers landed things: commit $learner and commit $other.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 \$ bash scripts/tests/test-close-provenance.sh — ok
 REPORT
 if [ "$RC" != 1 ]; then
@@ -224,6 +228,7 @@ What changed
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 \$ node --test scripts/tests/learn-publish.test.mjs 2>&1 | tail -8
 # pass 17
 REPORT
@@ -244,6 +249,7 @@ Mission: a report that names nothing cannot be checked.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 $ bash scripts/tests/test-close-provenance.sh — ok
 REPORT
 if [ "$RC" != 1 ] || ! printf '%s' "$OUT" | grep -qF "records no commit sha"; then

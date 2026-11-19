@@ -61,6 +61,7 @@ Mission: the person reading this report can act on it without asking a question.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 $ delegate close w1 — closed
 REPORT
 
@@ -72,6 +73,7 @@ Mission: TODO write the mission.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 $ delegate close w2 — closed
 REPORT
 
@@ -83,6 +85,7 @@ Mission: a report can quote its own test run without being refused.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 ```
 $ node --test
 # tests 6
@@ -99,6 +102,7 @@ Mission: tilde fences are read the same way as backtick fences.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 ~~~
 TBD is what the log line said before the fix
 FIXME and TODO appear here as data too
@@ -107,13 +111,14 @@ REPORT
 
 # 5. A fence opened and never closed is fenced to end of file: no refusal over output, but one
 #    warning line on stderr, so a fence typo is not silent.
-report_case "unbalanced fence passes with a warning" 0 "unclosed ~~~ fence opened at line 7" <<'REPORT'
+report_case "unbalanced fence passes with a warning" 0 "unclosed ~~~ fence opened at line 8" <<'REPORT'
 # Report
 
 Mission: a missing closing fence costs one warning, not a refused report.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 ~~~
 # todo 0
 still inside the fence, to the end of the file
@@ -127,6 +132,7 @@ Mission: <fill in the mission here>
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 $ delegate close w6 — closed
 REPORT
 
@@ -138,6 +144,7 @@ Mission: the scan picks up where the fence ends.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 ```
 # todo 0
 ```
@@ -161,6 +168,7 @@ The first version of the lint flagged every column-0 line that starts no block
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 $ delegate close w8 — closed
 REPORT
 
@@ -178,6 +186,7 @@ Command: <fill in: the exact command you ran, flags and all> line, `slim-plain.m
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 $ delegate close w9 — closed
 REPORT
 
@@ -190,6 +199,7 @@ Mission: `slim-plain.md:88` is quoted, <paste the tail of the run here> is not.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 $ delegate close w10 — closed
 REPORT
 
@@ -204,6 +214,7 @@ Mission: a clean report is still not a closed worker without the wipe step.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 $ delegate close nowipe — refused
 REPORT
 out=$("$bin/delegate" close nowipe 2>&1) && rc=0 || rc=$?

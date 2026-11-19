@@ -76,6 +76,7 @@ Commit: $sha
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 \$ bash scripts/test-provenance.sh — ok
 REPORT
 if [ "$RC" != 1 ]; then
@@ -100,6 +101,7 @@ Commit: ffffffffffffffffffffffffffffffffffffffff
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 \$ bash scripts/test-provenance.sh — ok
 REPORT
 if [ "$RC" != 1 ] || ! printf '%s' "$OUT" | grep -qF "does not resolve"; then
@@ -117,6 +119,7 @@ Mission: the reader can check what the report claims.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 $ bash scripts/test-provenance.sh — ok
 REPORT
 if [ "$RC" != 1 ] || ! printf '%s' "$OUT" | grep -qF "records no commit sha"; then
@@ -141,6 +144,7 @@ Commit: $sha2
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 \$ bash scripts/test-provenance.sh — ok
 REPORT
 if [ "$RC" != 0 ]; then
@@ -152,7 +156,7 @@ fi
 # 5. A worker with no git repo in its cwd has nothing to resolve a sha against: the check steps
 #    aside instead of refusing every report in a non-repo folder.
 printf '{"plain":{"space":"space-plain","cwd":"","branch":""}}\n' >"$PI_BOSS_ROOT/state/delegations.json"
-printf '# Report\n\nMission: a folder with no repo is still closable.\n\n## Evidence\n\n$ close — ok\n' \
+printf '# Report\n\nMission: a folder with no repo is still closable.\n\n## Evidence\n\n$ bin/preflight — 5/5 passed\n$ close — ok\n' \
 	>"$PI_BOSS_ROOT/reports/plain.md"
 printf '{"timestamp":"%s","command":"wipe","task":"plain","decision":"done","reason":null,"overridden":false,"slug":"plain"}\n' \
 	"$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$PI_BOSS_ROOT/state/decisions.jsonl"
@@ -296,6 +300,7 @@ Commit: $inflight
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 \$ bash scripts/test-provenance.sh — ok
 REPORT
 if [ "$RC" != 1 ]; then
@@ -320,6 +325,7 @@ Commit: $landed
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 \$ bash scripts/test-provenance.sh — ok
 REPORT
 short=$(git -C "$merged" rev-parse --short "$landed")
@@ -354,6 +360,7 @@ Commit: $landed
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 \$ bash scripts/test-provenance.sh — ok
 REPORT
 if [ "$RC" != 1 ] || ! printf '%s' "$OUT" | grep -qF -- "--merged needs a PR number"; then
@@ -420,6 +427,7 @@ Commit: $landed
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 \$ bash scripts/test-provenance.sh — ok
 REPORT
 printf '{"merged-order":{"space":"space-merged-order","cwd":"%s","branch":""}}\n' "$merged" \
@@ -469,6 +477,7 @@ Commit: $equiv_sha
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 \$ bash scripts/test-provenance.sh — ok
 REPORT
 equiv_short=$(git -C "$equiv" rev-parse --short "$equiv_sha")
@@ -528,6 +537,7 @@ Commit: $neigh_sha
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 \$ bash scripts/test-provenance.sh — ok
 REPORT
 row=$(grep '"command":"provenance"' "$PI_BOSS_ROOT/state/decisions.jsonl" | grep '"slug":"merged-neighbour"' | tail -n 1)
@@ -579,6 +589,7 @@ Commit: $revd_sha
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 \$ bash scripts/test-provenance.sh — ok
 REPORT
 revd_landed_short=$(git -C "$revd" rev-parse --short "$revd_landed")
@@ -626,6 +637,7 @@ Commit: $side_sha
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 \$ bash scripts/test-provenance.sh — ok
 REPORT
 if [ "$RC" != 1 ]; then

@@ -28,6 +28,11 @@ mkdir -p "$PI_BOSS_ROOT/reports" "$PI_BOSS_ROOT/state" "$PI_BOSS_ROOT/specs" "$w
 # space's name and its id sit together, so FAKE_HERDR_LS is that answer.
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"%s/publish-calls"\nexit "${FAKE_PUBLISH_RC:-0}"\n' "$work" \
 	>"$work/stub/publish"
+# The gate step runs before publish. finish finds `preflight` on PATH first, so this stub is the
+# gate: its exit code is the case, and its log is how "finish ran the gate before it published" is
+# read instead of believed.
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"%s/preflight-calls"\nexit "${FAKE_PREFLIGHT_RC:-0}"\n' "$work" \
+	>"$work/stub/preflight"
 printf '#!/usr/bin/env bash\nif [ "${1:-}" = ls ]; then [ -n "${FAKE_HERDR_LS:-}" ] && printf "%%s\\n" "$FAKE_HERDR_LS"; exit 0; fi\nprintf "%%s\\n" "$*" >>"%s/herdr-calls"\nexit 0\n' "$work" \
 	>"$work/stub/herdr-app"
 # `hc ls --all --json` is herdr's own answer about what still runs; FAKE_HC_LS is that answer, so a
@@ -35,7 +40,7 @@ printf '#!/usr/bin/env bash\nif [ "${1:-}" = ls ]; then [ -n "${FAKE_HERDR_LS:-}
 # could not be read, and the record stands. FAKE_HC_RC is a herdr that refuses outright.
 printf '#!/usr/bin/env bash\ncase " $* " in *" ls "*) [ -n "${FAKE_HC_LS:-}" ] && printf "%%s\\n" "$FAKE_HC_LS" ;; esac\nexit "${FAKE_HC_RC:-0}"\n' \
 	>"$work/stub/hc"
-chmod +x "$work/stub/publish" "$work/stub/herdr-app" "$work/stub/hc"
+chmod +x "$work/stub/publish" "$work/stub/preflight" "$work/stub/herdr-app" "$work/stub/hc"
 export PATH=$work/stub:$PATH
 
 fails=0
@@ -54,7 +59,9 @@ run() {
 # each case so a case can change exactly one thing.
 reset() {
 	: >"$work/publish-calls"
+	: >"$work/preflight-calls"
 	: >"$work/herdr-calls"
+	unset FAKE_PREFLIGHT_RC
 	: >"$PI_BOSS_ROOT/state/decisions.jsonl"
 	unset FAKE_HC_LS FAKE_HERDR_LS FAKE_HC_RC
 	printf '{"w1":{"space":"space-w1","cwd":"","branch":""}}\n' \
@@ -70,6 +77,7 @@ Mission: one command does the tail of a worker.
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 Command: `bash scripts/tests/test-finish.sh`
 
 Output (last 20 lines):
@@ -103,6 +111,82 @@ open_workers() {
 
 closed_space() { grep -qF "space.close --id space-w1" "$work/herdr-calls"; }
 
+# The gate's own line in state/decisions.jsonl: how many there are, and the reason it carries.
+decision_rows() { # <command>
+	[ -f "$PI_BOSS_ROOT/state/decisions.jsonl" ] || { printf '0'; return; }
+	node -e '
+		const fs = require("fs");
+		const rows = fs.readFileSync(process.argv[1], "utf8").split("\n").filter(Boolean)
+			.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+		process.stdout.write(String(rows.filter((r) => r.command === process.argv[2] && r.slug === "w1").length));' \
+		"$PI_BOSS_ROOT/state/decisions.jsonl" "$1"
+}
+decision_reason() { # <command>
+	node -e '
+		const fs = require("fs");
+		const rows = fs.readFileSync(process.argv[1], "utf8").split("\n").filter(Boolean)
+			.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+		const r = rows.filter((x) => x.command === process.argv[2] && x.slug === "w1").pop();
+		process.stdout.write(r ? String(r.reason || "") : "");' \
+		"$PI_BOSS_ROOT/state/decisions.jsonl" "$1"
+}
+
+# 0a. The gate runs first and its refusal is the whole run: a branch that does not pass the checks
+#     CI would run is not published, so the wipe never records a step over work nobody can see and
+#     the space stays open for a follow-up worker. The report is untouched — that is the point.
+reset
+FAKE_PREFLIGHT_RC=1 run finish w1
+if [ "$RC" = 0 ]; then
+	fail "finish with a failing preflight exited 0, wanted nonzero — $OUT"
+elif ! printf '%s' "$OUT" | grep -qE 'step 1 of 4 \(preflight\)'; then
+	fail "finish did not name the preflight step as the failing one — $OUT"
+elif [ -s "$work/publish-calls" ]; then
+	fail "finish published past a failing preflight: $(tr '\n' ';' <"$work/publish-calls")"
+elif [ "$(decision_rows wipe)" != 0 ] || closed_space; then
+	fail "finish wiped or closed after a failing preflight"
+elif [ "$(open_workers)" != 1 ]; then
+	fail "finish dropped the delegation entry after a failing preflight"
+elif ! printf '%s' "$OUT" | grep -qF -- '--skip-preflight'; then
+	fail "the refusal does not name the way to record a broken check — $OUT"
+else
+	pass "a failing preflight stops the run before publish: no push, no wipe, no close"
+fi
+
+# 0b. The escape hatch: a check genuinely broken on this machine is recorded, with its reason, the
+#     way a wipe skip is — and it stands in for the run the report could not paste.
+reset
+awk '!/bin\/preflight/' "$PI_BOSS_ROOT/reports/w1.md" >"$work/r" && mv "$work/r" "$PI_BOSS_ROOT/reports/w1.md"
+run finish w1 --skip-preflight "semgrep is broken on this machine"
+if [ "$RC" != 0 ]; then
+	fail "finish --skip-preflight did not finish: exit $RC — $OUT"
+elif ! grep -qF "w1" "$work/publish-calls"; then
+	fail "finish --skip-preflight did not publish: $(tr '\n' ';' <"$work/publish-calls")"
+elif [ -s "$work/preflight-calls" ]; then
+	fail "finish --skip-preflight ran the gate anyway: $(tr '\n' ';' <"$work/preflight-calls")"
+elif [ "$(decision_rows preflight)" != 1 ]; then
+	fail "finish --skip-preflight recorded $(decision_rows preflight) preflight line(s), wanted exactly 1"
+elif [ "$(decision_reason preflight)" != "semgrep is broken on this machine" ]; then
+	fail "the recorded reason reads '$(decision_reason preflight)', wanted the one that was given"
+else
+	pass "--skip-preflight publishes and records its reason in state/decisions.jsonl"
+fi
+
+# 0c. A skip with no reason is refused before the gate, the publish or anything else: the reason is
+#     the only thing that tells a broken check from a forgotten one.
+reset
+run finish w1 --skip-preflight ""
+if [ "$RC" = 0 ]; then
+	fail "finish --skip-preflight with an empty reason exited 0, wanted nonzero — $OUT"
+elif ! printf '%s' "$OUT" | grep -qF -- "--skip-preflight needs a reason"; then
+	fail "finish --skip-preflight with an empty reason did not say what was missing — $OUT"
+elif [ -s "$work/publish-calls" ] || [ -s "$work/preflight-calls" ]; then
+	fail "finish ran a step before refusing an empty --skip-preflight"
+elif [ "$(decision_rows preflight)" != 0 ]; then
+	fail "an empty --skip-preflight still recorded a line"
+else
+	pass "--skip-preflight without a reason is refused before anything runs"
+fi
+
 # 1. Publish fails: nothing else runs. The report has no PR, so the wipe would record a step over
 #    work nobody can see and the close would throw the space away — the one state that must not be
 #    reachable. Says which step, and that the space is still open.
@@ -110,7 +194,7 @@ reset
 FAKE_PUBLISH_RC=1 run finish w1
 if [ "$RC" = 0 ]; then
 	fail "finish with a failing publish exited 0, wanted nonzero — $OUT"
-elif ! printf '%s' "$OUT" | grep -qE 'step 1 of 3 \(publish\)'; then
+elif ! printf '%s' "$OUT" | grep -qE 'step 2 of 4 \(publish\)'; then
 	fail "finish did not name the publish step as the failing one — $OUT"
 elif ! printf '%s' "$OUT" | grep -qi 'space is still open'; then
 	fail "finish did not say the space is still open — $OUT"
@@ -150,7 +234,7 @@ awk '/^## Thrown away$/ { exit } { print }' "$PI_BOSS_ROOT/reports/w1.md" >"$wor
 run finish w1
 if [ "$RC" = 0 ]; then
 	fail "finish wiped a report with no '## Thrown away' block, wanted a refusal — $OUT"
-elif ! printf '%s' "$OUT" | grep -qE 'step 2 of 3 \(wipe\)'; then
+elif ! printf '%s' "$OUT" | grep -qE 'step 3 of 4 \(wipe\)'; then
 	fail "finish did not name the wipe step as the failing one — $OUT"
 elif [ "$(wipe_lines)" != 0 ]; then
 	fail "a refused wipe still recorded a line in state/decisions.jsonl"
@@ -186,7 +270,7 @@ awk '/^## Evidence$/ { skip = 1 } skip && /^## Thrown away$/ { skip = 0 } !skip'
 run finish w1
 if [ "$RC" = 0 ]; then
 	fail "finish closed a report with no Evidence block, wanted a refusal — $OUT"
-elif ! printf '%s' "$OUT" | grep -qE 'step 3 of 3 \(close\)'; then
+elif ! printf '%s' "$OUT" | grep -qE 'step 4 of 4 \(close\)'; then
 	fail "finish did not name the close step as the failing one — $OUT"
 elif [ "$(wipe_lines)" != 1 ]; then
 	fail "a refused close did not keep the wipe it already recorded ($(wipe_lines) line(s))"
@@ -374,7 +458,7 @@ export FAKE_HERDR_LS='{"spaces":[{"id":"space-w1","name":"w1","folder":"/home/ma
 run finish w1
 if [ "$RC" = 0 ]; then
 	fail "finish called a worker closed while herdr still listed its space, wanted a refusal — $OUT"
-elif ! printf '%s' "$OUT" | grep -qE 'step 3 of 3 \(close\)'; then
+elif ! printf '%s' "$OUT" | grep -qE 'step 4 of 4 \(close\)'; then
 	fail "finish did not name the close step as the failing one — $OUT"
 elif ! printf '%s' "$OUT" | grep -qF "space space-w1 (w1) is still open"; then
 	fail "the warning does not name the space and its id — $OUT"

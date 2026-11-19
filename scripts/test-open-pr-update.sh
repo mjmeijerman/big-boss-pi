@@ -131,6 +131,7 @@ Test change: scripts/tests/test-publish.sh pinned an open PR as a stop sign; it 
 
 ## Evidence
 
+$ bin/preflight — 5/5 passed
 \\\`\\\`\\\`
 ${slug}: ok
 \\\`\\\`\\\`
