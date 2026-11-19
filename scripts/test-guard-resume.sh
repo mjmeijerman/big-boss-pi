@@ -133,8 +133,8 @@ get)
 	case $fg in
 	none) printf '{"state":"live","foreground":{}}\n' ;;
 	shell) printf '{"state":"live","foreground":{"argv":["/bin/bash"],"pid":1},"argv":["/bin/bash"]}\n' ;;
-	pi) printf '{"state":"live","foreground":{"argv":["/home/mark/.local/share/pnpm/pi/cli.js"],"pid":2}}\n' ;;
-	launch) printf '{"state":"live","foreground":{"argv":["sh","-lc","exec /home/mark/big-boss-pi/bin/pi-bare"],"pid":4}}\n' ;;
+	pi) printf '{"state":"live","foreground":{"argv":["/opt/pnpm/bin/pi/cli.js"],"pid":2}}\n' ;;
+	launch) printf '{"state":"live","foreground":{"argv":["sh","-lc","exec /opt/boss/bin/pi-bare"],"pid":4}}\n' ;;
 	other:*) printf '{"state":"live","foreground":{"argv":["%s"],"pid":3}}\n' "${fg#other:}" ;;
 	esac
 	;;

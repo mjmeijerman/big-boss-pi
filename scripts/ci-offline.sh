@@ -204,6 +204,19 @@ expect "close reads the sha that belongs to this worker" 0 "close-provenance: ok
 #     Throwaway repos with a bare origin and stub gh/herdr-app, so nothing is pushed and no PR exists.
 expect "preflight: the checks CI would run, before the push" 0 "preflight: ok" -- \
 	bash "$root/scripts/tests/test-preflight.sh"
+# 5o. No tracked file carries an absolute home directory (the one bug that gave a Windows machine
+#     five symptoms), and the three worker wrappers find pi the same way on every platform: $PI_BIN,
+#     PATH, $PNPM_HOME, $HOME, %APPDATA% — with bin/pi-sandboxed refusing on native Windows instead
+#     of running bare. Both are sweeps over this tree, so they need nothing but the tree.
+expect "no tracked file carries a home directory" 0 "no-hardcoded-home: ok" -- \
+	bash "$root/scripts/tests/test-no-hardcoded-home.sh"
+expect "pi resolution order, wrappers and the Windows refusal" 0 "pi-resolve: ok" -- \
+	bash "$root/scripts/tests/test-pi-resolve.sh"
+# 5p. One failed guard pass is one pass: a refused space.new or a tab that cannot be opened is
+#     logged and the next interval tries again, in the same process, so the space still comes back
+#     after it is closed. One stub herdr-app, one real guard process per case.
+expect "the guard survives a failed iteration" 0 "guard-iteration: ok" -- \
+	bash "$root/scripts/tests/test-guard-iteration.sh"
 
 # 6. Routing is a refusal, not a warning. delegate reads jev from $PI_BOSS_ROOT/bin, so a
 #    fake jev there answers route=local without a model and without touching the real tree.

@@ -110,7 +110,7 @@ setup() { # <slug> <branch> [trunk]
 		"$real_git" -C "$REPO" checkout -q -b "$branch"
 		printf 'two\n' >>"$REPO/file.txt"
 		"$real_git" -C "$REPO" commit -q -am "feat: the worker's change" -m "Agent-Slug: $slug" \
-			-m "Spec: /home/mark/big-boss-pi/specs/publish-open-pr.md"
+			-m "Spec: specs/publish-open-pr.md"
 	else
 		# A merged PR's branch was pushed before it was merged, so origin holds it: the publish
 		# reads origin's head to confirm that nothing of this branch is missing there.

@@ -5,14 +5,18 @@
 #
 #   finish-rename.sh                  print the state and what the next steps would be
 #   finish-rename.sh --close-old-space  close the Herdr space named pi-master, then print how to
-#                                       delete /home/mark/pi-master afterwards
+#                                       delete the rollback copy ($HOME/pi-master) afterwards
 #
 # It never deletes anything itself. Deleting the rollback copy is the user's call and the
 # command is printed, not run.
 set -uo pipefail
 
-OLD_ROOT=/home/mark/pi-master
-NEW_ROOT=/home/mark/big-boss-pi
+# Both roots are resolved at runtime, never written down: the old one is $HOME/pi-master on every
+# platform, and the new one is this script's own tree, which is the only path that can be right on
+# the machine that is running it.
+self_root=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)
+OLD_ROOT=${PI_MASTER_ROOT:-${HOME:-}/pi-master}
+NEW_ROOT=${PI_BOSS_ROOT:-$self_root}
 
 usage() {
 	cat <<EOF

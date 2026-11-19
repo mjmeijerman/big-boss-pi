@@ -365,8 +365,8 @@ export FAKE_HC_LS='{"hidden_finished":0,"terminals":[
 {"address":"t2","status":"idle","where":"learn-00-13 / learn-00-13"},
 {"address":"t3","status":"done","where":"learner-gaps-rebase / learner-gaps-rebase"}]}'
 export FAKE_HERDR_LS='{"spaces":[
-{"id":"sp-learn","name":"learn-00-13","folder":"/home/mark/.pi"},
-{"id":"sp-other","name":"learner-gaps-rebase","folder":"/home/mark/.pi"}]}'
+{"id":"sp-learn","name":"learn-00-13","folder":"/tmp/pi"},
+{"id":"sp-other","name":"learner-gaps-rebase","folder":"/tmp/pi"}]}'
 run finish w1
 if [ "$RC" != 0 ]; then
 	fail "finish with a finished learn space exited $RC — $OUT"
@@ -388,7 +388,7 @@ reset
 export FAKE_HC_LS='{"hidden_finished":0,"terminals":[
 {"address":"t1","status":"done","where":"learn-00-14 / learn-00-14"},
 {"address":"t2","status":"working","where":"learn-00-14 / learn-00-14"}]}'
-export FAKE_HERDR_LS='{"spaces":[{"id":"sp-learn2","name":"learn-00-14","folder":"/home/mark/.pi"}]}'
+export FAKE_HERDR_LS='{"spaces":[{"id":"sp-learn2","name":"learn-00-14","folder":"/tmp/pi"}]}'
 run finish w1
 if [ "$RC" != 0 ]; then
 	fail "finish with a live learner exited $RC — $OUT"
@@ -405,7 +405,7 @@ reset
 printf '{"w1":{"space":"space-w1","cwd":"","branch":""},"learn-00-15":{"space":"sp-learn3","cwd":"","branch":""}}\n' \
 	>"$PI_BOSS_ROOT/state/delegations.json"
 export FAKE_HC_LS='{"hidden_finished":0,"terminals":[{"address":"t1","status":"done","where":"learn-00-15 / learn-00-15"}]}'
-export FAKE_HERDR_LS='{"spaces":[{"id":"sp-learn3","name":"learn-00-15","folder":"/home/mark/.pi"}]}'
+export FAKE_HERDR_LS='{"spaces":[{"id":"sp-learn3","name":"learn-00-15","folder":"/tmp/pi"}]}'
 run finish w1
 if [ "$RC" != 0 ]; then
 	fail "finish with a tracked learn slug exited $RC — $OUT"
@@ -419,7 +419,7 @@ fi
 #     its own job. One warning line names the skip, and no fake count is printed.
 reset
 export FAKE_HC_LS='{"hidden_finished":0,"terminals":[{"address":"t1","status":"done","where":"learn-00-16 / learn-00-16"}]}'
-export FAKE_HERDR_LS='{"spaces":[{"id":"sp-learn4","name":"learn-00-16","folder":"/home/mark/.pi"}]}'
+export FAKE_HERDR_LS='{"spaces":[{"id":"sp-learn4","name":"learn-00-16","folder":"/tmp/pi"}]}'
 export FAKE_HC_RC=1
 run finish w1
 if [ "$RC" != 0 ]; then
@@ -435,7 +435,7 @@ fi
 # 13. The reap is opt-out for anything that must see the ordinary paths untouched.
 reset
 export FAKE_HC_LS='{"hidden_finished":0,"terminals":[{"address":"t1","status":"done","where":"learn-00-17 / learn-00-17"}]}'
-export FAKE_HERDR_LS='{"spaces":[{"id":"sp-learn5","name":"learn-00-17","folder":"/home/mark/.pi"}]}'
+export FAKE_HERDR_LS='{"spaces":[{"id":"sp-learn5","name":"learn-00-17","folder":"/tmp/pi"}]}'
 out=$(env DELEGATE_NO_REAP=1 "$delegate" finish w1 2>&1) && RC=0 || RC=$?
 OUT=$out
 if [ "$RC" != 0 ]; then
@@ -454,7 +454,7 @@ fi
 #     So the close is confirmed against `herdr-app ls`, the window's own list, and a space still on
 #     that list is a warning that names its id, with the worker kept so closing it again is possible.
 reset
-export FAKE_HERDR_LS='{"spaces":[{"id":"space-w1","name":"w1","folder":"/home/mark/big-boss-pi"}]}'
+export FAKE_HERDR_LS='{"spaces":[{"id":"space-w1","name":"w1","folder":"/tmp/big-boss-pi"}]}'
 run finish w1
 if [ "$RC" = 0 ]; then
 	fail "finish called a worker closed while herdr still listed its space, wanted a refusal — $OUT"
@@ -474,7 +474,7 @@ fi
 # 15. And the confirmation does not block the ordinary close: a space herdr no longer lists is gone,
 #     whatever space.close's own exit code said.
 reset
-export FAKE_HERDR_LS='{"spaces":[{"id":"sp-other","name":"somebody-else","folder":"/home/mark/.pi"}]}'
+export FAKE_HERDR_LS='{"spaces":[{"id":"sp-other","name":"somebody-else","folder":"/tmp/pi"}]}'
 run finish w1
 if [ "$RC" != 0 ]; then
 	fail "finish with a space herdr no longer lists exited $RC — $OUT"

@@ -6,8 +6,8 @@
 # whose directory is long gone. Every `git branch`, `git status` and `git log --all` in the repo then
 # reads them, so the next worker misleads itself with work that already landed.
 #
-#   bash scripts/prune-refs.sh --cwd /home/mark/.pi                 list them, change nothing
-#   bash scripts/prune-refs.sh --cwd /home/mark/.pi --apply --yes   delete exactly what it listed
+#   bash scripts/prune-refs.sh --cwd ~/.pi                          list them, change nothing
+#   bash scripts/prune-refs.sh --cwd ~/.pi --apply --yes            delete exactly what it listed
 #
 # Three proofs, and only three, make a branch dead — everything else is kept and says why:
 #   * ancestry: `git branch --merged origin/<trunk>` lists it; or
@@ -106,7 +106,7 @@ git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1 || die "not a git checkout: $c
 # --- what we compare against -------------------------------------------------------------------
 
 # The trunk is whatever origin/HEAD points at, and the two checkouts here name it differently
-# (`trunk` in /home/mark/.pi, `main` here), so it is never hardcoded.
+# (`trunk` in ~/.pi, `main` here), so it is never hardcoded.
 trunk=$(git -C "$cwd" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) || trunk=""
 trunk=${trunk#origin/}
 if [ -z "$trunk" ] || ! git -C "$cwd" rev-parse --verify --quiet "refs/remotes/origin/$trunk" >/dev/null; then
