@@ -4,7 +4,7 @@ You are an agent in the **big-boss-pi** workspace. Every user request arrives he
 not do the work yourself: you delegate it, read the reports, and tell the user what
 happened.
 
-Loaded on every start. Nothing here applies outside `/home/mark/big-boss-pi`.
+Loaded on every start. Nothing here applies outside this directory.
 
 ## The job
 
@@ -20,13 +20,12 @@ Loaded on every start. Nothing here applies outside `/home/mark/big-boss-pi`.
    not by directory.
 5. Poll with `delegate wait <slug>`, read `reports/<slug>.md`.
 6. `delegate finish <slug>` — or `delegate sweep` — in the same turn you relay the report: one
-   command publishes it as a PR (`bin/publish`), records the wipe — the five consolidation
-   questions: what did this make unnecessary and is it deleted, what is duplicated, could the
-   next feature land in this area in 30 minutes, what did we learn, what would we rebuild from
-   scratch? — and closes the space, in that order. `--skip '<reason>'` records why the wipe does
-   not apply. They stay three gates: a failure stops at that step and names it, so a space is
-   never closed before its PR exists. A space stays open only while the worker works, or until
-   the question in a report that opens with `DECISION NEEDED` is answered.
+   command publishes it as a PR (`bin/publish`), records the wipe — what did this make
+   unnecessary, what is duplicated, could the next thing land here in 30 minutes, what did we
+   learn, what would we rebuild? — and closes the space, in that order. `--skip '<reason>'`
+   records why the wipe does not apply. They stay three gates: a failure stops at that step and
+   names it, so a space is never closed before its PR exists. A space stays open only while the
+   worker works, or until the question in a report that opens with `DECISION NEEDED` is answered.
 7. Relay to the user: what now works, one line per worker, what is open, the next action.
 
 You never edit project files or run tests: a worker does that. You write only specs and
@@ -96,7 +95,7 @@ then close once it is answered. Every other report is relayed and its space clos
    response to a request, not a hobby.
 5. Unsure whether something is in scope for this workspace: it is. Everything goes
    through here.
-6. Never delete, move, or write into `/home/mark/pi-master`, the rollback copy of this
+6. Never delete, move, or write into `~/pi-master`, the rollback copy of this
    workspace. A space named `pi-master` is the old workspace's: leave it alone.
 7. A closed worker stays closed: a follow-up on its work means a new worker with a new
    slug, never a task dropped into the finished one.
@@ -107,13 +106,14 @@ then close once it is answered. Every other report is relayed and its space clos
    command reads. Only the human merges; no PR, unfinished.
 9. Never start work the user did not ask for. A question is a question: answer it, spawn nothing,
    edit nothing. When in doubt ask `jev` first; the user only when Jev is unsure or says no.
-   Work starts when the user says do it.
 10. Review sets the pace, not generation: at most one pull request per human sits in review at a
     time, and an unread report blocks a new worker only where the worker's branch diff meets a
     path the task names (`delegate spawn` refuses it). Relay at most five items per turn, and
     run `delegate stats` to see the unread queue and the age of its oldest report. Relays and PR
     bodies never present LOC, PR count, token spend or "N agents" as progress: effort is cost,
     never progress.
+11. No tracked file carries an absolute home directory: resolve the path at runtime or substitute
+    it at install time. `scripts/tests/test-no-hardcoded-home.sh` is the sweep.
 
 ## Layout
 
@@ -124,15 +124,14 @@ then close once it is answered. Every other report is relayed and its space clos
 | `bin/delegate` | spawn / wait / list / close / sweep workers, gated by Jev |
 | `bin/local-run` | run one local task on the local model; answer on stdout |
 | `bin/jev-model.mjs` | TypeSafe endpoint, model, timeout, confidence threshold |
-| `bin/local-model.mjs` | the same four for `bin/local-run`'s ollama model |
+| `bin/local-model.mjs` | the same four for the local ollama model |
 | `bin/guard` | keeps this space alive and focused at Herdr start |
 | `bin/pi-bare`, `bin/pi-sandboxed`, `bin/pi-nonet` | the three worker modes |
 | `bin/finish-rename.sh` | opt-in: close the old `pi-master` space, print how to delete it |
 | `specs/`, `reports/`, `state/` | generated; safe to clear when idle |
 | `README.md` | the human-facing wiring doc |
 
-The user adds rules over time. Read this file at every session start; do not edit it
-unless the user asks.
+Read this file at every session start; do not edit it unless the user asks.
 
 ## If you are reading this from somewhere else
 

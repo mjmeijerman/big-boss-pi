@@ -115,7 +115,7 @@ The learner published its proposal as commit $learner, which is the evidence tha
 ## Evidence
 
 $ bin/preflight — 5/5 passed
-\$ git -C /home/mark/.pi log --oneline -1 learn/learn-17-01
+\$ git -C ~/.pi log --oneline -1 learn/learn-17-01
 $learner chore(learn): the learner publishes its own proposal
 REPORT
 if [ "$RC" != 1 ]; then

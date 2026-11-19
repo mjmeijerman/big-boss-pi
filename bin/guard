@@ -45,7 +45,7 @@
 # Radar Vol. 35: blip 20 (stateful guardrails) — a rule nothing checks is a rule that is gone.
 #
 # Path spelling on Windows. Under Git Bash this script's own root is an MSYS path
-# (/c/Users/Mark/big-boss-pi): bash, awk, coreutils and the resume script all take it as it is, and
+# (/c/Users/<you>/big-boss-pi): bash, awk, coreutils and the resume script all take it as it is, and
 # MSYS rewrites a path-like argv on its way to a native program. Two boundaries no rewrite reaches:
 # a path carried *inside* a JSON string (the `--argv` handed to herdr-app), and a path carried in an
 # environment variable or argv to node.exe, which is a native program and would read /c/... off the
@@ -54,7 +54,7 @@
 #   * native_path() is the spelling a native Windows program can read, and is used at every
 #     boundary that leaves the script: --folder, and every path handed to node;
 #   * on Linux and macOS both are the identity, so nothing about that platform changes.
-# native_path uses `cygpath -m` (C:/Users/Mark/...) and not -w: slash-separated is still an
+# native_path uses `cygpath -m` (C:/Users/<you>/...) and not -w: slash-separated is still an
 # absolute native path that Windows APIs accept, and it needs no escaping inside the JSON argv or
 # the shell line a tab runs.
 set -uo pipefail
@@ -145,6 +145,12 @@ boot_id() {
 		process.stdout.write("boot"+Math.round((Date.now()-os.uptime()*1000)/60000))' 2>/dev/null || true
 }
 BOOT=$(boot_id)
+# Did herdr-app answer on the last pass? A file, not a shell variable: every pass after the first
+# runs in a subshell, so a fatal error in one pass ends that pass and not the guard, and the next
+# pass still has to know that Herdr restarted (that is the one moment the space is selected).
+APP_DOWN=$STATE/app-down
+app_down() { [ -f "$APP_DOWN" ]; }
+set_app_down() { if [ "$1" = 1 ]; then : >"$APP_DOWN"; else rm -f "$APP_DOWN"; fi; }
 # The resume map and its script live in ~/.pi. Both are overridable so a test can supply a fake
 # map and a fake script instead of a desktop app and a real session.
 RESUME_SCRIPT=${PI_BOSS_RESUME_SCRIPT:-${HOME:-}/.pi/scripts/herdr-resume.sh}
@@ -632,7 +638,9 @@ kickoff_later() {
 	) &
 }
 
-# repair_tab <space> <tab> <name> <index> <terminal> — returns 0 only when it repaired the tab.
+# repair_tab <space> <tab> <name> <index> <terminal> — 0 when it repaired the tab, 2 when it left
+# the tab alone on purpose (rate-limited, the person's own, already resumed in this boot), 1 when a
+# repair was attempted and failed.
 # Two paths, in this order:
 #   1. the tab has a resume entry, by its terminal id or by the tab id in the entry — let the
 #      ~/.pi resume script run, then, when that declined, do the same job here with `hc send` on
@@ -645,7 +653,7 @@ kickoff_later() {
 repair_tab() {
 	local space=$1 tab=$2 name=$3 index=$4 terminal=${5:-} boss=0 argv out new_terminal new_tab args=() key entry
 	key=$(repair_key "$space" "$name" "$index")
-	repaired_recently "$key" && return 1
+	repaired_recently "$key" && return 2
 	[ "$name" = master ] && boss=1
 
 	if entry=$(resume_entry_for_tab "$space" "$tab" "$terminal"); then
@@ -667,7 +675,7 @@ repair_tab() {
 		2)
 			# Already restored in this boot and pi is gone: the person let it go. Leave the tab be.
 			log "tab $name ($tab) already had its session resumed in this boot; leaving it alone"
-			return 1
+			return 2
 			;;
 		esac
 		log "could not resume terminal \`$entry_terminal\` in tab $name ($tab); opening a new pi instead: $(printf '%s' "$resumed" | tail -n 2 | tr '\n' ' ')"
@@ -678,7 +686,7 @@ repair_tab() {
 		if person_shell "$terminal"; then
 			log "tab $name ($tab) left alone: it is the person's tab (interactive shell on terminal \`$terminal\` that the guard did not start)"
 			mark_repaired "$key"
-			return 1
+			return 2
 		fi
 		log "tab $name ($tab) opened fresh: terminal \`${terminal:-unknown}\` has no entry in $RESUME_DIR, so it never held pi"
 	fi
@@ -715,7 +723,7 @@ repair_tab() {
 # repair_stale_tabs <space id> — repair every stale tab of the space, then put the person back
 # on the space and tab they were looking at. A failed restore is one line, never a failed repair.
 repair_stale_tabs() {
-	local space=$1 snapshot=$2 stale tab name index before touched=0 class
+	local space=$1 snapshot=$2 stale tab name index before touched=0 failed=0 class
 	# Before anything is repaired: which of these tabs are the guard's to repair at all.
 	classify_snapshot "$space" <<<"$snapshot" |
 		while IFS=$'\t' read -r name tab; do
@@ -733,34 +741,50 @@ repair_stale_tabs() {
 		if [ "$class" = person ] && ! resume_entry_for_tab "$space" "$tab" "$terminal" >/dev/null; then
 			continue
 		fi
-		repair_tab "$space" "$tab" "$name" "$index" "$terminal" && touched=1
+		repair_tab "$space" "$tab" "$name" "$index" "$terminal"
+		case $? in
+		0) touched=1 ;;
+		2) : ;; # left alone on purpose: rate-limited, the person's, or already resumed this boot
+		*)
+			# A tab that cannot be put back is logged and left as it is; it must not stop this pass
+			# from finishing, nor the space from being rebuilt after it is closed.
+			failed=1
+			;;
+		esac
 	done <<<"$stale"
-	[ "$touched" = 1 ] || return 0
-	if [ -n "$before" ]; then
+	if [ "$failed" = 1 ]; then
+		log "at least one tab could not be repaired this pass; the next interval tries again"
+	fi
+	if [ "$touched" = 1 ] && [ -n "$before" ]; then
 		restore_focus ${before} ||
 			printf 'guard: could not restore focus to space %s tab %s after repairing %s\n' \
 				"${before%% *}" "${before##* }" "$SPACE_NAME" >&2
 	fi
-	return 0
+	[ "$failed" = 0 ]
 }
 
 ensure() {
-	local snapshot space
+	local snapshot space tabs_failed=0
 	snapshot=$(herdr-app ls 2>/dev/null) || snapshot=""
 	space=$(printf '%s' "$snapshot" | space_id) || {
 		# Log the transition, not every poll: a closed window is normal.
-		[ "$app_down" = 1 ] || log "herdr-app not answering; waiting"
-		app_down=1
+		app_down || log "herdr-app not answering; waiting"
+		set_app_down 1
 		return 0
 	}
 	# Herdr (re)started: put the person on big-boss-pi once, then never steal focus again.
-	if [ "$app_down" = 1 ]; then
+	if app_down; then
 		log "herdr-app answered again"
-		app_down=0
+		set_app_down 0
 		herdr-app do space.select --id "$space" >/dev/null 2>&1 && log "selected $SPACE_NAME ($space)"
 	fi
 	if [ -z "$space" ]; then
-		create_space || return 0
+		# One failed creation is one pass, not the end: the space still has to come back on the next
+		# interval, whatever was wrong with this attempt (a closed window, a bad argv, a slow app).
+		create_space || {
+			log "could not create $SPACE_NAME this pass; the next interval tries again"
+			return 1
+		}
 		# A space the guard created has never been on screen: nothing has selected it yet. On a clean
 		# install — the Windows first run — Herdr would answer every later poll with a space nobody is
 		# looking at, which reads as "Herdr opened empty". Select it once, here, and never again.
@@ -777,10 +801,13 @@ ensure() {
 	if [ "$space" != "$known" ]; then
 		printf '{"space":"%s","created":"%s"}\n' "$space" "$(iso_now)" >"$SPACE_STATE"
 	fi
-	repair_stale_tabs "$space" "$snapshot"
+	# The tab repairs are this pass's work; a failure among them is reported to the loop, which
+	# logs it and stays on the interval.
+	repair_stale_tabs "$space" "$snapshot" || tabs_failed=1
 	if [ "$1" = "select" ]; then
 		herdr-app do space.select --id "$space" >/dev/null 2>&1 && log "selected $SPACE_NAME ($space)"
 	fi
+	return "$tabs_failed"
 }
 
 # Dispatch only when executed: sourcing this file just gives you the functions.
@@ -792,16 +819,19 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 	fi
 	need_app || { log "herdr-app not on PATH; exiting"; exit 0; }
 	log "guard started (space $SPACE_NAME, root $ROOT, interval ${INTERVAL}s)"
-	app_down=0
+	set_app_down 0
 
 	# Recreate immediately, and put the person on it: that is "open when Herdr starts".
-	ensure select
+	ensure select || log "the first pass failed; the loop keeps trying"
 
 	# One poll and out: a test drives a repair without waiting for the interval, and a person can
 	# ask for one repair without starting a service.
 	[ "${PI_BOSS_ONCE:-0}" = 1 ] && exit 0
 
+	# Every pass in a subshell: a fatal error inside one pass (a bad tab, a stub that is not there,
+	# an unbound variable) ends *that* pass and not the guard. The space was closed once and never
+	# came back because one broken iteration was allowed to be the last one.
 	while sleep "$INTERVAL"; do
-		ensure ""
+		(ensure "") || log "iteration failed; staying on the interval and trying again next poll"
 	done
 fi

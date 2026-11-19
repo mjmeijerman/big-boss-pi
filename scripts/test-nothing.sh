@@ -107,7 +107,7 @@ Nothing landed on purpose: the pull request merged before the work finished.
 ## Evidence
 
 $ bin/preflight — 5/5 passed
-\$ git -C /home/mark/.pi log --oneline -1 origin/trunk
+\$ git -C ~/.pi log --oneline -1 origin/trunk
 1c624f1 ci(scripts-test): run every bash gate test from make scripts-test (#68)
 REPORT
 row=$(decisions nothing landed-nothing)

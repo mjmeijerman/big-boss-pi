@@ -4,21 +4,21 @@ The delegation hub. Every request goes through the big-boss-pi Herdr space; agen
 Jev how many workers a task needs and in which mode, spawn them in their own spaces, and report
 back. They do not do project work themselves.
 
-This workspace replaced `pi-master`. The old tree at `/home/mark/pi-master` is the rollback
+This workspace replaced `pi-master`. The old tree at `~/pi-master` is the rollback
 copy: read-only during the transition, deleted only when the user says so.
 
 ## What is wired where
 
 | piece | path | why there |
 |---|---|---|
-| The rules every agent here loads | `/home/mark/big-boss-pi/AGENTS.md` | Pi loads `AGENTS.md` from the working directory and every parent, on every start, with no project trust needed. New or reloaded agents therefore start with the same knowledge |
+| The rules every agent here loads | `$PI_BOSS_ROOT/AGENTS.md` | Pi loads `AGENTS.md` from the working directory and every parent, on every start, with no project trust needed. New or reloaded agents therefore start with the same knowledge |
 | Decision model | `bin/jev` → `~/.local/bin/jev` | TypeSafe's Jev on api.typesafe.ai, one typed request with a calibrated probability per question; decides worker count, mode, route, thinking effort, and permissions |
 | Local worker | `bin/local-run` | runs a local task on the ollama model (`bin/local-model.mjs`), headless: prompt in, answer on stdout, no space and no spec, no network; records one line in `state/usage.jsonl` |
 | Delegation | `bin/delegate` → `~/.local/bin/delegate` | one jev call for mode, count, route and thinking effort, one Herdr space per worker jev asked for, the spec, where the report lands, and every decision in `state/decisions.jsonl`; `delegate sweep` closes the workers that finished |
-| Worker modes | `bin/pi-bare`, `bin/pi-sandboxed`, `bin/pi-nonet` | `delegate` picks one from Jev's answer |
+| Worker modes | `bin/pi-bare`, `bin/pi-sandboxed`, `bin/pi-nonet` | `delegate` picks one from Jev's answer. All three find pi the same way, at runtime (`bin/pi-resolve.sh`: `$PI_BIN`, `PATH`, `$PNPM_HOME`, `$HOME`, `%APPDATA%`), so none of them carries a home directory; on native Windows the two sandboxed modes refuse with the WSL2 line instead of running bare |
 | Preflight | `bin/preflight` | the checks CI would run, on this branch, here: `bash -n`/`node --check` on the changed files, the repo's own suite, semgrep over the changed files, the changed tests under a scrubbed `env -i`, and the body gate on the exact body `bin/publish` would send. `delegate finish` runs it before the publish, and no push happens past a failing check |
 | Never-closable space | `bin/guard` → `~/.local/bin/big-boss-pi-guard` + `~/.config/systemd/user/big-boss-pi-guard.service` | polls `herdr-app ls`; recreates the `big-boss-pi` space if it disappears, selects it once when Herdr starts, resumes a tab whose terminal is no longer pi from its resume entry — found by terminal id **or** by the tab id the entry recorded, newest `updated_at` first, session file required — first through `~/.pi/scripts/herdr-resume.sh` and then, when that declines, with its own `hc send` on the entry's terminal, and reopens it with an absolute argv only when there is no usable entry or the resume did not start pi, at most once a minute per tab and logged in `state/guard.log` with the path it took. Only tabs it is allowed to repair: the parked tabs it saw when it started, and the ones it opened itself — a tab the person opens while it runs is theirs, kept in `state/tab-classes` so a restart does not take it either. It never touches a space named `pi-master` |
-| Delegation-only enforcement | `~/.pi/agent/extensions/big-boss-pi-guard.ts` | blocks the `write` and `edit` tools, and shell writes into the directory (`echo x > …`, `rm/mv/cp/tee/sed -i`), when the session's cwd is under `/home/mark/big-boss-pi` **or** `/home/mark/pi-master`; no-ops everywhere else, including for a worker session (`PI_WORKER=1`) |
+| Delegation-only enforcement | `~/.pi/agent/extensions/big-boss-pi-guard.ts` | blocks the `write` and `edit` tools, and shell writes into the directory (`echo x > …`, `rm/mv/cp/tee/sed -i`), when the session's cwd is under this workspace **or** under `~/pi-master`; no-ops everywhere else, including for a worker session (`PI_WORKER=1`) |
 | Rollback helper | `bin/finish-rename.sh` | closes the old `pi-master` space on request and prints how to delete the old tree. Runs nothing by default |
 
 ## Paths and the environment variable
@@ -348,7 +348,7 @@ for pi to appear, and only then logs the resume. It never types twice in one boo
 `restored_boot_id` is this boot, or a terminal recorded in `state/resumed`, is left alone.
 
 Only a tab with no usable entry — a tab that never held pi — is reopened, in place, under its
-own name, with `sh -lc exec /home/mark/big-boss-pi/bin/pi-bare -a` — absolute, because the holder
+own name, with `sh -lc exec $PI_BOSS_ROOT/bin/pi-bare -a` — absolute, because the holder
 restarts it from a PATH without the pnpm bin dir. The same reopen is the fallback when a resume
 does not put pi back, with one log line saying so. A live pi tab is left alone, a tab is repaired
 at most once a minute (a pi that exits at once must not become a spawn loop), and every repair
@@ -391,7 +391,7 @@ that delegation is the path of least resistance, and a direct file edit fails lo
 The guard covers the **boss session**, not the worker it spawned. `bin/pi-bare`,
 `bin/pi-sandboxed` and `bin/pi-nonet` export `PI_WORKER=1` into the worker's environment, and
 the guard returns early for such a session: a worker writes in the workspace it was given,
-including `/home/mark/big-boss-pi` and its `specs`/`reports`. A session without `PI_WORKER` is
+including this workspace root and its `specs`/`reports`. A session without `PI_WORKER` is
 the boss and stays guarded exactly as before.
 
 ## Daily use

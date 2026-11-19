@@ -5,15 +5,48 @@
 # The worker's report has to get back to the big-boss-pi agent, and its spec has to get in.
 # Both live in the workspace root, which the sandbox does not mount, so those two directories
 # are bound read-write on purpose: specs + reports, nothing else.
+#
+# Where pi and the sandbox runner are is resolved at runtime (bin/pi-resolve.sh, $HOME), never
+# carried in this file: one wrapper for every platform, and no path from this developer's laptop.
+#
+# Windows: native Windows has no bwrap and no pisandbox, so this mode refuses with the honest line
+# and a non-zero exit instead of silently running bare or dying on a missing path. The WSL2-backed
+# entry is the one marked place at the bottom.
 set -uo pipefail
-root=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)
+here=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
+root=$(cd -- "$here/.." && pwd)
 root=${PI_BOSS_ROOT:-${PI_MASTER_ROOT:-$root}}
-export PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}:/home/mark/.local/share/pnpm/bin"
+# shellcheck source=bin/pi-resolve.sh
+. "$here/pi-resolve.sh"
+
+win=0
+pi_is_win && win=1
+
+# --- WSL2 wiring (follow-up worker) ------------------------------------------
+# The only sandbox native Windows can have is a Linux kernel, i.e. WSL2. When that lands it goes
+# here, and nowhere else: detect the distro, then hand this same file to it so the sandbox below is
+# exactly the Linux one —
+#   exec wsl.exe -e bash "$here/pi-sandboxed" "$@"
+# Until then the honest line is the whole of the Windows behaviour.
+if [ "$win" = 1 ]; then
+	printf 'pi-sandboxed: no sandbox on native Windows; run pi under WSL2 (docs/install.md#sandboxing-on-windows)\n' >&2
+	exit 1
+fi
+
+# The pi this session runs, and the directory the sandbox needs on PATH to find it again.
+pi_resolve || exit 127
+export PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}:$PI_RESOLVED_DIR"
+
 # This session is the worker, not the boss: the big-boss-pi write guard returns early for it.
 # The sandbox inherits the environment, so the marker survives into it.
 export PI_WORKER=1
+sandbox=${PI_BOSS_PISANDBOX:-${HOME:-}/.pi/scripts/pisandbox}
+if [ ! -x "$sandbox" ]; then
+	printf 'pi-sandboxed: no sandbox runner at %s (install the harness, or set PI_BOSS_PISANDBOX)\n' "$sandbox" >&2
+	exit 127
+fi
 seeds=()
 for d in "$root/specs" "$root/reports"; do
 	[ -d "$d" ] && seeds+=(--rw "$d")
 done
-exec /home/mark/.pi/scripts/pisandbox "${seeds[@]+"${seeds[@]}"}" -- "$@"
+exec "$sandbox" "${seeds[@]+"${seeds[@]}"}" -- "$@"

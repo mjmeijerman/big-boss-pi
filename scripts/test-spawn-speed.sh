@@ -307,7 +307,7 @@ rm -f "$PI_BOSS_ROOT/state/delegations.json"
 export FAKE_HC_LS='{"hidden_finished":0,"terminals":[
 {"address":"t1","status":"done","where":"learn-07-08 / learn-07-08"},
 {"address":"t2","status":"done","where":"learn-07-08 / learn-07-08"}]}'
-export FAKE_HERDR_LS='{"spaces":[{"id":"sp-learn","name":"learn-07-08","folder":"/home/mark/.pi"}]}'
+export FAKE_HERDR_LS='{"spaces":[{"id":"sp-learn","name":"learn-07-08","folder":"/tmp/pi"}]}'
 : >"$work/herdr-log"
 export HERDR_LOG=$work/herdr-log
 JEV_STUB_COUNT=1 spawn reap-task --cwd "$area" "one small change"

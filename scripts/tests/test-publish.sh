@@ -599,7 +599,7 @@ rm -rf "$REPO/scripts"
 
 # --- a target repo's test-change gate gets the worker's own reason ---------------------------------
 #
-# `make pr-check` here (and in /home/mark/.pi) asks why a test changed beside its source, and a
+# `make pr-check` here (and in ~/.pi) asks why a test changed beside its source, and a
 # body with that line is the only thing that answers it. The worker is the only one who knows, so
 # the report's line is carried into the body; when the report has none, the body has none, and the
 # gate that wants one still refuses. Nothing here invents a reason.
