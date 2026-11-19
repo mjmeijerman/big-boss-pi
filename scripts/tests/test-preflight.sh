@@ -27,7 +27,10 @@
 #      a failing suite fails the gate with its name, and a prose-only diff names both fast paths.
 #   J. the body gate runs in the checkout that holds the branch: a worktree for a branch in a
 #      worktree, in place for a main checkout that is on the branch, and a throwaway worktree for a
-#      branch only a ref holds — removed afterwards, on the refused path too.
+#      branch only a ref holds — removed afterwards, on the refused path too;
+#   K. a branch cut before a pull request merged refuses the publish: the `behind` check's FAIL,
+#      the rebase line, no push, the report still there and the space still open. #68's shape —
+#      spawned 19:27:52Z, #67 merged 19:32:04Z, arrived CONFLICTING with AGENTS.md and README.md.
 #
 #   bash scripts/tests/test-preflight.sh      exit 0 = every case held
 set -uo pipefail
@@ -815,6 +818,42 @@ elif [ "$(worktrees_held)" != 1 ]; then
 	fail "the repo still holds $(worktrees_held) worktrees after a refused gate — $OUT"
 else
 	pass "a throwaway checkout is removed after a refused gate, not only after a passing one"
+fi
+
+# --- K. a branch cut before a pull request merged ------------------------------------------------
+
+# The #68 shape: the branch and trunk both move the same file, trunk merges after the branch was
+# cut, and every check this machine runs on its own would pass. Only `behind` can see it, so the
+# assertions are that `finish` names it, prints the rebase, and publishes nothing.
+reset_case behind
+printf 'the trunk\n\none line from the branch\n' >"$REPO/README.md"
+commit_branch "docs(w1): a line the trunk also moves"
+git -C "$REPO" checkout -q main
+printf 'the trunk\n\nthe line that merged\n' >"$REPO/README.md"
+git -C "$REPO" commit -q -am "docs: the line that merged"
+git -C "$REPO" push -q origin main
+git -C "$REPO" checkout -q feat/w1
+write_report Medium yes
+track_worker
+run "$delegate" finish w1
+if [ "$RC" = 0 ]; then
+	fail "a branch 1 commit behind a colliding trunk published anyway — $OUT"
+elif ! said "behind"; then
+	fail "the behind check is not named — $OUT"
+elif ! said "1 commit(s) behind origin/main"; then
+	fail "the refusal does not say how far behind — $OUT"
+elif ! said "README.md"; then
+	fail "the colliding path is not named — $OUT"
+elif ! said "rebase origin/main"; then
+	fail "the refusal does not carry the rebase that fixes it — $OUT"
+elif gh_saw '^gh pr (create|edit) ' || [ -n "$(origin_head)" ]; then
+	fail "a push or a pull request happened past a branch behind trunk"
+elif [ ! -s "$PI_BOSS_ROOT/reports/w1.md" ]; then
+	fail "a refused run took the report with it"
+elif grep -q 'space.close' "$work/herdr-calls" 2>/dev/null; then
+	fail "a refused run closed the space"
+else
+	pass "a branch behind a colliding trunk is refused with the rebase: no push, report and space kept"
 fi
 
 # --- summary -----------------------------------------------------------------------------------
