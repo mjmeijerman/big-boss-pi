@@ -149,6 +149,12 @@ expect "spawn plan, worker count, path blocking and evidence scaffold" 0 "spawn 
 #     real space.
 expect "guard resumes before it reopens a tab" 0 "guard-resume: ok" -- \
 	bash "$root/scripts/test-guard-resume.sh"
+# 5f2. The same guard under Git Bash on Windows, which is the only thing that creates the space
+#      there: a simulated msys shell, a stub herdr-app that records the exact argv it received,
+#      so --folder is native and --argv keeps the POSIX path a `sh -lc` line needs, plus a
+#      missing hc, a root with a space, the state file written once, and the POSIX shape as it was.
+expect "guard creates the space with the argv Windows can read" 0 "guard-windows: ok" -- \
+	bash "$root/scripts/test-guard-windows.sh"
 # 5g. Typed decisions: jev asks TypeSafe one question (four for a plan) and acts on the
 #     probability; a low-probability field, an unoffered option, a 401, a timeout, a malformed
 #     body and a missing key are all exit 3, and the API key never reaches stdout or stderr. A
