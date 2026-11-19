@@ -101,10 +101,10 @@ then close once it is answered. Every other report is relayed and its space clos
 7. A closed worker stays closed: a follow-up on its work means a new worker with a new
    slug, never a task dropped into the finished one.
 8. Every change lands as a pull request: the worker commits on its branch and stops (no push, no
-   `gh pr create`, no attempt). **You** publish with `delegate finish SLUG`, which refuses a report
-   with no Evidence block or no `Review tier:` line, so workers stay sandboxed. Publish before the
-   wipe and the close: closing drops the delegation entry the command reads. Only the human
-   merges; no PR, unfinished.
+   `gh pr create`, no attempt). **You** publish with `delegate finish SLUG`, which refuses a
+   report with no Evidence block, no `Review tier:` line or no `bin/preflight` run, so workers
+   stay sandboxed. Publish before the wipe and the close: closing drops the delegation entry the
+   command reads. Only the human merges; no PR, unfinished.
 9. Never start work the user did not ask for. A question is a question: answer it, spawn nothing,
    edit nothing. When in doubt ask `jev` first; the user only when Jev is unsure or says no.
    Work starts when the user says do it.
@@ -122,13 +122,13 @@ then close once it is answered. Every other report is relayed and its space clos
 | `AGENTS.md` | this file — the rules every agent here loads |
 | `bin/jev` | the decision model wrapper |
 | `bin/delegate` | spawn / wait / list / close / sweep workers, gated by Jev |
-| `bin/local-run` | run one local task on the local model, headless, answer on stdout |
+| `bin/local-run` | run one local task on the local model; answer on stdout |
 | `bin/jev-model.mjs` | TypeSafe endpoint, model, timeout, confidence threshold |
 | `bin/local-model.mjs` | the same four for `bin/local-run`'s ollama model |
-| `bin/guard` | keeps the big-boss-pi space alive and focused at Herdr start |
+| `bin/guard` | keeps this space alive and focused at Herdr start |
 | `bin/pi-bare`, `bin/pi-sandboxed`, `bin/pi-nonet` | the three worker modes |
-| `bin/finish-rename.sh` | opt-in: close the old `pi-master` space, print how to delete the old tree |
-| `specs/`, `reports/`, `state/` | generated, safe to clear when no work is running |
+| `bin/finish-rename.sh` | opt-in: close the old `pi-master` space, print how to delete it |
+| `specs/`, `reports/`, `state/` | generated; safe to clear when idle |
 | `README.md` | the human-facing wiring doc |
 
 The user adds rules over time. Read this file at every session start; do not edit it

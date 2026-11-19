@@ -103,6 +103,14 @@ prog=publish
 # functions (delegate dispatches on BASH_SOURCE), so nothing here starts a worker.
 # shellcheck source=bin/delegate
 . "$BIN/delegate"
+# run_body_gate (the target repo's body gate) is the preflight's own function: `bin/preflight` runs
+# it on the body a publish would send, and this command runs it on the body it is about to send, so
+# there is one definition of what a body gate is and no way for the two to drift. Preflight itself
+# runs without `set -e` (it reports every check); a publish must stop at the first refusal, so -e
+# goes back on here.
+# shellcheck source=bin/preflight
+. "$self_root/bin/preflight"
+set -euo pipefail
 prog=publish
 
 die() {
@@ -152,17 +160,29 @@ stopped_unpushed() {
 }
 
 usage() {
-	printf 'usage: %s <slug> [--cwd DIR]\n' "$prog"
+	printf 'usage: %s <slug> [--cwd DIR] [--body-out FILE]\n' "$prog"
+	printf '  --body-out FILE: write the body this publish would send and stop — no body gate, no push. bin/preflight gates that file.\n' 
 	printf '  body gate: make pr-check BODY=<report body> [BRANCH=<worker branch>] — BRANCH is passed only when a dry run shows the recipe expands it, because a gate that diffs a named branch cannot verify a checkout sitting on trunk otherwise.\n'
 	printf '  duplicate guard: gh pr list --state all for the branch before anything is pushed — an open PR gets the push and its body refreshed from the report, an already-merged one stops the publish, closed is named.\n'
 }
 slug=""
 lookup_cwd=""
+body_out=""
 while [ "$#" -gt 0 ]; do
 	case $1 in
 	-h | --help | help)
 		usage
 		exit 0
+		;;
+	--body-out)
+		[ "$#" -ge 2 ] && [ -n "$2" ] || die "--body-out needs a file to write the body to"
+		body_out=$2
+		shift 2
+		;;
+	--body-out=*)
+		body_out=${1#--body-out=}
+		[ -n "$body_out" ] || die "--body-out needs a file to write the body to"
+		shift
 		;;
 	--cwd)
 		[ "$#" -ge 2 ] && [ -n "$2" ] || die "--cwd needs a directory"
@@ -226,6 +246,13 @@ fi
 [ -f "$report" ] || die "$report does not exist, so there is no report to publish"
 if ! report_has_evidence "$report"; then
 	die "$report has no Evidence block, so the PR body would claim more than the report proves"
+fi
+# ...and the evidence that counts here is the gate's own run: a report that claims green without
+# having run the checks CI would run is exactly what the gate exists to stop. One recorded
+# `--skip-preflight` reason stands in for it, because a check that is genuinely broken on this
+# machine is the one case where the run cannot happen.
+if ! report_has_preflight_evidence "$report" "$slug"; then
+	die "$report names no 'bin/preflight' run under ## Evidence, so nothing shows the checks CI would run were run here. Paste the run: \`bin/preflight --slug $slug\` and its last lines, under ## Evidence — or record why the gate does not apply: delegate finish $slug --skip-preflight \"<reason>\""
 fi
 [ -n "$cwd" ] || die "state/delegations.json records no cwd for this worker"
 
@@ -344,14 +371,6 @@ if ! printf '%s\n' "$slugs" | grep -qE '^Agent-Slug:[[:space:]]*[^[:space:]]'; t
 	die "no commit on $branch carries an Agent-Slug trailer, so nothing ties the branch to a worker"
 fi
 
-# 5. gh has to be there before anything is pushed: a push that cannot be followed by a PR leaves
-# the branch uploaded and the person with a loose end. The duplicate guard needs gh too, so it is
-# skipped by name rather than quietly: a publish that never had a guard should say so.
-if ! command -v gh >/dev/null 2>&1; then
-	note "gh unavailable, duplicate guard skipped — gh is not on PATH"
-	die "gh is not on PATH, so the branch would be pushed with no PR to follow it"
-fi
-
 # The PR body, built from the report: mission verbatim, the tier, the evidence, and the thrown-away
 # section when the worker wrote one. The body gate and gh both read this file. The mission label is
 # reduced to the bare `Mission:` a body gate greps for, the same way the tier's value is: the text
@@ -427,63 +446,31 @@ trap 'rm -f "$body"' EXIT
 	fi
 } >"$body"
 
-# 6. The target repo's own body gate, before anything leaves the machine.
-#
-# The gate reads the changed files from the checkout it runs in, so it only sees the worker's diff
-# when that checkout is on the worker's branch. Most of the time it is not: the boss's tree sits on
-# trunk and keeps being read, and the worker committed in its own worktree. Diffing trunk against
-# trunk then correctly says `unverifiable: no changed files` and every publish from a worktree was
-# refused. So when HEAD is not the branch being published, the branch is named to the gate
-# (`make pr-check BRANCH=<branch>`, `scripts/pr-gate.sh --branch <branch>`) and the gate diffs the
-# merge base of trunk and that branch without anything being checked out. An empty diff still
-# refuses: the branch form is another way to see the diff, not a way to skip it.
-head_branch=$(git -C "$cwd" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
-gate_branch=""
-if [ "$head_branch" != "$branch" ]; then
-	gate_branch=$branch
+# The body is the thing the gate and gh both read, so it is also the thing a preflight wants to
+# look at first: --body-out writes exactly the body above and stops, before the body gate, before
+# gh, before anything is pushed. `bin/preflight` runs this and gates the file, which is why a body
+# it proved is a body a publish would send byte for byte.
+if [ -n "$body_out" ]; then
+	cp "$body" "$body_out" || die "cannot write the body to $body_out"
+	printf '%s\n' "$body_out"
+	exit 0
 fi
-if [ -f "$cwd/Makefile" ] && grep -qE '^pr-check[[:space:]]*:' "$cwd/Makefile"; then
-	# A gate may diff the branch it is told about instead of the checkout it sits in: `make
-	# pr-check BRANCH=<branch>` is how a repo verifies a worker's branch from a tree that stays
-	# on trunk. Whether the target takes the variable is detected once, with a dry run: a sentinel
-	# branch is offered and the recipe make would run is read back — if the sentinel is in it, the
-	# target expands BRANCH and gets the real branch. A target whose recipe never mentions it is
-	# called exactly as before, so a gate that would choke on the variable keeps working.
-	gate_args=(BODY="$body")
-	if [ -n "$gate_branch" ] &&
-		probe=$(make -C "$cwd" --no-print-directory -n pr-check BODY=/dev/null BRANCH=__publish_probe__ 2>/dev/null) &&
-		printf '%s\n' "$probe" | grep -q '__publish_probe__'; then
-		gate_args+=("BRANCH=$branch")
-		note "body gate: make -C $cwd pr-check BRANCH=$branch (its recipe expands BRANCH)"
-		note "the checkout is on ${head_branch:-a detached HEAD}, not $branch"
-	else
-		note "body gate: make -C $cwd pr-check"
-	fi
-	if ! make -C "$cwd" --no-print-directory pr-check "${gate_args[@]}"; then
-		die "the body gate (make pr-check) failed, so nothing was pushed"
-	fi
-elif [ -x "$cwd/scripts/pr-gate.sh" ]; then
-	# The fallback script takes the branch as a flag, and only some versions have one. A repo whose
-	# pr-gate.sh has no --branch must not be handed a flag it treats as a path or refuses outright,
-	# so the flag is offered only when the script's own argument parsing mentions it — the same
-	# shape as the `make -n` probe above, one probe instead of a guess.
-	gate_flag=""
-	if [ -n "$gate_branch" ] && grep -qE -- '--branch[)=|[:space:]]' "$cwd/scripts/pr-gate.sh"; then
-		gate_flag=1
-	fi
-	if [ -n "$gate_flag" ]; then
-		note "body gate: $cwd/scripts/pr-gate.sh --body --branch $branch"
-		if ! (cd "$cwd" && ./scripts/pr-gate.sh --body "$body" --branch "$branch"); then
-			die "the body gate (scripts/pr-gate.sh --branch $branch) failed, so nothing was pushed"
-		fi
-	else
-		note "body gate: $cwd/scripts/pr-gate.sh --body"
-		if ! (cd "$cwd" && ./scripts/pr-gate.sh --body "$body"); then
-			die "the body gate (scripts/pr-gate.sh) failed, so nothing was pushed"
-		fi
-	fi
-else
-	note "body gate skipped: $cwd has no 'make pr-check' target and no scripts/pr-gate.sh"
+
+# 5. gh has to be there before anything is pushed: a push that cannot be followed by a PR leaves
+# the branch uploaded and the person with a loose end. The duplicate guard needs gh too, so it is
+# skipped by name rather than quietly: a publish that never had a guard should say so.
+if ! command -v gh >/dev/null 2>&1; then
+	note "gh unavailable, duplicate guard skipped — gh is not on PATH"
+	die "gh is not on PATH, so the branch would be pushed with no PR to follow it"
+fi
+
+# 6. The target repo's own body gate, before anything leaves the machine. The gate and how its
+# branch argument is probed live in run_body_gate (bin/preflight), sourced at the top: the preflight
+# runs the same function on the same body, so a body it passed is not a body this refuses. A gate
+# that diffs the checkout it sits in cannot see a worker's branch, so the branch is named to it when
+# the checkout is not on it, and only when the target is shown to expand it.
+if ! run_body_gate "$cwd" "$branch" "$body"; then
+	die "the body gate (${BODY_GATE:-make pr-check}) failed, so nothing was pushed"
 fi
 
 # How many of the branch's commits are not already in trunk. The answer is `commit_in_trunk`'s, per

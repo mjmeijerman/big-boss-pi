@@ -1,0 +1,631 @@
+#!/usr/bin/env bash
+# preflight — the checks CI would run, run here first, on the branch about to be published.
+#
+#   bin/preflight [--cwd DIR] [--slug SLUG] [--only NAME]... [--list] [BRANCH]
+#
+# Why it exists: every red CI round in this workspace was a round trip — a rebase, a second worker,
+# ten minutes of waiting — over something a machine here answers in seconds. `new RegExp(variable)`
+# (semgrep 1.186 is installed), a test whose stub PATH has no `node` (an `env -i` run shows it), a
+# stale `Review tier:` in the PR body (the body gate refuses it), a host-dependent assertion. CI
+# found them; this finds them first. `delegate finish` runs it before it publishes.
+#
+# It decides which checks apply from the diff against the merge base with trunk, so a docs-only
+# change is seconds and an engine change is thorough. A check that does not apply is printed as
+# `skip` with the reason — never as a pass:
+#
+#   syntax    bash -n on the changed shell files, node --check on the changed .mjs/.js
+#   suites    the repo's own tests: `node --test scripts/tests/*.test.mjs` plus `make scripts-test`
+#             in a pi checkout, `bash scripts/ci-local.sh` here; a checkout with neither is named
+#   semgrep   the changed files only, the workflow's own --config when a repo pins one, else
+#             p/default plus scripts/semgrep-rules.yml; semgrep missing is a FAIL, never a pass
+#   scrub     the changed test files under `env -i PATH=<empty stub>:/usr/bin:/bin HOME=<tmp>` —
+#             the runner does not have your PATH, and this is the check that catches it (pi#66)
+#   body      the AGENTS.md docs budget and the target repo's own body gate, run on the body
+#             `bin/publish` would actually send, so a wrong tier cannot reach GitHub
+#
+# Output is plain and meant to be pasted: one line per check, verdict, name, elapsed, detail; the
+# detail under a failing check; then a summary. No colour, no progress bars.
+#
+#   bin/preflight --list                      the five check names, nothing run
+#   bin/preflight --only semgrep feat/x       one check, on that branch
+#   bin/preflight --slug w1                   the branch and body of worker w1
+#
+# Exit 0 only when every check that applied passed. A failing check prints the exact command that
+# reproduces it, because that command is the next thing a person types.
+set -uo pipefail
+
+self_root=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)
+BIN=$self_root/bin
+ROOT=${PI_BOSS_ROOT:-${PI_MASTER_ROOT:-$self_root}}
+
+# bin/delegate gives fresh_trunk_branch (which ref is trunk, in this tree) and the report functions
+# the body check reads its report through. Sourcing only defines functions and variables, so
+# nothing here starts a worker. Its `set -e` is put back: this script reports every check, and one
+# check failing must not abort the run before the next one says what it found.
+# shellcheck source=bin/delegate
+. "$BIN/delegate"
+set +e
+# delegate points BIN at $ROOT/bin — the tree a caller named with PI_BOSS_ROOT, which is where state
+# lives and need not carry the programs. preflight's own programs come from the tree it sits in.
+PBIN=$self_root/bin
+
+prog=preflight
+DECISIONS=$ROOT/state/decisions.jsonl
+say() { printf '%s\n' "$*"; }
+die() { printf '%s: error: %s\n' "$prog" "$*" >&2; exit 2; }
+
+PREFLIGHT_TMP=""
+cleanup() { [ -z "$PREFLIGHT_TMP" ] || rm -rf "$PREFLIGHT_TMP"; }
+trap cleanup EXIT
+
+want_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# --- the checks, in the order they run ---------------------------------------------------------
+
+preflight_ids=(syntax suites semgrep scrub body)
+preflight_names=(
+	"syntax (bash -n, node --check, shellcheck)"
+	"suites (the repo's own tests)"
+	"semgrep (the changed files)"
+	"scrub (env -i, the runner does not have your PATH)"
+	"body (docs budget and the body gate)"
+)
+
+name_of() {
+	local i
+	for i in "${!preflight_ids[@]}"; do
+		[ "${preflight_ids[$i]}" = "$1" ] && { printf '%s' "${preflight_names[$i]}"; return 0; }
+	done
+	return 1
+}
+
+# --- what changed, and which checks that makes apply -------------------------------------------
+
+# pf_trunk <cwd> — the trunk this branch is compared against, read the way publish reads it.
+pf_trunk() {
+	local t
+	t=$(fresh_trunk_branch "$1" 2>/dev/null || true)
+	[ -n "$t" ] || t=main
+	printf '%s' "$t"
+}
+
+# pf_collect <cwd> <branch> — fill PF_CHANGED (every changed path), PF_CODE (the ones a linter or a
+# compiler reads) and PF_TESTS (the ones that are test files), and set PF_BASE/PF_TRUNK/PF_NOTE.
+# A branch with no merge base against trunk is compared against the trunk itself, so a fresh
+# branch still diffs its own work instead of refusing.
+pf_collect() {
+	local cwd=$1 branch=$2 f mb base
+	PF_TRUNK=$(pf_trunk "$cwd")
+	base=""
+	for candidate in "refs/remotes/origin/$PF_TRUNK" "$PF_TRUNK"; do
+		if git -C "$cwd" rev-parse --verify --quiet "$candidate" >/dev/null 2>&1; then
+			base=$candidate
+			break
+		fi
+	done
+	[ -n "$base" ] || base=$PF_TRUNK
+	mb=$(git -C "$cwd" merge-base "$base" "$branch" 2>/dev/null) || mb=""
+	PF_BASE=$mb
+	if [ -z "$mb" ]; then
+		mb=$base
+		PF_NOTE="no merge base with $base: diffing $base..$branch"
+	fi
+	PF_CHANGED=()
+	PF_CODE=()
+	PF_TESTS=()
+	while IFS= read -r f; do
+		[ -n "$f" ] || continue
+		PF_CHANGED+=("$f")
+		case $f in
+		*.sh | bin/*)
+			case $f in *.mjs | *.js | *.md) ;; *) PF_CODE+=("$f") ;; esac
+			;;
+		*.mjs | *.js | *.ts | *.py) PF_CODE+=("$f") ;;
+		esac
+		case $f in
+		scripts/tests/* | tests/* | *test-*.sh | *.test.mjs | *.test.js | *_test.py) PF_TESTS+=("$f") ;;
+		esac
+	done < <(git -C "$cwd" diff --name-only --diff-filter=ACMR "${mb}..${branch}" 2>/dev/null)
+	return 0
+}
+
+# pf_applies <id> — true when the check has something to look at.
+pf_applies() {
+	case $1 in
+	syntax | semgrep) [ "${#PF_CODE[@]}" -gt 0 ] ;;
+	scrub) [ "${#PF_TESTS[@]}" -gt 0 ] ;;
+	suites) [ "$PF_SHAPE" != none ] && [ "${#PF_CODE[@]}" -gt 0 ] ;;
+	body) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# pf_skip_reason <id> — why a check does not apply here, in one line that names the fact.
+pf_skip_reason() {
+	case $1 in
+	syntax | semgrep) printf 'no changed code file (nothing here compiles or lints)' ;;
+	scrub) printf 'no changed test file (nothing to run under the scrub)' ;;
+	suites)
+		if [ "$PF_SHAPE" = none ]; then
+			printf 'no suite found: no Makefile scripts-test target, no scripts/tests/*.test.mjs, no scripts/ci-local.sh in %s' "$PF_CWD"
+		else
+			printf 'docs-only diff: no code file changed, so the %s suite has nothing new to prove' "$PF_SHAPE_NAME"
+		fi
+		;;
+	*) printf 'does not apply' ;;
+	esac
+}
+
+# pf_repo_shape <cwd> — "pi" (scripts/tests/*.test.mjs or a Makefile scripts-test target), "boss"
+# (scripts/ci-local.sh), else "none". Naming the shape is what the skip line has to carry: "skipped"
+# with no reason is how a check that never ran reads as one that passed.
+pf_repo_shape() {
+	local cwd=$1
+	if [ -f "$cwd/Makefile" ] && grep -qE '^scripts-test[[:space:]]*:' "$cwd/Makefile"; then
+		printf 'pi'
+		return 0
+	fi
+	if compgen -G "$cwd/scripts/tests/*.test.mjs" >/dev/null 2>&1; then
+		printf 'pi'
+		return 0
+	fi
+	if [ -f "$cwd/scripts/ci-local.sh" ]; then
+		printf 'boss'
+		return 0
+	fi
+	printf 'none'
+}
+
+# --- check: syntax -----------------------------------------------------------------------------
+
+pf_check_syntax() {
+	local f rc=0 nb=0 nm=0 out
+	for f in "${PF_CODE[@]}"; do
+		[ -f "$PF_CWD/$f" ] || continue
+		case $f in
+		*.mjs | *.js)
+			nm=$((nm + 1))
+			if ! out=$(node --check "$PF_CWD/$f" 2>&1); then
+				rc=1
+				printf '%s:\n%s\n' "$f" "$(printf '%s\n' "$out" | head -n 3 | sed 's/^/  /')"
+			fi
+			;;
+		*)
+			nb=$((nb + 1))
+			if ! out=$(bash -n "$PF_CWD/$f" 2>&1); then
+				rc=1
+				printf '%s:\n%s\n' "$f" "$(printf '%s\n' "$out" | head -n 3 | sed 's/^/  /')"
+			fi
+			;;
+		esac
+	done
+	printf 'bash -n: %d file(s), node --check: %d file(s)\n' "$nb" "$nm"
+	# shellcheck on the changed shell files, when it is here. Absence is said out loud rather than
+	# read as clean — the same line scripts/ci-local.sh prints — but it is not a failure: the gate
+	# refuses work, and a missing linter is not the work's fault.
+	local shells=()
+	for f in "${PF_CODE[@]}"; do
+		case $f in *.sh | bin/*) [ -f "$PF_CWD/$f" ] && shells+=("$f") ;; esac
+	done
+	if [ "${#shells[@]}" -eq 0 ]; then
+		printf 'shellcheck: no changed shell file\n'
+	elif ! want_cmd shellcheck; then
+		printf 'shellcheck: not installed here, so %d changed shell file(s) went unlinted — install it (apt install shellcheck) to have the linter CI runs\n' "${#shells[@]}"
+	else
+		if ! out=$(cd "$PF_CWD" && shellcheck --severity=error "${shells[@]}" 2>&1); then
+			rc=1
+			printf 'shellcheck --severity=error on %s:\n%s\n' "${shells[*]}" "$(printf '%s\n' "$out" | head -n 12 | sed 's/^/  /')"
+		else
+			printf 'shellcheck --severity=error: %d changed shell file(s) clean\n' "${#shells[@]}"
+		fi
+	fi
+	return $rc
+}
+
+# --- check: the repo's own suites --------------------------------------------------------------
+
+pf_check_suites() {
+	local rc=0 out
+	case $PF_SHAPE in
+	pi)
+		if compgen -G "$PF_CWD/scripts/tests/*.test.mjs" >/dev/null 2>&1; then
+			if ! out=$(cd "$PF_CWD" && node --test scripts/tests/*.test.mjs 2>&1); then
+				rc=1
+				printf 'node --test scripts/tests/*.test.mjs failed:\n%s\n' "$(printf '%s\n' "$out" | tail -n 20 | sed 's/^/  /')"
+			fi
+		fi
+		if [ -f "$PF_CWD/Makefile" ] && grep -qE '^scripts-test[[:space:]]*:' "$PF_CWD/Makefile"; then
+			if ! out=$(cd "$PF_CWD" && make --no-print-directory scripts-test 2>&1); then
+				rc=1
+				printf 'make scripts-test failed:\n%s\n' "$(printf '%s\n' "$out" | tail -n 20 | sed 's/^/  /')"
+			fi
+		fi
+		[ "$rc" = 0 ] && printf 'pi checkout: node --test scripts/tests/*.test.mjs and make scripts-test both passed\n'
+		;;
+	boss)
+		if ! out=$(cd "$PF_CWD" && bash scripts/ci-local.sh 2>&1); then
+			rc=1
+			printf 'bash scripts/ci-local.sh failed:\n%s\n' "$(printf '%s\n' "$out" | tail -n 25 | sed 's/^/  /')"
+		else
+			printf 'boss workspace: %s\n' "$(printf '%s\n' "$out" | grep -E '^ci-local: ' | tail -n 1)"
+		fi
+		;;
+	*)
+		printf 'no suite in this checkout\n'
+		return 1
+		;;
+	esac
+	return $rc
+}
+
+# --- check: semgrep, on the changed files only --------------------------------------------------
+
+# pf_semgrep_configs <cwd> — the configs to hand semgrep, one per line. The repo's workflow wins
+# when it pins one (that is what CI would run); otherwise p/default. The harness's own pinned rules
+# ride along either way, so the rule that catches a `new RegExp(variable)` is present on a repo
+# whose workflow never mentions semgrep. PREFLIGHT_SEMGREP_CONFIG replaces the registry half, which
+# is the one that needs the network.
+pf_semgrep_configs() {
+	local cwd=$1 f c found=""
+	for f in "$cwd"/.github/workflows/*.yml "$cwd"/.github/workflows/*.yaml; do
+		[ -f "$f" ] || continue
+		c=$(grep -oE -- '--config[= ][^ "]+' "$f" 2>/dev/null | head -n 1 | sed -E 's/^--config[= ]//')
+		[ -n "$c" ] && {
+			found=$c
+			break
+		}
+	done
+	[ -n "$found" ] || found=${PREFLIGHT_SEMGREP_CONFIG:-p/default}
+	printf '%s\n' "$found"
+	# The pinned local rules ride along unless the repo already points at that same file, so the
+	# invocation reads once rather than twice.
+	if [ -f "$self_root/scripts/semgrep-rules.yml" ] && [ "$found" != "$self_root/scripts/semgrep-rules.yml" ]; then
+		printf '%s\n' "$self_root/scripts/semgrep-rules.yml"
+	fi
+	return 0
+}
+
+pf_check_semgrep() {
+	local configs=() f cfg rc=0 out files=()
+	if ! want_cmd semgrep; then
+		printf 'semgrep is not installed here, so this check cannot pass — install it (pipx install semgrep) and run it again\n'
+		return 1
+	fi
+	mapfile -t configs < <(pf_semgrep_configs "$PF_CWD")
+	for f in "${PF_CODE[@]}"; do
+		[ -f "$PF_CWD/$f" ] || continue
+		files+=("$f")
+	done
+	[ "${#files[@]}" -gt 0 ] || {
+		printf 'no changed code file\n'
+		return 0
+	}
+	local args=( --error --quiet --metrics=off --disable-version-check --no-git-ignore )
+	for cfg in "${configs[@]}"; do args+=( --config "$cfg" ); done
+	out=$(cd "$PF_CWD" && semgrep "${args[@]}" "${files[@]}" 2>&1)
+	rc=$?
+	if [ "$rc" -ne 0 ]; then
+		# Name the files and the rules rather than dumping the banner: a finding without its file is
+		# a reading task, and the reproduce line below already carries the whole invocation.
+		printf 'semgrep (%s) over %d changed file(s):\n' "$(printf '%s' "${configs[*]}" | sed 's/ /, /g')" "${#files[@]}"
+		printf '%s\n' "$out" | grep -E '^ {4}[^ ]+\.(mjs|cjs|js|jsx|ts|tsx|sh|bash|py|go|rs|java|rb|php)$' \
+			| tr -d ' ' | sort -u | sed 's/^/  file: /'
+		printf '%s\n' "$out" | grep -oE '❱+ [^ ]+$' | sed -E 's/^❱+ //' | sort -u | sed 's/^/  rule: /'
+		return 1
+	fi
+	printf 'semgrep: %d changed file(s) clean, configs: %s\n' "${#files[@]}" "$(printf '%s' "${configs[*]}" | sed 's/ /, /g')"
+	return 0
+}
+
+# --- check: the scrubbed environment -----------------------------------------------------------
+
+# The check that catches pi#66: a test that reaches a tool through the developer's PATH and finds
+# it, so it passes here and fails on a runner that has only /usr/bin:/bin. The emptied environment
+# is the whole point — an empty stub directory first (so a test's own fake commands have somewhere
+# to go and nothing of the user's leaks in), then the two directories a runner does have, and a
+# throwaway HOME. Any test that needs one of the user's own tools fails here, which is what CI
+# would have said ten minutes later.
+pf_check_scrub() {
+	local tmp stub f rc=0 n=0 out
+	tmp=$PREFLIGHT_TMP/scrub
+	mkdir -p "$tmp/stub" "$tmp/home"
+	stub=$tmp/stub
+	for f in "${PF_TESTS[@]}"; do
+		[ -f "$PF_CWD/$f" ] || continue
+		n=$((n + 1))
+		case $f in
+		*.mjs | *.js) out=$(cd "$PF_CWD" && env -i PATH="$stub:/usr/bin:/bin" HOME="$tmp/home" TMPDIR="$tmp" node --test "$PF_CWD/$f" 2>&1) ;;
+		*) out=$(cd "$PF_CWD" && env -i PATH="$stub:/usr/bin:/bin" HOME="$tmp/home" TMPDIR="$tmp" bash "$PF_CWD/$f" 2>&1) ;;
+		esac
+		if [ $? -ne 0 ]; then
+			rc=1
+			printf '%s failed with only %s:/usr/bin:/bin on PATH:\n%s\n' "$f" "$stub" \
+				"$(printf '%s\n' "$out" | tail -n 20 | sed 's/^/  /')"
+		fi
+	done
+	printf 'the runner does not have your PATH: %d changed test file(s) under env -i\n' "$n"
+	return $rc
+}
+
+# --- check: the body, before it can reach GitHub ------------------------------------------------
+
+# run_body_gate <cwd> <branch> <body-file> — the target repo's own body gate, and the one
+# definition of it: bin/publish sources this file and calls it, so the gate the preflight runs is
+# the gate a publish runs. `make pr-check BODY=<file>` when the repo has that target,
+# `scripts/pr-gate.sh --body <file>` when it has that script, else a named skip. The branch is
+# named to the gate exactly when the checkout is not on it, and only when the target is shown to
+# expand it: a gate that diffs trunk against trunk sees no changed files and refuses every publish.
+# Sets BODY_GATE to the gate that ran (empty when none did) and returns nonzero when it refused.
+# publish has its own note (it prefixes "publish:"); standalone there is nobody to ask.
+pf_gate_note() {
+	if declare -F note >/dev/null 2>&1; then note "$@"; else printf '%s: %s\n' "${prog:-preflight}" "$*" >&2; fi
+}
+
+run_body_gate() {
+	local cwd=$1 branch=$2 body=$3 head_branch gate_branch probe gate_flag
+	BODY_GATE=""
+	head_branch=$(git -C "$cwd" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+	gate_branch=""
+	[ "$head_branch" = "$branch" ] || gate_branch=$branch
+	if [ -f "$cwd/Makefile" ] && grep -qE '^pr-check[[:space:]]*:' "$cwd/Makefile"; then
+		BODY_GATE="make pr-check"
+		local gate_args=( BODY="$body" )
+		if [ -n "$gate_branch" ] &&
+			probe=$(make -C "$cwd" --no-print-directory -n pr-check BODY=/dev/null BRANCH=__publish_probe__ 2>/dev/null) &&
+			printf '%s\n' "$probe" | grep -q '__publish_probe__'; then
+			gate_args+=( "BRANCH=$branch" )
+			pf_gate_note "body gate: make -C $cwd pr-check BRANCH=$branch (its recipe expands BRANCH)"
+			pf_gate_note "the checkout is on ${head_branch:-a detached HEAD}, not $branch"
+		else
+			pf_gate_note "body gate: make -C $cwd pr-check"
+		fi
+		make -C "$cwd" --no-print-directory pr-check "${gate_args[@]}" || return 1
+		return 0
+	fi
+	if [ -x "$cwd/scripts/pr-gate.sh" ]; then
+		BODY_GATE="scripts/pr-gate.sh"
+		gate_flag=""
+		if [ -n "$gate_branch" ] && grep -qE -- '--branch[)=|[:space:]]' "$cwd/scripts/pr-gate.sh"; then
+			gate_flag=1
+		fi
+		if [ -n "$gate_flag" ]; then
+			pf_gate_note "body gate: $cwd/scripts/pr-gate.sh --body --branch $branch"
+			( cd "$cwd" && ./scripts/pr-gate.sh --body "$body" --branch "$branch" ) || return 1
+		else
+			pf_gate_note "body gate: $cwd/scripts/pr-gate.sh --body"
+			( cd "$cwd" && ./scripts/pr-gate.sh --body "$body" ) || return 1
+		fi
+		return 0
+	fi
+	pf_gate_note "body gate skipped: $cwd has no 'make pr-check' target and no scripts/pr-gate.sh"
+	return 0
+}
+
+pf_check_body() {
+	local rc=0 bytes limit body out
+	if [ -f "$PF_CWD/AGENTS.md" ]; then
+		limit=${AGENTS_MD_LIMIT:-8192}
+		bytes=$(wc -c <"$PF_CWD/AGENTS.md" | tr -d '[:space:]')
+		printf 'docs budget: AGENTS.md %s B / %s B\n' "$bytes" "$limit"
+		if [ "$bytes" -gt "$limit" ]; then
+			printf 'AGENTS.md is %s B over its %s B budget\n' "$((bytes - limit))" "$limit"
+			rc=1
+		fi
+	else
+		printf 'docs budget: no AGENTS.md in this checkout\n'
+	fi
+	if [ -z "$PF_SLUG" ]; then
+		printf 'body gate: no --slug, so there is no report to build the body from and nothing to gate\n'
+		return $rc
+	fi
+	body=$PREFLIGHT_TMP/body.md
+	if ! out=$("$PBIN/publish" --body-out "$body" "$PF_SLUG" 2>&1); then
+		printf 'the body bin/publish would send cannot be built:\n%s\n' "$(printf '%s\n' "$out" | sed 's/^/  /')"
+		return 1
+	fi
+	if ! run_body_gate "$PF_CWD" "$PF_BRANCH" "$body"; then
+		printf 'the body gate %srefused the body bin/publish would send:\n%s\n' "${BODY_GATE:+($BODY_GATE) }" \
+			"$(printf '%s\n' "$out" | sed 's/^/  /')"
+		return 1
+	fi
+	printf 'body gate: %s passed on the body bin/publish would send (%s)\n' "${BODY_GATE:-none in this repo}" "$body"
+	return $rc
+}
+
+# --- dispatch ----------------------------------------------------------------------------------
+
+usage() {
+	printf 'usage: %s [--cwd DIR] [--slug SLUG] [--only NAME]... [--list] [BRANCH]\n' "$prog" >&2
+	printf 'checks: %s\n' "${preflight_ids[*]}" >&2
+	exit 2
+}
+
+resolve() {
+	local s=$1 i
+	for i in "${!preflight_ids[@]}"; do
+		[ "$s" = "${preflight_ids[$i]}" ] && { printf '%s' "${preflight_ids[$i]}"; return 0; }
+	done
+	return 1
+}
+
+# pf_branch_for_slug <cwd> <slug> — the branch a worker's commits are on. A recorded branch that is
+# not trunk is the answer; a trunk branch is what the boss checkout sits on, so the branch is found
+# by its `Agent-Slug:` trailer, one match, exactly as bin/publish finds it.
+pf_branch_for_slug() {
+	local cwd=$1 slug=$2 recorded trunk found candidate
+	recorded=""
+	if [ -f "$DELEGATIONS" ]; then
+		recorded=$(node -e '
+			const fs=require("fs");let j={};
+			try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"))}catch{}
+			process.stdout.write(String((j[process.argv[2]]||{}).branch||""))' "$DELEGATIONS" "$slug")
+	fi
+	trunk=$(pf_trunk "$cwd")
+	case $recorded in
+	"" | "$trunk" | trunk | main | master) ;;
+	*) printf '%s' "$recorded"; return 0 ;;
+	esac
+	found=""
+	for candidate in $(git -C "$cwd" for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null); do
+		if git -C "$cwd" log --format=%B "refs/remotes/origin/$trunk..$candidate" 2>/dev/null |
+			grep -qE "^Agent-Slug:[[:space:]]*${slug}[[:space:]]*$"; then
+			found="$found$candidate"$'\n'
+		fi
+	done
+	found=$(printf '%s' "$found" | grep -E . || true)
+	[ "$(printf '%s' "$found" | grep -cE . || true)" = 1 ] || return 1
+	printf '%s' "$found"
+}
+
+preflight_main() {
+	local cwd="" slug="" branch="" selected=() id out rc fails=0 ran=0 start end ms part
+	local parts=()
+	local elapsed_ms=0 total_start total_end mode
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--cwd)
+			[ "$#" -ge 2 ] && [ -n "$2" ] || die "--cwd needs a directory"
+			cwd=$2
+			shift 2
+			;;
+		--cwd=*)
+			cwd=${1#--cwd=}
+			shift
+			;;
+		--slug)
+			[ "$#" -ge 2 ] && [ -n "$2" ] || die "--slug needs a worker slug"
+			slug=$2
+			shift 2
+			;;
+		--slug=*)
+			slug=${1#--slug=}
+			shift
+			;;
+		--only)
+			[ "$#" -ge 2 ] || usage
+			IFS=, read -r -a parts <<<"$2"
+			for part in "${parts[@]}"; do
+				[ -n "$part" ] || continue
+				id=$(resolve "$part") || die "no such check: $part (bin/preflight --list names them)"
+				selected+=("$id")
+			done
+			shift 2
+			;;
+		--only=*)
+			IFS=, read -r -a parts <<<"${1#--only=}"
+			for part in "${parts[@]}"; do
+				[ -n "$part" ] || continue
+				id=$(resolve "$part") || die "no such check: $part (bin/preflight --list names them)"
+				selected+=("$id")
+			done
+			shift
+			;;
+		--list)
+			for id in "${preflight_ids[@]}"; do say "$id	$(name_of "$id")"; done
+			return 0
+			;;
+		-h | --help | help) usage ;;
+		-*) die "unknown option $1" ;;
+		*)
+			[ -z "$branch" ] || die "one branch at a time: got '$branch' and '$1'"
+			branch=$1
+			shift
+			;;
+		esac
+	done
+
+	# --slug with no --cwd: the worker's own tree is where its branch lives. A gate that runs where
+	# the caller happens to stand checks a checkout the branch is not in, and says "no such branch".
+	if [ -z "$cwd" ] && [ -n "$slug" ] && [ -f "$DELEGATIONS" ]; then
+		cwd=$(node -e '
+			const fs = require("fs");
+			let j = {};
+			try { j = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch { process.exit(0); }
+			const w = j[process.argv[2]];
+			if (w && w.cwd) process.stdout.write(String(w.cwd));' "$DELEGATIONS" "$slug" 2>/dev/null || true)
+	fi
+	[ -n "$cwd" ] || cwd=$(git -C . rev-parse --show-toplevel 2>/dev/null || true)
+	[ -n "$cwd" ] || die "no --cwd and not inside a git repository"
+	cwd=$(cd -- "$cwd" 2>/dev/null && pwd) || die "--cwd is not a directory"
+	git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1 || die "$cwd is not a git repository"
+	[ -n "$slug" ] || slug=""
+	if [ -z "$branch" ] && [ -n "$slug" ]; then
+		branch=$(pf_branch_for_slug "$cwd" "$slug") ||
+			die "no branch in $cwd carries 'Agent-Slug: $slug' (or several do), so there is nothing to check"
+	fi
+	if [ -z "$branch" ]; then
+		branch=$(git -C "$cwd" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+		[ -n "$branch" ] || die "no branch given and $cwd is on a detached HEAD"
+	fi
+	git -C "$cwd" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null ||
+		git -C "$cwd" rev-parse --verify --quiet "$branch" >/dev/null ||
+		die "no such branch in $cwd: $branch"
+
+	PREFLIGHT_TMP=$(mktemp -d "${TMPDIR:-/tmp}/preflight.XXXXXX") || die "cannot make a temporary directory"
+	PF_CWD=$cwd
+	PF_BRANCH=$branch
+	PF_SLUG=$slug
+	PF_SHAPE=$(pf_repo_shape "$cwd")
+	case $PF_SHAPE in
+	pi) PF_SHAPE_NAME="pi checkout" ;;
+	boss) PF_SHAPE_NAME="this workspace" ;;
+	*) PF_SHAPE_NAME="a checkout with no suite" ;;
+	esac
+	pf_collect "$cwd" "$branch"
+
+	if [ "${#selected[@]}" -eq 0 ]; then
+		selected=("${preflight_ids[@]}")
+	fi
+
+	say "preflight: $branch in $cwd"
+	if [ -n "$PF_BASE" ]; then
+		say "  against ${PF_BASE:0:7} (merge base with $PF_TRUNK), ${#PF_CHANGED[@]} file(s) changed, shape: $PF_SHAPE_NAME"
+	else
+		say "  ${PF_NOTE:-no merge base}, ${#PF_CHANGED[@]} file(s) changed, shape: $PF_SHAPE_NAME"
+	fi
+	say ""
+
+	total_start=$(date +%s%N)
+	for id in "${selected[@]}"; do
+		ran=$((ran + 1))
+		out=$PREFLIGHT_TMP/$id.out
+		if ! pf_applies "$id"; then
+			printf 'skip  %-44s %4ss  %s\n' "$(name_of "$id")" 0 "$(pf_skip_reason "$id")"
+			ran=$((ran - 1))
+			continue
+		fi
+		start=$(date +%s%N)
+		mode=pf_check_"$id"
+		"$mode" >"$out" 2>&1
+		rc=$?
+		end=$(date +%s%N)
+		ms=$(( (end - start) / 1000000 ))
+		elapsed_ms=$((elapsed_ms + ms))
+		if [ "$rc" = 0 ]; then
+			printf 'pass  %-44s %4ss  %s\n' "$(name_of "$id")" "$((ms / 1000))" "$(head -n 1 "$out")"
+			[ "$(wc -l <"$out")" -le 1 ] || sed 's/^/      /' "$out" | tail -n +2
+		else
+			fails=$((fails + 1))
+			printf 'FAIL  %-44s %4ss  exit %s\n' "$(name_of "$id")" "$((ms / 1000))" "$rc"
+			sed 's/^/      /' "$out"
+			printf '      reproduce: %s --only %s%s%s %s\n' "$PBIN/preflight" "$id" \
+				"${slug:+ --slug $slug}" "${cwd:+ --cwd $cwd}" "$branch"
+		fi
+	done
+	total_end=$(date +%s%N)
+
+	say ""
+	if [ "$fails" = 0 ]; then
+		say "preflight: $ran/$ran passed on $branch in $(( (total_end - total_start) / 1000000000 ))s"
+		return 0
+	fi
+	say "preflight: $((ran - fails))/$ran passed, $fails FAILED on $branch in $(( (total_end - total_start) / 1000000000 ))s"
+	say "nothing should be published from this branch until the checks above pass — or say why the check does not apply: delegate finish <slug> --skip-preflight \"<reason>\""
+	return 1
+}
+
+# Dispatch only when executed: bin/publish sources this file for run_body_gate, and sourcing must
+# define the function without running a check.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+	preflight_main "$@"
+fi

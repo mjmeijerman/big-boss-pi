@@ -16,6 +16,7 @@ copy: read-only during the transition, deleted only when the user says so.
 | Local worker | `bin/local-run` | runs a local task on the ollama model (`bin/local-model.mjs`), headless: prompt in, answer on stdout, no space and no spec, no network; records one line in `state/usage.jsonl` |
 | Delegation | `bin/delegate` → `~/.local/bin/delegate` | one jev call for mode, count, route and thinking effort, one Herdr space per worker jev asked for, the spec, where the report lands, and every decision in `state/decisions.jsonl`; `delegate sweep` closes the workers that finished |
 | Worker modes | `bin/pi-bare`, `bin/pi-sandboxed`, `bin/pi-nonet` | `delegate` picks one from Jev's answer |
+| Preflight | `bin/preflight` | the checks CI would run, on this branch, here: `bash -n`/`node --check` on the changed files, the repo's own suite, semgrep over the changed files, the changed tests under a scrubbed `env -i`, and the body gate on the exact body `bin/publish` would send. `delegate finish` runs it before the publish, and no push happens past a failing check |
 | Never-closable space | `bin/guard` → `~/.local/bin/big-boss-pi-guard` + `~/.config/systemd/user/big-boss-pi-guard.service` | polls `herdr-app ls`; recreates the `big-boss-pi` space if it disappears, selects it once when Herdr starts, resumes a tab whose terminal is no longer pi from its resume entry — found by terminal id **or** by the tab id the entry recorded, newest `updated_at` first, session file required — first through `~/.pi/scripts/herdr-resume.sh` and then, when that declines, with its own `hc send` on the entry's terminal, and reopens it with an absolute argv only when there is no usable entry or the resume did not start pi, at most once a minute per tab and logged in `state/guard.log` with the path it took. Only tabs it is allowed to repair: the parked tabs it saw when it started, and the ones it opened itself — a tab the person opens while it runs is theirs, kept in `state/tab-classes` so a restart does not take it either. It never touches a space named `pi-master` |
 | Delegation-only enforcement | `~/.pi/agent/extensions/big-boss-pi-guard.ts` | blocks the `write` and `edit` tools, and shell writes into the directory (`echo x > …`, `rm/mv/cp/tee/sed -i`), when the session's cwd is under `/home/mark/big-boss-pi` **or** `/home/mark/pi-master`; no-ops everywhere else, including for a worker session (`PI_WORKER=1`) |
 | Rollback helper | `bin/finish-rename.sh` | closes the old `pi-master` space on request and prints how to delete the old tree. Runs nothing by default |
@@ -234,7 +235,17 @@ delegate finish <slug> --skip "<why>"   # same, with the wipe recorded as not ap
 delegate finish <slug> --cwd <repo>     # a worker whose delegations.json entry is already gone
 ```
 
-They stay three gates. The publish is the same `bin/publish` (found on PATH, else next to
+Before any of those, step 1 is the preflight: `bin/preflight` on the worker's branch, the
+syntax, suite, semgrep, scrub and body checks CI would run, each printed with its elapsed time
+and, when one fails, the exact command that reproduces it. A failing check stops the run with
+nothing pushed, nothing wiped and the space still open; `--skip-preflight "<why>"` records a
+gate that cannot run on this machine, the way `--skip` records a wipe that does not apply.
+
+```
+delegate finish <slug> --skip-preflight "<why the gate cannot run here>"
+```
+
+They stay four gates. The publish is the same `bin/publish` (found on PATH, else next to
 `bin/delegate`) with its Evidence and `Review tier:` checks; the wipe is the same `delegate wipe`
 and now also refuses a report with no `## Thrown away` block, because a recorded step with no
 answers behind it stands for nothing; the close is the same `delegate close` with its provenance
