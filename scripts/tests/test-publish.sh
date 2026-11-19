@@ -734,15 +734,19 @@ export FAKE_PR_JSON='[{"number":5,"state":"OPEN","url":"https://github.com/examp
 run worker
 if [ "$rc" -eq 0 ]; then pass "an existing PR exits 0"; else fail "an existing PR exits 0 (exit $rc: $err)"; fi
 check "  ...its URL is printed" bash -c "printf '%s' '$out' | grep -qF 'https://github.com/example/repo/pull/5'"
-check "  ...nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
+check "  ...it says the PR was updated, not published" bash -c "printf '%s' '$out' | grep -qF 'updated #5'"
+check "  ...the description is refreshed from the report" calls '^gh pr edit 5 .*--body-file'
+check "  ...nothing was pushed, since origin already holds the head" bash -c '! grep -q "git push" "$FAKE_LOG"'
 check "  ...no second PR was created" bash -c '! grep -q "pr create" "$FAKE_LOG"'
 
 # --- one PR per branch, before anything is pushed ----------------------------------------------
 #
 # A proof run on a branch that was already merged opened a second pull request, which a person had
-# to close. The branch is now asked about once, across every state, before the push: an open PR or an
-# already-merged one stops the publish, a closed one is named so nobody reads the new PR as the first,
-# and a merged branch that carries further commits still publishes them.
+# to close. The branch is now asked about once, across every state, before anything is pushed: an
+# open PR is the destination and gets the push plus a body refresh from this worker's report (that
+# stranding is scripts/test-open-pr-update.sh), an already-merged one with nothing ahead stops the
+# publish, a closed one is named so nobody reads the new PR as the first, and a merged branch that
+# carries further commits still publishes them.
 
 pr_case() { # <name> <the JSON gh answers with>
 	new_case "$1"
@@ -755,7 +759,9 @@ run worker
 if [ "$rc" -eq 0 ]; then pass "a branch with an open PR exits 0"; else fail "a branch with an open PR exits 0 (exit $rc: $err)"; fi
 check "  ...the open PR is named by number and branch" said '#12 is already open for feat/worker'
 check "  ...its URL is printed" printed 'https://github.com/example/repo/pull/12'
-check "  ...nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
+check "  ...and the run says it updated it" printed 'updated #12'
+check "  ...the body is refreshed from this worker's report" calls '^gh pr edit 12 .*--body-file'
+check "  ...nothing was pushed, since origin already holds the head" bash -c '! grep -q "git push" "$FAKE_LOG"'
 check "  ...no second PR was created" bash -c '! grep -q "pr create" "$FAKE_LOG"'
 check "  ...the branch was asked about across every state" calls '^gh pr list .*--state all'
 
@@ -804,6 +810,7 @@ pr_case pr-open-wins '[{"number":3,"state":"CLOSED","url":"https://github.com/ex
 run worker
 if [ "$rc" -eq 0 ]; then pass "an old closed PR beside an open one exits 0"; else fail "an old closed PR beside an open one exits 0 (exit $rc: $err)"; fi
 check "  ...the open one is the answer" printed '/pull/4'
+check "  ...and it is the one updated" printed 'updated #4'
 check "  ...nothing was pushed" bash -c '! grep -q "git push" "$FAKE_LOG"'
 
 # --- the push has to be proved, not announced ---------------------------------------------------
@@ -842,10 +849,14 @@ new_case open-pr-behind
 export FAKE_PR_JSON='[{"number":12,"state":"OPEN","url":"https://github.com/example/repo/pull/12"}]'
 export FAKE_LOCAL_HEAD=0123456789abcdef0123456789abcdef01234567 FAKE_REMOTE_HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 run worker
-if [ "$rc" -ne 0 ]; then pass "an open PR whose branch is not on the remote is not a publish"; else fail "an open PR whose branch is not on the remote is not a publish (exit $rc: $err)"; fi
+if [ "$rc" -ne 0 ]; then pass "an open PR behind its branch pushes and still refuses an unconfirmed push"; else fail "an open PR behind its branch pushes and still refuses an unconfirmed push (exit $rc: $err)"; fi
 check "  ...the open PR is still named" said '#12 is already open for feat/worker'
-check "  ...the branch head is named too" said 'the branch is at 0123456'
-check "  ...and nothing was pushed there" bash -c '! grep -q "git push" "$FAKE_LOG"'
+check "  ...the branch was pushed towards it" calls '^git .*push .*origin feat/worker'
+check "  ...the commit it pushed is named" said 'not 0123456'
+check "  ...and nothing was published" said 'nothing was published'
+check "  ...with no body edit, since the description would describe a commit that is not there" bash -c '! grep -q "pr edit" "$FAKE_LOG"'
+# An open PR whose origin is behind gets the push and then the body edit: that ordering needs a
+# remote that moves, so it lives in scripts/test-open-pr-update.sh against a real bare origin.
 
 # --- a worker that was already wiped and closed -------------------------------------------------
 #
