@@ -200,9 +200,9 @@ pf_check_syntax() {
 		esac
 	done
 	printf 'bash -n: %d file(s), node --check: %d file(s)\n' "$nb" "$nm"
-	# shellcheck on the changed shell files, when it is here. Absence is said out loud rather than
-	# read as clean — the same line scripts/ci-local.sh prints — but it is not a failure: the gate
-	# refuses work, and a missing linter is not the work's fault.
+	# The linter, on the changed shell files, when it is installed. Absence is said out loud rather
+	# than read as clean — the same line scripts/ci-local.sh prints — but it is not a failure: the
+	# gate refuses work, and a missing linter is not the work's fault.
 	local shells=()
 	for f in "${PF_CODE[@]}"; do
 		case $f in *.sh | bin/*) [ -f "$PF_CWD/$f" ] && shells+=("$f") ;; esac
