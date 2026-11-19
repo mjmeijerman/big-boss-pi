@@ -128,10 +128,56 @@ esac
 STUB
 chmod +x "$work/stub/herdr-app" "$work/stub/cygpath" "$work/stub-hc/hc"
 
+# bin/guard reaches node at every JSON boundary (the argv it hands the app, the space snapshot,
+# the state files), so node belongs on the simulated PATH by name and not by luck: the host PATH
+# is not what CI runs, and that inheritance is exactly the bug that made this suite red on a
+# runner while it was green on a laptop. Resolved to its own directory rather than stubbed — a
+# stub that printed JSON would be a second implementation of what case 1 is checking, and the
+# guard's contract is about what *its* node prints. PI_TEST_NO_NODE=1 leaves node off on purpose:
+# that is how the missing-command failure below is shown instead of asserted against empty strings.
+coreutils=/usr/bin:/bin
+node_dir=""
+if [ -z "${PI_TEST_NO_NODE:-}" ]; then
+	node_real=$(command -v node 2>/dev/null || true)
+	[ -n "$node_real" ] && node_dir=$(dirname -- "$(readlink -f -- "$node_real")")
+else
+	# PI_TEST_NO_NODE=1 asks for the runner's shape on a host where /usr/bin happens to have node
+	# too: one directory of the coreutils the suite needs, linked by hand, with no node in it.
+	coreutils=$work/core
+	mkdir -p "$coreutils"
+	for c in sh uname dirname readlink sed grep awk date tr tail stat sleep timeout cat; do
+		src=$(command -v "$c" 2>/dev/null || true)
+		[ -n "$src" ] && ln -sf "$src" "$coreutils/$c"
+	done
+fi
+node_bin=${node_dir:+$node_dir/node}
+
 # $work/stub is the Windows-shaped PATH: herdr-app and cygpath, no hc. A second dir adds hc.
-path_win=$work/stub:/usr/bin:/bin
+path_win=$work/stub${node_dir:+:$node_dir}:$coreutils
 path_win_hc=$work/stub-hc:$path_win
-path_posix=$work/stub:/usr/bin:/bin
+path_posix=$work/stub${node_dir:+:$node_dir}:$coreutils
+
+# A stub PATH is a set of promises, and a scenario that reaches a command its PATH cannot reach
+# fails far from the cause: a missing `node` meant pi_argv printed nothing, --argv arrived empty,
+# and every later comparison failed on ''. Name the first missing command and stop.
+need() { # need <path> <command>...
+	local p=$1 c
+	shift
+	for c in "$@"; do
+		PATH=$p command -v "$c" >/dev/null 2>&1 && continue
+		printf 'guard-windows: missing stub: %s — not on PATH=%s\n' "$c" "$p" >&2
+		printf 'guard-windows: 1 case(s) failed (setup)\n' >&2
+		exit 1
+	done
+}
+# What bin/guard reaches on any run: node for each JSON boundary, the app and cygpath for the space,
+# bash (the suite starts the guard with the scenario PATH already in force) and the coreutils it uses
+# for paths, stamps, the snapshot tables and the log.
+need_common=(node herdr-app cygpath bash sh uname dirname readlink sed grep awk date tr tail stat \
+	sleep timeout)
+need "$path_win" "${need_common[@]}"
+need "$path_posix" "${need_common[@]}"
+need "$path_win_hc" "${need_common[@]}" hc
 
 new_fake() {
 	case_no=$((case_no + 1))
@@ -198,8 +244,9 @@ space_new_call() {
 logged() { grep -qF "$1" "$fake/root/state/guard.log" 2>/dev/null; }
 
 win_env=(PI_PLATFORM=win32 MSYS=1 OSTYPE=msys)
-# What the guard will resolve `sh` to under the fake cygpath: the sh on this PATH, drive-prefixed.
-want_shell="C:$(command -v sh)"
+# What the guard will resolve `sh` to under the fake cygpath: the sh on the scenario PATH,
+# drive-prefixed. Asked of that PATH, not of ours — they are not the same list any more.
+want_shell="C:$(PATH=$path_win command -v sh)"
 
 # 1. win32, no hc: the space is made, and the two arguments that leave the script are spelled for
 #    the consumer they leave to — a native path for --folder, a POSIX single-quoted word inside the
@@ -213,7 +260,7 @@ folder=$(argn 6 "$f")
 argv=$(argn 10 "$f")
 want_argv="[\"$want_shell\",\"-lc\",\"exec '$r/bin/pi-bare' -a\"]"
 json=no
-node -e 'JSON.parse(process.argv[1])' "$argv" >/dev/null 2>&1 && json=yes
+"$node_bin" -e 'JSON.parse(process.argv[1])' "$argv" >/dev/null 2>&1 && json=yes
 if [ "$(space_new_calls)" = 1 ] && [ "$folder" = "C:$r" ] && [ "$argv" = "$want_argv" ] && [ "$json" = yes ]; then
 	pass "win32: --folder is native (C:$r), --argv is JSON with the POSIX path as one quoted word"
 else
@@ -231,7 +278,7 @@ else
 fi
 # The app that spawns the tab does not inherit this shell's PATH, so the shell itself has to be an
 # absolute native path, and the tab runs the POSIX `pi-bare`, not the `.cmd` shim.
-shell=$(node -e 'process.stdout.write(JSON.parse(process.argv[1])[0])' "$argv")
+shell=$("$node_bin" -e 'process.stdout.write(JSON.parse(process.argv[1])[0])' "$argv")
 case $shell in
 [A-Za-z]:/*sh) pass "win32: the tab's shell is the absolute native sh this guard resolved ($shell)" ;;
 *) fail "the tab's shell is not an absolute native path: '$shell'" ;;
