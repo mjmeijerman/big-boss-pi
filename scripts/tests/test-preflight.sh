@@ -77,7 +77,9 @@ export PATH=$work/stub:$PATH
 export GH_LOG=$work/gh.log GH_BODY=$work/gh-body
 
 fails=0
+skips=0
 pass() { printf '  ok    %s\n' "$*"; }
+skip() { printf '  skip  %s\n' "$*"; skips=$((skips + 1)); }
 fail() { printf '  FAIL  %s\n' "$*"; fails=$((fails + 1)); }
 
 OUT=""
@@ -173,18 +175,33 @@ chmod +x "$REPO/scripts/tool.sh"
 commit_branch "feat(scripts): a small clean script"
 write_report Medium yes
 track_worker
+have_semgrep=0
+command -v semgrep >/dev/null 2>&1 && have_semgrep=1
 run "$delegate" finish w1
-if [ "$RC" != 0 ]; then
+if [ "$have_semgrep" = 0 ]; then
+	# The scrub's PATH has no semgrep, and a changed code file with no semgrep is a FAIL by design
+	# ("semgrep is not installed here, so this check cannot pass"), never a silent pass. That is
+	# what this branch has to do here: refuse, and push nothing.
+	if [ "$RC" = 0 ]; then
+		fail "a changed code file published with no semgrep on this PATH — $OUT"
+	elif ! said "semgrep is not installed"; then
+		fail "no semgrep on this PATH was not named plainly — $OUT"
+	elif gh_saw '^gh pr (create|edit) ' || [ -n "$(origin_head)" ]; then
+		fail "a push or a pull request happened with no semgrep on this PATH"
+	else
+		pass "with no semgrep on this PATH a changed code file refuses the publish, and says so"
+	fi
+elif [ "$RC" != 0 ]; then
 	fail "a green branch did not finish: exit $RC — $OUT"
-elif [ "$(origin_head)" != "$SHA" ]; then
+elif [ "$have_semgrep" = 1 ] && [ "$(origin_head)" != "$SHA" ]; then
 	fail "the branch did not reach origin at its own commit (origin has $(origin_head 2>/dev/null))"
-elif ! gh_saw '^gh pr create '; then
+elif [ "$have_semgrep" = 1 ] && ! gh_saw '^gh pr create '; then
 	fail "no pull request was opened: $(tr '\n' ';' <"$GH_LOG")"
-elif ! grep -q '^Review tier: Medium$' "$GH_BODY"; then
+elif [ "$have_semgrep" = 1 ] && ! grep -q '^Review tier: Medium$' "$GH_BODY"; then
 	fail "the PR body did not carry the tier"
-elif ! said "preflight" || ! said "4/4" && ! said "5/5"; then
+elif [ "$have_semgrep" = 1 ] && { ! said "preflight" || { ! said "4/4" && ! said "5/5"; }; }; then
 	fail "finish did not report the preflight step — $OUT"
-elif [ ! -s "$PI_BOSS_ROOT/state/decisions.jsonl" ]; then
+elif [ "$have_semgrep" = 1 ] && [ ! -s "$PI_BOSS_ROOT/state/decisions.jsonl" ]; then
 	fail "the wipe step recorded nothing"
 else
 	pass "a branch that passes every check publishes, wipes and closes as it did before"
@@ -227,6 +244,9 @@ printf 'export function match(input) {\n\treturn new RegExp(input).test("x");\n}
 commit_branch "feat: a dynamic regexp"
 write_report Medium yes
 track_worker
+if [ "$have_semgrep" = 0 ]; then
+	skip "a semgrep finding needs semgrep on PATH, and this PATH has none (the scrub run)"
+else
 run env PREFLIGHT_SEMGREP_CONFIG="$root/scripts/semgrep-rules.yml" "$delegate" finish w1
 if [ "$RC" = 0 ]; then
 	fail "a semgrep finding published anyway — $OUT"
@@ -238,6 +258,7 @@ elif gh_saw '^gh pr (create|edit) ' || [ -n "$(origin_head)" ]; then
 	fail "a pull request or a push happened past a semgrep finding"
 else
 	pass "a semgrep finding on a changed file refuses the publish"
+fi
 fi
 
 # A checkout where semgrep is missing must not read as clean: the check fails and says so.
@@ -387,7 +408,11 @@ fi
 
 printf '\n'
 if [ "$fails" -ne 0 ]; then
-	printf '\npreflight: %d case(s) failed\n' "$fails" >&2
+	printf '\npreflight: %d case(s) failed, %d skipped\n' "$fails" "$skips" >&2
 	exit 1
+fi
+if [ "$skips" -ne 0 ]; then
+	printf 'preflight: ok, %d case(s) skipped by name\n' "$skips"
+	exit 0
 fi
 printf 'preflight: ok\n'
