@@ -175,9 +175,9 @@ new_case() { # <slug> <branch>
 	err=""
 	rc=0
 }
-run() { # <slug> — the real publish, stdout and stderr kept apart
-	out=$("$publish" "$1" 2>"$work/stderr") && rc=0 || rc=$?
-	err=$(cat "$work/stderr")
+run() { # <slug> — the real publish, stdout and stderr kept apart, and the stderr of the case kept
+	out=$("$publish" "$1" 2>"$work/case$case_no.err") && rc=0 || rc=$?
+	err=$(cat "$work/case$case_no.err")
 }
 remote_sha() { "$real_git" -C "$REPO.git" rev-parse "refs/heads/$1"; }
 local_sha() { "$real_git" -C "$REPO" rev-parse "refs/heads/$1"; }
