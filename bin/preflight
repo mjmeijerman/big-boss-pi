@@ -21,7 +21,10 @@
 #   scrub     the changed test files under `env -i PATH=<empty stub>:/usr/bin:/bin HOME=<tmp>` —
 #             the runner does not have your PATH, and this is the check that catches it (pi#66)
 #   body      the AGENTS.md docs budget and the target repo's own body gate, run on the body
-#             `bin/publish` would actually send, so a wrong tier cannot reach GitHub
+#             `bin/publish` would actually send, so a wrong tier cannot reach GitHub. Shape-aware:
+#             a checkout with no root AGENTS.md has no budget to measure, so that half is skipped by
+#             name (a pi checkout keeps its instructions at agent/AGENTS.md, which is not one) and
+#             the gate half still runs and still blocks; no pr-check target is a named skip too
 #
 # Output is plain and meant to be pasted: one line per check, verdict, name, elapsed, detail; the
 # detail under a failing check; then a summary. No colour, no progress bars.
@@ -349,6 +352,41 @@ pf_check_scrub() {
 
 # --- check: the body, before it can reach GitHub ------------------------------------------------
 
+# pf_has_body_gate <cwd> — true when the checkout has a body gate of its own: a `make pr-check`
+# target or an executable scripts/pr-gate.sh. One definition, read by run_body_gate and by the body
+# check's own skip line, so "there is no gate here" cannot drift from "the gate did not run".
+pf_has_body_gate() {
+	local cwd=$1
+	if [ -f "$cwd/Makefile" ] && grep -qE '^pr-check[[:space:]]*:' "$cwd/Makefile"; then
+		return 0
+	fi
+	[ -x "$cwd/scripts/pr-gate.sh" ]
+}
+
+# pf_docs_budget <cwd> — the docs-budget half of the body check. A budget is a rule of a checkout
+# that has a root AGENTS.md; one that does not (a pi checkout keeps its instructions at
+# agent/AGENTS.md, which is not a docs budget) has nothing here to measure. That is "not applicable
+# here", said in a line, never a pass that pretends to have measured something and never a failure
+# the branch cannot fix — a gate that fails on its own shape is a gate people learn to bypass.
+pf_docs_budget() {
+	local cwd=$1 bytes limit
+	if [ ! -f "$cwd/AGENTS.md" ]; then
+		case $PF_SHAPE in
+		pi) printf 'docs budget: no root AGENTS.md in this checkout — skipped (a pi checkout keeps its instructions at agent/AGENTS.md, which is not a docs budget)\n' ;;
+		*) printf 'docs budget: no root AGENTS.md in this checkout — skipped (this checkout has no docs budget to measure)\n' ;;
+		esac
+		return 0
+	fi
+	limit=${AGENTS_MD_LIMIT:-8192}
+	bytes=$(wc -c <"$cwd/AGENTS.md" | tr -d '[:space:]')
+	printf 'docs budget: AGENTS.md %s B / %s B\n' "$bytes" "$limit"
+	if [ "$bytes" -gt "$limit" ]; then
+		printf 'AGENTS.md is %s B over its %s B budget\n' "$((bytes - limit))" "$limit"
+		return 1
+	fi
+	return 0
+}
+
 # run_body_gate <cwd> <branch> <body-file> — the target repo's own body gate, and the one
 # definition of it: bin/publish sources this file and calls it, so the gate the preflight runs is
 # the gate a publish runs. `make pr-check BODY=<file>` when the repo has that target,
@@ -367,6 +405,10 @@ run_body_gate() {
 	head_branch=$(git -C "$cwd" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
 	gate_branch=""
 	[ "$head_branch" = "$branch" ] || gate_branch=$branch
+	if ! pf_has_body_gate "$cwd"; then
+		pf_gate_note "body gate skipped: $cwd has no 'make pr-check' target and no scripts/pr-gate.sh"
+		return 0
+	fi
 	if [ -f "$cwd/Makefile" ] && grep -qE '^pr-check[[:space:]]*:' "$cwd/Makefile"; then
 		BODY_GATE="make pr-check"
 		local gate_args=( BODY="$body" )
@@ -402,33 +444,27 @@ run_body_gate() {
 }
 
 pf_check_body() {
-	local rc=0 bytes limit body out
-	if [ -f "$PF_CWD/AGENTS.md" ]; then
-		limit=${AGENTS_MD_LIMIT:-8192}
-		bytes=$(wc -c <"$PF_CWD/AGENTS.md" | tr -d '[:space:]')
-		printf 'docs budget: AGENTS.md %s B / %s B\n' "$bytes" "$limit"
-		if [ "$bytes" -gt "$limit" ]; then
-			printf 'AGENTS.md is %s B over its %s B budget\n' "$((bytes - limit))" "$limit"
-			rc=1
-		fi
-	else
-		printf 'docs budget: no AGENTS.md in this checkout\n'
-	fi
+	local rc=0 body out
+	body=$PREFLIGHT_TMP/body.md
+	# The gate half first. It is the half a branch can fail, so the line the check is read by is a
+	# verdict about this body, never a budget this checkout does not have.
 	if [ -z "$PF_SLUG" ]; then
 		printf 'body gate: no --slug, so there is no report to build the body from and nothing to gate\n'
-		return $rc
-	fi
-	body=$PREFLIGHT_TMP/body.md
-	if ! out=$("$PBIN/publish" --body-out "$body" "$PF_SLUG" 2>&1); then
+	elif ! out=$("$PBIN/publish" --body-out "$body" "$PF_SLUG" 2>&1); then
 		printf 'the body bin/publish would send cannot be built:\n%s\n' "$(printf '%s\n' "$out" | sed 's/^/  /')"
-		return 1
+		rc=1
+	elif ! pf_has_body_gate "$PF_CWD"; then
+		printf 'body: no pr-check target in this checkout — skipped (no Makefile pr-check target and no scripts/pr-gate.sh in %s, so there is no body gate to run)\n' "$PF_CWD"
+	elif ! run_body_gate "$PF_CWD" "$PF_BRANCH" "$body"; then
+		printf 'the body gate %srefused the body bin/publish would send\n' "${BODY_GATE:+($BODY_GATE) }"
+		rc=1
+	else
+		printf 'body gate: %s passed on the body bin/publish would send (%s)\n' "${BODY_GATE:-none in this repo}" "$body"
 	fi
-	if ! run_body_gate "$PF_CWD" "$PF_BRANCH" "$body"; then
-		printf 'the body gate %srefused the body bin/publish would send:\n%s\n' "${BODY_GATE:+($BODY_GATE) }" \
-			"$(printf '%s\n' "$out" | sed 's/^/  /')"
-		return 1
-	fi
-	printf 'body gate: %s passed on the body bin/publish would send (%s)\n' "${BODY_GATE:-none in this repo}" "$body"
+	# ...then the budget, which is a rule of the checkouts that have one. It can fail on its own (an
+	# AGENTS.md over budget) and that failure stands; a checkout with no root AGENTS.md says so by
+	# name instead of reading as a failure the branch is supposed to fix.
+	pf_docs_budget "$PF_CWD" || rc=1
 	return $rc
 }
 

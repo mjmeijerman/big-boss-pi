@@ -17,6 +17,9 @@
 #      shape), while a test that needs nothing of the sort passes both;
 #   E. a docs-only diff takes the fast path, names why each check was skipped, and still refuses a
 #      body the gate would refuse (a made-up review tier);
+#   G. a pi-shaped checkout — no root AGENTS.md but a `pr-check` target — skips the docs budget by
+#      name, keeps the body gate blocking, and exits nonzero only for a real body problem;
+#   H. a checkout with neither a root AGENTS.md nor a body gate passes with two named skips;
 #   F. `--skip-preflight "<reason>"` publishes and records the reason in state/decisions.jsonl.
 #
 #   bash scripts/tests/test-preflight.sh      exit 0 = every case held
@@ -357,6 +360,101 @@ elif gh_saw '^gh pr (create|edit) ' || [ -n "$(origin_head)" ]; then
 	fail "a pull request or a push happened past a refused body"
 else
 	pass "a bad tier on a docs-only diff blocks the publish on the fast path"
+fi
+
+# --- G. a pi-shaped checkout: no root AGENTS.md, and the body gate still blocks -----------------
+
+# The shape that found this: a pi checkout keeps its agent instructions at agent/AGENTS.md, so it has
+# no root AGENTS.md and no docs budget — but its Makefile has a pr-check target, and that gate has to
+# keep working. The budget half is a named skip, not a failure the branch cannot fix; a checkout that
+# fails on its own shape is a checkout whose gate gets bypassed with --skip-preflight.
+reset_case pi-shape
+mkdir -p "$REPO/scripts/tests"
+printf 'export const ok = 1;\n' >"$REPO/ok.mjs"
+cat >"$REPO/scripts/tests/smoke.test.mjs" <<'TEST'
+import { test } from "node:test";
+test("smoke", () => {});
+TEST
+cat >"$REPO/Makefile" <<'MAKE'
+pr-check:
+	@bash $(CURDIR)/scripts/body-gate.sh "$(BODY)"
+
+scripts-test:
+	@node --test scripts/tests/*.test.mjs
+MAKE
+cat >"$REPO/scripts/body-gate.sh" <<'GATE'
+#!/usr/bin/env bash
+# The shape of a target repo's own body gate: it reads the body bin/publish would send.
+body=${1:-}
+[ -f "$body" ] || { printf 'pr-check: no body file\n' >&2; exit 1; }
+grep -qE '^Review tier: ' "$body" || { printf 'pr-check: no Review tier: line\n' >&2; exit 1; }
+grep -q '^## Evidence' "$body" || { printf 'pr-check: no Evidence section\n' >&2; exit 1; }
+if [ -n "${GATE_WANTS_TEST_CHANGE:-}" ] && ! grep -qE '^Test change: ' "$body"; then
+	printf 'pr-check: no Test change: line\n' >&2
+	exit 1
+fi
+printf 'pr-check: body ok\n'
+GATE
+chmod +x "$REPO/scripts/body-gate.sh"
+commit_branch "feat: a pi-shaped checkout, a body gate, and no root AGENTS.md"
+track_worker
+
+# G1. A body the gate refuses still refuses the run, and the budget is not blamed for it.
+write_report Whatever yes
+run "$pf" --only body --slug w1
+if [ "$RC" = 0 ]; then
+	fail "a made-up review tier passed the body check in a pi-shaped checkout — $OUT"
+elif ! said "docs budget: no root AGENTS.md in this checkout — skipped"; then
+	fail "the docs budget did not name itself as skipped — $OUT"
+elif ! said "Review tier"; then
+	fail "the refusal does not name the tier line — $OUT"
+else
+	pass "a pi-shaped checkout skips the docs budget by name and still refuses a body the gate refuses"
+fi
+
+# G2. A body the gate accepts passes, with the skip said out loud and the gate named.
+write_report Medium yes
+run "$pf" --only body --slug w1
+if [ "$RC" != 0 ]; then
+	fail "a pi-shaped checkout with a good body failed the body check: exit $RC — $OUT"
+elif ! said "docs budget: no root AGENTS.md in this checkout — skipped"; then
+	fail "the docs budget did not name itself as skipped — $OUT"
+elif said "no pr-check target"; then
+	fail "the body gate was skipped in a checkout that has one — $OUT"
+elif ! said "body gate: make pr-check passed"; then
+	fail "the body gate did not run and pass — $OUT"
+else
+	pass "a pi-shaped checkout passes with the budget skipped by name and its own pr-check gate run"
+fi
+
+# G3. The gate still blocks: a report publish accepts, refused by the checkout's own gate.
+run env GATE_WANTS_TEST_CHANGE=1 "$pf" --only body --slug w1
+if [ "$RC" = 0 ]; then
+	fail "the checkout's own body gate refused a body and the check passed anyway — $OUT"
+elif ! said "Test change"; then
+	fail "the gate's refusal is not shown — $OUT"
+elif ! said "docs budget: no root AGENTS.md in this checkout — skipped"; then
+	fail "the docs budget did not name itself as skipped on the failing run — $OUT"
+else
+	pass "a pi-shaped checkout's own pr-check gate still blocks a body it refuses"
+fi
+
+# --- H. no root AGENTS.md and no body gate: two named skips, and the check passes --------------
+
+reset_case no-gate
+printf 'export const ok = 1;\n' >"$REPO/ok.mjs"
+commit_branch "feat: a checkout with nothing to gate"
+write_report Medium yes
+track_worker
+run "$pf" --only body --slug w1
+if [ "$RC" != 0 ]; then
+	fail "a checkout with no docs budget and no gate failed the body check: exit $RC — $OUT"
+elif ! said "docs budget: no root AGENTS.md in this checkout — skipped"; then
+	fail "the missing docs budget was not named as skipped — $OUT"
+elif ! said "body: no pr-check target in this checkout — skipped"; then
+	fail "the missing body gate was not named as skipped — $OUT"
+else
+	pass "no root AGENTS.md and no pr-check target: the body check passes with two named skips"
 fi
 
 # --- F. the escape hatch: --skip-preflight "<reason>" ------------------------------------------
