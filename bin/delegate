@@ -2,7 +2,7 @@
 # delegate — the only way an agent in big-boss-pi starts work.
 #
 #   delegate spawn <slug> --cwd DIR [--mode bare|sandboxed|no-net] [--thinking LEVEL]
-#                  [--acceptance] [--override-jev --reason TEXT] [--no-restore] "<task>"
+#                  [--count N] [--acceptance] [--override-jev --reason TEXT] [--no-restore] "<task>"
 #   delegate wait <slug> [--timeout SECONDS]
 #   delegate list
 #   delegate close <slug> [--merged PR-URL-OR-NUMBER]
@@ -128,14 +128,17 @@
 # `defaults`. The four answers are still recorded as four decision lines (count, mode, route,
 # thinking), each carrying jev's own answer. Routing is a refusal, not a
 # warning: a task Jev calls "local" stops the spawn and prints the cheaper bin/local-run command
-# to run instead. A caller's --mode or --thinking is accepted only when it matches Jev's answer
-# for that exact task text; otherwise the spawn aborts and prints Jev's answer. Overriding Jev — a
-# mode, a thinking level or a local route — needs --override-jev with a non-empty --reason, and the
-# override is recorded. A dead model is still a refusal — unless --override-jev carried a reason,
+# to run instead. A caller's --mode, --count or --thinking is accepted only when it matches Jev's
+# answer for that exact task text; otherwise the spawn aborts and prints Jev's answer. Overriding
+# Jev — a count, a mode, a thinking level or a local route — needs --override-jev with a non-empty
+# --reason, and the override is recorded on that decision's own line. A dead model is still a refusal — unless --override-jev carried a reason,
 # which is the promise those refusal messages make and which makes every field take the same
 # default, recorded as defaulted. An "unsure" route is recorded and the spawn continues.
 #
-# Jev's count is honoured, not noted. A task that needs three workers starts three spaces,
+# Jev's count is honoured, not noted. --count N asks for N workers (1..8, the live ceiling): a
+# count that disagrees with jev is a contradiction like a mode, so it refuses unless
+# --override-jev --reason came with it, and the count line then records `overridden: true` with
+# jev's own answer beside it. A task that needs three workers starts three spaces,
 # `SLUG`, `SLUG-2`, `SLUG-3`, each with its own spec and report file, the same task text plus its
 # position in the group, and the same mode and thinking level. Count 1 is exactly the old
 # behaviour and the old slug. A count that would cross the live-worker ceiling refuses rather than
@@ -1308,8 +1311,8 @@ acceptance_source_spec() {
 }
 
 cmd_spawn() {
-	local slug="" cwd="" mode="" thinking="" task="" override_jev=0 reason="" runner="" no_restore=0 acceptance=0
-	[ "$#" -ge 1 ] || die 'usage: delegate spawn <slug> --cwd DIR [--mode M] [--thinking LEVEL] [--acceptance] [--override-jev --reason TEXT] [--no-restore] "<task>"'
+	local slug="" cwd="" mode="" thinking="" count_flag="" task="" override_jev=0 reason="" runner="" no_restore=0 acceptance=0
+	[ "$#" -ge 1 ] || die 'usage: delegate spawn <slug> --cwd DIR [--mode M] [--thinking LEVEL] [--count N] [--acceptance] [--override-jev --reason TEXT] [--no-restore] "<task>"'
 	slug=$1; shift
 	local words=()
 	while [ "$#" -gt 0 ]; do
@@ -1317,6 +1320,7 @@ cmd_spawn() {
 		--cwd) cwd=${2:-}; shift 2 ;;
 		--mode) mode=${2:-}; shift 2 ;;
 		--thinking) thinking=${2:-}; shift 2 ;;
+		--count) count_flag=${2:-}; shift 2 ;;
 		--acceptance) acceptance=1; shift ;;
 		--override-jev) override_jev=1; shift ;;
 		--reason) reason=${2:-}; shift 2 ;;
@@ -1334,6 +1338,14 @@ cmd_spawn() {
 	"" | off | minimal | low | medium | high | xhigh | max) ;;
 	*) die "thinking must be off, minimal, low, medium, high, xhigh or max: '$thinking'" ;;
 	esac
+	# --count asks for a number of workers, bounded by the live-space hard stop. A number outside
+	# it is refused here, before jev is asked, and the message names where the ceiling comes from.
+	if [ -n "$count_flag" ]; then
+		case $count_flag in
+		*[!0-9]* | "") die "usage: --count N takes a whole number of workers from 1 to 8 — 8 is the live-space ceiling, the hard stop on spaces tracked in state/delegations.json: '$count_flag'" ;;
+		*) [ "$count_flag" -ge 1 ] && [ "$count_flag" -le 8 ] || die "usage: --count N takes a whole number of workers from 1 to 8 — 8 is the live-space ceiling, the hard stop on spaces tracked in state/delegations.json: '$count_flag'" ;;
+		esac
+	fi
 	cwd=$(readlink -f -- "$cwd")
 	# --acceptance: the task text is, or names, a file under specs/. A second opinion that has not
 	# seen the implementation is only worth having if what it was given actually exists, so this
@@ -1352,7 +1364,7 @@ cmd_spawn() {
 	#    still recorded on its own line below, so a reader cannot tell the difference in the log.
 	local jev_count jev_mode jev_route jev_effort plan_reason overridden=false
 	local count_reason mode_reason route_reason thinking_reason
-	local mode_overridden=false thinking_overridden=false route_overridden=false
+	local mode_overridden=false thinking_overridden=false route_overridden=false count_overridden=false
 	local task_ctx="spawn:$slug" reason_given=0
 	if [ -n "${reason// /}" ]; then reason_given=1; fi
 	plan_jev "$task" "$task_ctx" "$override_jev" "$reason_given"
@@ -1400,13 +1412,14 @@ cmd_spawn() {
 			"$prog" "$JEV_DEFAULTS_NOTE" "$jev_count" "$jev_mode" "$jev_route" "$jev_effort" >&2
 	fi
 
-	# 2. A caller's mode and thinking level must agree with Jev for this exact task text, and a
-	#    task Jev calls local refuses: local work needs no space, no spec and no agent.
+	# 2. A caller's mode, count and thinking level must agree with Jev for this exact task text,
+	#    and a task Jev calls local refuses: local work needs no space, no spec and no agent.
 	#    Jev's answer is recorded either way: a refusal is a decision too, and the audit line
 	#    says why nothing spawned. An override without a reason is a guess, so it refuses too.
-	local refusal="" refuse_mode=0 refuse_thinking=0 refuse_route=0
+	local refusal="" refuse_mode=0 refuse_thinking=0 refuse_route=0 refuse_count=0
 	if [ -n "$mode" ] && [ "$mode" != "$jev_mode" ]; then refuse_mode=1; fi
 	if [ -n "$thinking" ] && [ "$thinking" != "$jev_level" ]; then refuse_thinking=1; fi
+	if [ -n "$count_flag" ] && [ "$count_flag" != "$jev_count" ]; then refuse_count=1; fi
 	if [ "$jev_route" = local ]; then refuse_route=1; fi
 
 	if [ "$override_jev" = 1 ] && [ "$reason_given" = 0 ]; then
@@ -1416,8 +1429,10 @@ cmd_spawn() {
 		# marked. Nothing to overrule is not an override.
 		if [ "$refuse_mode" = 1 ]; then mode_overridden=true; fi
 		if [ "$refuse_thinking" = 1 ]; then thinking_overridden=true; fi
+		if [ "$refuse_count" = 1 ]; then count_overridden=true; fi
 		if [ "$refuse_route" = 1 ]; then route_overridden=true; fi
-		if [ "$mode_overridden" = true ] || [ "$thinking_overridden" = true ] || [ "$route_overridden" = true ]; then
+		if [ "$mode_overridden" = true ] || [ "$thinking_overridden" = true ] ||
+			[ "$count_overridden" = true ] || [ "$route_overridden" = true ]; then
 			overridden=true
 		fi
 	elif [ "$refuse_mode" = 1 ]; then
@@ -1426,6 +1441,9 @@ Re-run without --mode to use jev's answer, or re-run with --override-jev --reaso
 	elif [ "$refuse_thinking" = 1 ]; then
 		refusal="--thinking $thinking contradicts jev, which answered effort '$jev_effort' — level '$jev_level' for this task ($thinking_reason).
 Re-run without --thinking to use jev's level, or re-run with --override-jev --reason '<why>' to overturn jev."
+	elif [ "$refuse_count" = 1 ]; then
+		refusal="--count $count_flag contradicts jev: jev wants $jev_count workers for this task ($count_reason).
+Re-run without --count to start jev's $jev_count, or re-run with --count $count_flag --override-jev --reason '<why $count_flag is the right number>' to overturn jev."
 	elif [ "$refuse_route" = 1 ]; then
 		refusal="jev routes this task local, so a space and an agent are more than it needs ($route_reason).
 Run it here instead:  $BIN/local-run \"<task>\"
@@ -1434,13 +1452,16 @@ Forcing a remote worker needs --override-jev --reason '<why this cannot run loca
 
 	if [ -n "$refusal" ]; then
 		record_decision mode "$task" "$jev_mode" "$mode_reason" false "-" "$ev_mode_answer" "$defaults_extra"
-		record_decision count "$task" "$jev_count" "$count_reason" false "-" "$ev_count_answer" "$defaults_extra"
+		record_decision count "$task" "$jev_count" "$count_reason" "$count_overridden" "-" "$ev_count_answer" "$defaults_extra"
 		record_decision route "$task" "$jev_route" "$route_reason" false "-" "$ev_route_answer" "$defaults_extra"
 		record_decision thinking "$task" "$jev_level" "$thinking_reason (jev effort $jev_effort → $jev_level)" false "-" "$ev_thinking_answer" "$defaults_extra"
 		die "$refusal"
 	fi
 
 	if [ -z "$mode" ]; then mode=$jev_mode; fi
+	# A --count that survives to here was overridden on purpose, and it is the number of workers
+	# that start. jev's own answer stays in ev_count_answer and goes on the count line beside it.
+	if [ "$count_overridden" = true ]; then jev_count=$count_flag; fi
 	# A --thinking that survives to here either agrees with jev or was overridden on purpose.
 	if [ -z "$thinking" ] || [ "$refuse_thinking" != 1 ]; then thinking=$jev_level; fi
 	jev_level=$thinking
@@ -1456,7 +1477,7 @@ Forcing a remote worker needs --override-jev --reason '<why this cannot run loca
 	#    decision was actually overturned, `jev` carries jev's own answer on every line, and
 	#    `defaults` names the fields jev was not sure enough about to decide.
 	record_decision mode "$task" "$mode" "$mode_reason" "$mode_overridden" "$slug" "$ev_mode_answer" "$defaults_extra"
-	record_decision count "$task" "$jev_count" "$count_reason" false "$slug" "$ev_count_answer" "$defaults_extra"
+	record_decision count "$task" "$jev_count" "$count_reason" "$count_overridden" "$slug" "$ev_count_answer" "$defaults_extra"
 	record_decision route "$task" "$jev_route" "$route_reason" "$route_overridden" "$slug" "$ev_route_answer" "$defaults_extra"
 	record_decision thinking "$task" "$jev_level" "$thinking_reason (jev effort $jev_effort → $jev_level)" "$thinking_overridden" "$slug" "$ev_thinking_answer" "$defaults_extra"
 
@@ -1468,12 +1489,12 @@ Forcing a remote worker needs --override-jev --reason '<why this cannot run loca
 		const fs=require("fs");let j={};try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"))}catch{}
 		process.stdout.write(String(Object.keys(j).length));' "$DELEGATIONS" 2>/dev/null || echo 0)
 	if [ $((live + jev_count)) -gt 8 ]; then
-		die "$live workers already tracked and jev asks for $jev_count more, past the live ceiling of 8 — close finished ones first, or split the task."
+		die "$live workers already tracked and this spawn asks for $jev_count more, past the live ceiling of 8 — close finished ones first, or split the task."
 	fi
 	# A count of N needs N slugs, and a slug is at most 31 characters; "-2" .. "-4" is what is
 	# appended, so a shorter slug is the only thing that has to change.
 	if [ "$jev_count" -gt 1 ] && [ "${#slug}" -gt 29 ]; then
-		die "jev wants $jev_count workers, named $slug-2 .. $slug-$jev_count, and a slug is at most 31 characters: use a slug of at most 29 characters."
+		die "a count of $jev_count needs the slugs $slug-2 .. $slug-$jev_count, and a slug is at most 31 characters: use a slug of at most 29 characters."
 	fi
 
 	# 4b. Review sets the pace in the area the work is in, not across the whole directory. An
@@ -1577,7 +1598,14 @@ ACCEPTANCE
 	# One space per worker jev asked for: SLUG, SLUG-2 .. SLUG-N. Every one gets its own spec, its
 	# own report path, its own space, and the same mode and thinking level. The task text carries
 	# the worker's position, so its report reads as one of a group instead of as the whole job.
-	local n spawn_slug spec report argv before out space tab pane terminal position
+	local n spawn_slug spec report argv before out space tab pane terminal position count_note=""
+	# A count that overruled jev downward is said in the spec the worker reads, so a later reader
+	# is not looking for workers that were never started.
+	if [ "$count_overridden" = true ] && [ "$jev_count" -lt "$JEV_COUNT" ]; then
+		count_note="Jev asked for $JEV_COUNT workers for this task; --count $jev_count with --override-jev
+started $jev_count instead, so workers $((jev_count + 1)) .. $JEV_COUNT were never started — do not
+look for them."
+	fi
 	for n in $(seq 1 "$jev_count"); do
 		if [ "$n" = 1 ]; then spawn_slug=$slug; else spawn_slug=$slug-$n; fi
 		spec=$SPECS/$spawn_slug.md
@@ -1594,6 +1622,11 @@ do not edit anyone else's report."
 			task_block="$task_block
 
 $position"
+		fi
+		if [ -n "$count_note" ]; then
+			task_block="$task_block
+
+$count_note"
 		fi
 		cat >"$spec" <<EOF
 # Worker \`$spawn_slug\`
@@ -2248,6 +2281,7 @@ cmd_finish() {
 # Kept: no report yet (still working), and a report carrying the DECISION NEEDED marker.
 cmd_sweep() {
 	local closed=0 kept=0 slug report
+	if [ "$#" -gt 0 ]; then die "unknown option $1 — usage: delegate sweep (it takes no options; --count belongs to delegate spawn)"; fi
 	local slugs=""
 	if [ -f "$DELEGATIONS" ]; then
 		slugs=$(node -e '
@@ -2291,7 +2325,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 	close) shift; cmd_close "$@" ;;
 	ask) shift; cmd_ask "$@" ;;
 	stats) shift; PI_BOSS_ROOT=$ROOT exec node "$self_bin/stats.mjs" "$@" ;;
-	sweep) cmd_sweep ;;
+	sweep) shift; cmd_sweep "$@" ;;
 	wipe) shift; cmd_wipe "$@" ;;
 	finish) shift; cmd_finish "$@" ;;
 	*) die 'usage: delegate spawn|wait|list|close|ask|stats|sweep|wipe|finish ...' ;;

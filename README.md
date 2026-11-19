@@ -122,10 +122,12 @@ PR, and that is jev's answer being right**.
 
 `delegate spawn` asks Jev once on every run — `jev plan` answers the count, the mode, the route
 and the thinking effort together, for the exact task text — and records them as the four
-decision lines it always did. A `--mode` or `--thinking` from the caller is
+decision lines it always did. A `--mode`, `--count` or `--thinking` from the caller is
 accepted only when it matches Jev's answer. A different one aborts the spawn and prints Jev's
 answer and its reason; overturning it needs `--override-jev --reason '<why>'`, and the
-override is recorded. A `local` route aborts the same way, pointing at `bin/local-run`. A field
+override is recorded on that decision's own line — including `--count`, whose line then carries
+`overridden: true` with Jev's own number beside it. `--count N` takes 1 to 8, the live-space
+ceiling. A `local` route aborts the same way, pointing at `bin/local-run`. A field
 Jev answers only weakly takes the conservative default (count 1, mode sandboxed, route remote,
 thinking medium), the spawn says which field defaulted and the decision line records it; an
 unoffered answer or a dead model still stops the spawn unless `--override-jev` carries a reason.
