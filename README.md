@@ -288,8 +288,11 @@ and a sentinel branch — the call also carries `BRANCH=<the worker's branch>`, 
 diffs a named branch would otherwise compare the checkout (usually trunk) with itself and refuse
 with `unverifiable: no changed files`; a recipe that never mentions it is called with `BODY` alone.
 A red gate stops the publish. A PR that
-already exists for the branch prints its URL instead of failing. Trunk is never pushed, nothing
-is force-pushed, and nothing is merged — the merge stays yours.
+already exists for the branch prints its URL instead of failing. Trunk is never pushed, and nothing
+is merged — the merge stays yours. A branch a rebase rewrote is re-pushed under
+`--force-with-lease` on the sha origin holds, because the `behind` check asks for that rebase; a
+branch whose remote tip carries a commit this worker neither has nor rewrote is refused, with that
+commit named, rather than forced.
 
 It refuses, naming the reason, when the slug is unknown, the report is missing or has no
 Evidence block (the same check `delegate close` uses), the report has no `Review tier:` line or
