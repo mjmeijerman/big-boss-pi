@@ -14,8 +14,11 @@
 # `skip` with the reason — never as a pass:
 #
 #   syntax    bash -n on the changed shell files, node --check on the changed .mjs/.js
-#   suites    the repo's own tests: `node --test scripts/tests/*.test.mjs` plus `make scripts-test`
-#             in a pi checkout, `bash scripts/ci-local.sh` here; a checkout with neither is named
+#   suites    the repo's own tests, each exactly once: in a pi checkout the node suite and every
+#             scripts/tests/*.test.sh — the globs `make scripts-test` runs, run directly, so the
+#             node suite cannot run twice (it used to: `node --test` and then a target that begins
+#             with it, 30 extra seconds on a five-file diff); a target that does more than those
+#             two globs is run whole, once, and a checkout with neither is named
 #   semgrep   the changed files only, the workflow's own --config when a repo pins one, else
 #             p/default plus scripts/semgrep-rules.yml; semgrep missing is a FAIL, never a pass
 #   scrub     the changed test files under `env -i PATH=<empty stub>:/usr/bin:/bin HOME=<tmp>` —
@@ -25,6 +28,14 @@
 #             a checkout with no root AGENTS.md has no budget to measure, so that half is skipped by
 #             name (a pi checkout keeps its instructions at agent/AGENTS.md, which is not one) and
 #             the gate half still runs and still blocks; no pr-check target is a named skip too
+#
+# The checks run side by side and each suite inside them writes its own log: they read files, they
+# build throwaway roots, none of them shares state with another — so the wall clock is the slowest
+# check rather than the sum of them, and the output is still one line per check and one line per
+# suite, never two suites interleaved. The scrub is the exception on purpose: it runs the same test
+# files the suites just ran, in an emptied environment, and it runs after them, never instead of
+# them. PREFLIGHT_JOBS caps the suites in flight at once (default 4): one process per test file on
+# a 32-core machine is 32 node processes fighting for the same tmpfs, and CI runs them serially.
 #
 # Output is plain and meant to be pasted: one line per check, verdict, name, elapsed, detail; the
 # detail under a failing check; then a summary. No colour, no progress bars.
@@ -54,6 +65,10 @@ PBIN=$self_root/bin
 
 prog=preflight
 DECISIONS=$ROOT/state/decisions.jsonl
+# How many suites run at once. Bounded on purpose: the suites are independent, but the machine they
+# run on is not infinite, and a gate that spawns thirty processes is a gate that measures itself.
+PF_JOBS=${PREFLIGHT_JOBS:-4}
+case $PF_JOBS in '' | *[!0-9]* | 0) PF_JOBS=4 ;; esac
 say() { printf '%s\n' "$*"; }
 die() { printf '%s: error: %s\n' "$prog" "$*" >&2; exit 2; }
 
@@ -116,9 +131,18 @@ pf_collect() {
 	PF_CHANGED=()
 	PF_CODE=()
 	PF_TESTS=()
+	# A pure-docs diff: every changed path is prose. That is the shape the fast paths exist for —
+	# nothing in it compiles, lints, or has a test to scrub — and it is counted, never guessed, so
+	# one stray .sh in the diff takes the whole run off the fast path.
+	PF_DOCS_ONLY=1
+	PF_DOCS_COUNT=0
 	while IFS= read -r f; do
 		[ -n "$f" ] || continue
 		PF_CHANGED+=("$f")
+		case $f in
+		*.md | *.markdown | docs/*) PF_DOCS_COUNT=$((PF_DOCS_COUNT + 1)) ;;
+		*) PF_DOCS_ONLY=0 ;;
+		esac
 		case $f in
 		*.sh | bin/*)
 			case $f in *.mjs | *.js | *.md) ;; *) PF_CODE+=("$f") ;; esac
@@ -129,6 +153,8 @@ pf_collect() {
 		scripts/tests/* | tests/* | *test-*.sh | *.test.mjs | *.test.js | *_test.py) PF_TESTS+=("$f") ;;
 		esac
 	done < <(git -C "$cwd" diff --name-only --diff-filter=ACMR "${mb}..${branch}" 2>/dev/null)
+	# An empty diff is not a prose diff: nothing changed at all is a different line.
+	[ "$PF_DOCS_COUNT" -gt 0 ] || PF_DOCS_ONLY=0
 	return 0
 }
 
@@ -143,11 +169,25 @@ pf_applies() {
 	esac
 }
 
-# pf_skip_reason <id> — why a check does not apply here, in one line that names the fact.
+# pf_skip_reason <id> — why a check does not apply here, in one line that names the fact. A
+# prose-only diff gets its own line rather than the generic one, because "the diff is docs" and "the
+# diff touched no code file" are two different reasons a person may want to argue with.
 pf_skip_reason() {
 	case $1 in
-	syntax | semgrep) printf 'no changed code file (nothing here compiles or lints)' ;;
-	scrub) printf 'no changed test file (nothing to run under the scrub)' ;;
+	syntax | semgrep)
+		if [ "$PF_DOCS_ONLY" = 1 ]; then
+			printf 'docs-only diff: no changed code file, so nothing in %s file(s) compiles or lints' "$PF_DOCS_COUNT"
+		else
+			printf 'no changed code file (nothing here compiles or lints)'
+		fi
+		;;
+	scrub)
+		if [ "$PF_DOCS_ONLY" = 1 ]; then
+			printf 'docs-only diff: no changed test file, so there is nothing to run under env -i'
+		else
+			printf 'no changed test file (nothing to run under the scrub)'
+		fi
+		;;
 	suites)
 		if [ "$PF_SHAPE" = none ]; then
 			printf 'no suite found: no Makefile scripts-test target, no scripts/tests/*.test.mjs, no scripts/ci-local.sh in %s' "$PF_CWD"
@@ -227,38 +267,150 @@ pf_check_syntax() {
 
 # --- check: the repo's own suites --------------------------------------------------------------
 
-pf_check_suites() {
-	local rc=0 out
+# A suite is one unit: a name and a command, run in the checkout, with its own log and its own
+# elapsed time. Units are independent (they build throwaway roots), so they run at once — capped,
+# because the cap is what keeps a gate from measuring its own process storm.
+pf_unit_add() { # <name> <command>
+	PF_UNIT_NAME+=("$1")
+	PF_UNIT_CMD+=("$2")
+}
+
+# pf_pi_superset_is_globs <cwd> — true when this checkout's `make scripts-test` is exactly the
+# standard two-glob recipe: the node suite, then every scripts/tests/*.test.sh through bash. Its
+# recipe is then proof that running those globs here is running the target — which is how the same
+# suite stops running twice (this check used to call `node --test` and then a target that begins
+# with it). A target that grew a step is not recognised: it is run whole, once, so the gate cannot
+# quietly stop doing something the target does. No target at all is the globs by definition.
+pf_pi_superset_is_globs() {
+	local cwd=$1 probe line saw_node=0 saw_loop=0
+	[ -f "$cwd/Makefile" ] || return 0
+	grep -qE '^scripts-test[[:space:]]*:' "$cwd/Makefile" || return 0
+	probe=$(cd "$cwd" && make --no-print-directory -n scripts-test 2>/dev/null) || return 1
+	[ -n "$probe" ] || return 1
+	while IFS= read -r line; do
+		line=${line#"${line%%[![:space:]]*}"} # leading blanks
+		line=${line%\\}                      # a shell line continuation
+		line=${line%"${line##*[![:space:]]}"} # trailing blanks
+		[ -n "$line" ] || continue
+		case $line in
+		'echo '* | 'printf '*) ;;
+		'node --test '*scripts/tests/*.test.mjs*) saw_node=1 ;;
+		'for t in scripts/tests/*.test.sh; do') saw_loop=1 ;;
+		'[ -e "$t" ] || continue;') ;;
+		'bash "$t" || '*) ;;
+		done) ;;
+		*) return 1 ;;
+		esac
+	done <<<"$probe"
+	[ "$saw_node" = 1 ] && [ "$saw_loop" = 1 ]
+}
+
+# pf_suite_units — fill PF_UNIT_NAME/PF_UNIT_CMD with the suites this checkout's superset would run.
+# pi: the two globs the target runs, or the target itself when its recipe is not those globs.
+# boss: scripts/ci-local.sh's own jobs, one each — the script declares them (`job_ids=(...)`), and a
+# script that declares none is run whole instead. Never both halves: that is the double run again.
+pf_suite_units() {
+	local cwd=$PF_CWD t n=0 id ids=""
+	local -a ids_a=()
+	PF_UNIT_NAME=()
+	PF_UNIT_CMD=()
 	case $PF_SHAPE in
 	pi)
-		if compgen -G "$PF_CWD/scripts/tests/*.test.mjs" >/dev/null 2>&1; then
-			if ! out=$(cd "$PF_CWD" && node --test scripts/tests/*.test.mjs 2>&1); then
-				rc=1
-				printf 'node --test scripts/tests/*.test.mjs failed:\n%s\n' "$(printf '%s\n' "$out" | tail -n 20 | sed 's/^/  /')"
+		if pf_pi_superset_is_globs "$cwd"; then
+			if compgen -G "$cwd/scripts/tests/*.test.mjs" >/dev/null 2>&1; then
+				for t in "$cwd"/scripts/tests/*.test.mjs; do [ -f "$t" ] && n=$((n + 1)); done
+				pf_unit_add "node --test scripts/tests/*.test.mjs ($n file(s))" 'node --test scripts/tests/*.test.mjs'
 			fi
+			for t in "$cwd"/scripts/tests/*.test.sh; do
+				[ -f "$t" ] || continue
+				pf_unit_add "bash scripts/tests/$(basename "$t")" "bash scripts/tests/$(basename "$t")"
+			done
+		else
+			pf_unit_add 'make scripts-test (its own recipe, not the two globs)' 'make --no-print-directory scripts-test'
 		fi
-		if [ -f "$PF_CWD/Makefile" ] && grep -qE '^scripts-test[[:space:]]*:' "$PF_CWD/Makefile"; then
-			if ! out=$(cd "$PF_CWD" && make --no-print-directory scripts-test 2>&1); then
-				rc=1
-				printf 'make scripts-test failed:\n%s\n' "$(printf '%s\n' "$out" | tail -n 20 | sed 's/^/  /')"
-			fi
-		fi
-		[ "$rc" = 0 ] && printf 'pi checkout: node --test scripts/tests/*.test.mjs and make scripts-test both passed\n'
 		;;
 	boss)
-		if ! out=$(cd "$PF_CWD" && bash scripts/ci-local.sh 2>&1); then
-			rc=1
-			printf 'bash scripts/ci-local.sh failed:\n%s\n' "$(printf '%s\n' "$out" | tail -n 25 | sed 's/^/  /')"
+		ids=$(sed -nE 's/^job_ids=\(([^)]*)\)$/\1/p' "$cwd/scripts/ci-local.sh" 2>/dev/null | head -n 1)
+		case $ids in *[!a-z0-9\ -]*) ids="" ;; esac
+		read -r -a ids_a <<<"$ids"
+		if [ "${#ids_a[@]}" -eq 0 ]; then
+			pf_unit_add 'bash scripts/ci-local.sh' 'bash scripts/ci-local.sh'
 		else
-			printf 'boss workspace: %s\n' "$(printf '%s\n' "$out" | grep -E '^ci-local: ' | tail -n 1)"
+			for id in "${ids_a[@]}"; do
+				pf_unit_add "ci-local: $id" "bash scripts/ci-local.sh --only $id"
+			done
 		fi
 		;;
-	*)
+	esac
+}
+
+# pf_run_units — run the discovered units at most PF_JOBS at a time and report them: one line per
+# suite with its own elapsed time, the wall clock, and every failure's own tail at the end. Nothing
+# interleaves because nothing shares a stream: each unit writes its own log.
+pf_run_units() {
+	local n=${#PF_UNIT_CMD[@]} i=0 j=0 idx pid rc ms fails=0 dir started ended
+	local -a pids=() unit_rc=() unit_ms=()
+	dir=$PREFLIGHT_TMP/units
+	mkdir -p "$dir"
+	started=$(date +%s%N)
+	while [ "$i" -lt "$n" ]; do
+		pids=()
+		j=0
+		while [ "$j" -lt "$PF_JOBS" ] && [ "$i" -lt "$n" ]; do
+			idx=$i
+			(
+				local s e r
+				s=$(date +%s%N)
+				(cd "$PF_CWD" && bash -c "${PF_UNIT_CMD[$idx]}") >"$dir/$idx.log" 2>&1
+				r=$?
+				e=$(date +%s%N)
+				printf '%s %s\n' "$r" "$(((e - s) / 1000000))" >"$dir/$idx.status"
+			) &
+			pids+=($!)
+			i=$((i + 1))
+			j=$((j + 1))
+		done
+		for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+	done
+	ended=$(date +%s%N)
+	for ((i = 0; i < n; i++)); do
+		rc=1
+		ms=0
+		[ -f "$dir/$i.status" ] && read -r rc ms <"$dir/$i.status"
+		unit_rc[i]=$rc
+		unit_ms[i]=$ms
+	done
+	printf '%s: %d suite(s) discovered, %d ran once each, wall %ss (at most %s at a time)\n' \
+		"$PF_SHAPE_NAME" "$n" "$n" "$(((ended - started) / 1000000000))" "$PF_JOBS"
+	for ((i = 0; i < n; i++)); do
+		if [ "${unit_rc[i]}" = 0 ]; then
+			printf '%-58s %5ss  ok\n' "${PF_UNIT_NAME[i]}" "$((unit_ms[i] / 1000))"
+		else
+			fails=$((fails + 1))
+			printf '%-58s %5ss  FAILED (exit %s)\n' "${PF_UNIT_NAME[i]}" "$((unit_ms[i] / 1000))" "${unit_rc[i]}"
+		fi
+	done
+	[ "$fails" = 0 ] && return 0
+	printf 'failures (last 20 lines of each):\n'
+	for ((i = 0; i < n; i++)); do
+		[ "${unit_rc[i]}" = 0 ] && continue
+		printf '%s, exit %s:\n' "${PF_UNIT_NAME[i]}" "${unit_rc[i]}"
+		tail -n 20 "$dir/$i.log" 2>/dev/null | sed 's/^/  /'
+	done
+	return 1
+}
+
+pf_check_suites() {
+	if [ "$PF_SHAPE" = none ]; then
 		printf 'no suite in this checkout\n'
 		return 1
-		;;
-	esac
-	return $rc
+	fi
+	pf_suite_units
+	if [ "${#PF_UNIT_CMD[@]}" -eq 0 ]; then
+		printf 'no suite found in %s\n' "$PF_CWD"
+		return 1
+	fi
+	pf_run_units
 }
 
 # --- check: semgrep, on the changed files only --------------------------------------------------
@@ -515,8 +667,8 @@ pf_branch_for_slug() {
 
 preflight_main() {
 	local cwd="" slug="" branch="" selected=() id out rc fails=0 ran=0 start end ms part
-	local parts=()
-	local elapsed_ms=0 total_start total_end mode
+	local -a parts=()
+	local total_start total_end
 	while [ "$#" -gt 0 ]; do
 		case $1 in
 		--cwd)
@@ -621,34 +773,74 @@ preflight_main() {
 	fi
 	say ""
 
-	total_start=$(date +%s%N)
+	# Which checks have something to look at, and the list as one string to test membership in.
+	local -a run_ids=() pids=()
+	local ran_list=" "
 	for id in "${selected[@]}"; do
-		ran=$((ran + 1))
+		if pf_applies "$id"; then
+			run_ids+=("$id")
+			ran_list="$ran_list$id "
+		fi
+	done
+	ran=${#run_ids[@]}
+
+	# The checks are independent — semgrep reads changed files, the suites build throwaway roots,
+	# the body check builds a body in the temporary directory — so they run side by side and the
+	# wall clock is the slowest of them instead of the sum. Each writes its own log; the report
+	# below is still one block per check, in the order a person reads them, whatever finished first.
+	#
+	# The scrub is the exception and it is deliberate: it runs the same test files the suites just
+	# ran, with almost nothing on PATH, and it runs after them — never alongside, so "passes here,
+	# fails there" stays a statement about one suite at a time, and never skipped, since it is the
+	# check that catches a test reaching for the developer's tools.
+	total_start=$(date +%s%N)
+	for id in "${run_ids[@]}"; do
+		[ "$id" = scrub ] && continue
+		(
+			local s e r m
+			s=$(date +%s%N)
+			m=pf_check_"$id"
+			"$m" >"$PREFLIGHT_TMP/$id.out" 2>&1
+			r=$?
+			e=$(date +%s%N)
+			printf '%s %s\n' "$r" "$(((e - s) / 1000000))" >"$PREFLIGHT_TMP/$id.status"
+		) &
+		pids+=($!)
+	done
+	for start in "${pids[@]}"; do wait "$start" 2>/dev/null || true; done
+	if case $ran_list in *" scrub "*) true ;; *) false ;; esac; then
+		(
+			local s e r m
+			s=$(date +%s%N)
+			m=pf_check_scrub
+			"$m" >"$PREFLIGHT_TMP/scrub.out" 2>&1
+			r=$?
+			e=$(date +%s%N)
+			printf '%s %s\n' "$r" "$(((e - s) / 1000000))" >"$PREFLIGHT_TMP/scrub.status"
+		)
+	fi
+	total_end=$(date +%s%N)
+
+	for id in "${selected[@]}"; do
 		out=$PREFLIGHT_TMP/$id.out
-		if ! pf_applies "$id"; then
+		if ! case $ran_list in *" $id "*) true ;; *) false ;; esac; then
 			printf 'skip  %-44s %4ss  %s\n' "$(name_of "$id")" 0 "$(pf_skip_reason "$id")"
-			ran=$((ran - 1))
 			continue
 		fi
-		start=$(date +%s%N)
-		mode=pf_check_"$id"
-		"$mode" >"$out" 2>&1
-		rc=$?
-		end=$(date +%s%N)
-		ms=$(( (end - start) / 1000000 ))
-		elapsed_ms=$((elapsed_ms + ms))
+		rc=1
+		ms=0
+		[ -f "$PREFLIGHT_TMP/$id.status" ] && read -r rc ms <"$PREFLIGHT_TMP/$id.status"
 		if [ "$rc" = 0 ]; then
-			printf 'pass  %-44s %4ss  %s\n' "$(name_of "$id")" "$((ms / 1000))" "$(head -n 1 "$out")"
-			[ "$(wc -l <"$out")" -le 1 ] || sed 's/^/      /' "$out" | tail -n +2
+			printf 'pass  %-44s %4ss  %s\n' "$(name_of "$id")" "$((ms / 1000))" "$(head -n 1 "$out" 2>/dev/null)"
+			[ "$(wc -l <"$out" 2>/dev/null || echo 0)" -le 1 ] || sed 's/^/      /' "$out" | tail -n +2
 		else
 			fails=$((fails + 1))
 			printf 'FAIL  %-44s %4ss  exit %s\n' "$(name_of "$id")" "$((ms / 1000))" "$rc"
-			sed 's/^/      /' "$out"
+			sed 's/^/      /' "$out" 2>/dev/null
 			printf '      reproduce: %s --only %s%s%s %s\n' "$PBIN/preflight" "$id" \
 				"${slug:+ --slug $slug}" "${cwd:+ --cwd $cwd}" "$branch"
 		fi
 	done
-	total_end=$(date +%s%N)
 
 	say ""
 	if [ "$fails" = 0 ]; then
