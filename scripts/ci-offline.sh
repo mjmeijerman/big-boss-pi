@@ -509,6 +509,11 @@ expect "futures panel: thrown away, cycles, evidence" 0 "futures stats: ok" -- \
 	bash "$root/scripts/test-futures-stats.sh"
 expect "acceptance mode, flag, generated spec and recorded mode" 0 "acceptance mode: ok" -- \
 	bash "$root/scripts/test-acceptance.sh"
+# 9. An open PR for the branch is the destination, not a stop sign: a second worker's commit is
+#    pushed into it and the description is rebuilt from that worker's report, in that order. Its own
+#    script because every case needs a real bare origin to push into and a gh that records its argv.
+expect "an open PR gets the push and the refreshed body" 0 "open PR update: ok" -- \
+	bash "$root/scripts/test-open-pr-update.sh"
 
 printf '\n%s\n' "$([ "$fails" = 0 ] && echo "offline behaviour: ok" || echo "offline behaviour: $fails failure(s)")"
 [ "$fails" = 0 ]

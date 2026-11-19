@@ -44,10 +44,18 @@
 # publish before anything leaves the machine; then the branch's existing pull requests, asked once
 # across all states, so a branch that is already merged or already open never becomes a second PR;
 # then the branch is pushed to origin, the remote head is read back and has to be the commit that
-# was just pushed, and the PR is opened against trunk. A publish that stops earlier on the
-# duplicate guard's answer — the PR is already open, or the branch is already merged — prints what
-# origin holds for the branch and refuses when that is not the branch: nothing was pushed there, so
-# a URL on its own would read as a publish.
+# was just pushed, and the PR is opened against trunk.
+#
+# An OPEN PR for the branch is the destination, not a stop sign. A second worker on a branch that
+# already has one used to be stranded here: the guard stopped before the push, the new commit sat
+# on the local branch only, and `delegate finish` printed `published` over a body that still
+# described the first worker (mjmeijerman/pi#183, where the body kept the first worker's
+# `Review tier: Medium` over a `sandbox/` diff). So an open PR gets the push and a body refresh
+# from this worker's report, and the line it prints says what happened — `updated #N (pushed <sha>,
+# body from reports/<slug>.md)` — never `published`. A merged PR with no work outside trunk, or one
+# the guard cannot read, keeps the old answer: it prints what origin holds for the branch and
+# refuses when that is not the branch, because nothing was pushed there and a URL on its own would
+# read as a publish.
 #
 # What it carries from the report into the body: the Mission line (its label reduced to the bare
 # `Mission:` a body gate greps for, the text untouched), the `Now possible:` sentence when the report
@@ -146,7 +154,7 @@ stopped_unpushed() {
 usage() {
 	printf 'usage: %s <slug> [--cwd DIR]\n' "$prog"
 	printf '  body gate: make pr-check BODY=<report body> [BRANCH=<worker branch>] — BRANCH is passed only when a dry run shows the recipe expands it, because a gate that diffs a named branch cannot verify a checkout sitting on trunk otherwise.\n'
-	printf '  duplicate guard: gh pr list --state all for the branch before anything is pushed — open or already-merged stops the publish, closed is named.\n'
+	printf '  duplicate guard: gh pr list --state all for the branch before anything is pushed — an open PR gets the push and its body refreshed from the report, an already-merged one stops the publish, closed is named.\n'
 }
 slug=""
 lookup_cwd=""
@@ -534,14 +542,15 @@ pr_line=$(printf '%s' "$pr_list" | node -e '
 	a = a.filter(p => p && p.number);
 	a.sort((x, y) => ((rank[x.state] ?? 3) - (rank[y.state] ?? 3)) || (y.number - x.number));
 	if (a[0]) process.stdout.write(`${a[0].number}\t${a[0].state}\t${a[0].url}`);')
+open_pr=""
 if [ -n "$pr_line" ]; then
 	IFS=$'\t' read -r pr_number pr_state pr_url <<<"$pr_line"
 	case $pr_state in
 	OPEN)
-		note "#$pr_number is already open for $branch: $pr_url"
-		stopped_unpushed "#$pr_number is already open for $branch"
-		printf '%s\n' "$pr_url"
-		exit 0
+		# The destination, not a stop sign: this branch already has the place its commits go, so
+		# the push below is what reaches it and the body is refreshed from this worker's report.
+		note "#$pr_number is already open for $branch: $pr_url — updating it instead of opening a second PR"
+		open_pr=$pr_number
 		;;
 	MERGED)
 		ahead=$(new_commits "$cwd" "$trunk" "$branch")
@@ -568,22 +577,59 @@ fi
 # 8. Push the branch only. Never a force, never trunk — and never on the push's own word: the sha
 # being pushed is read first, origin is asked for the branch's head afterwards, and a mismatch is
 # a refusal, not a warning. A push that cannot be confirmed must not end in a PR URL.
-note "pushing $branch to origin"
+# An open PR makes the push the update rather than the upload, and a branch origin already holds
+# at exactly the commit the tree is at has nothing to send: finishing twice must not push a second
+# time, and the body edit is harmless when the file did not change, so the second run still
+# refreshes the description and still exits 0.
 pushed=$(local_head "$cwd" "$branch")
 [ -n "$pushed" ] || die "git cannot read the head of $branch in $cwd, so there is nothing to prove was pushed"
-if ! git -C "$cwd" push -u origin "$branch"; then
-	die "git push failed, so no pull request was opened"
+push_needed=1
+if [ -n "$open_pr" ]; then
+	if ! there=$(remote_head "$cwd" "$branch"); then
+		die "#$open_pr is open for $branch, but origin's head for it could not be read (git ls-remote failed), so this publish cannot tell whether the branch needs the push"
+	fi
+	if [ "$there" = "$pushed" ]; then
+		push_needed=""
+		note "origin/$branch is already at ${pushed:0:7}: nothing to push, refreshing #$open_pr's description"
+	else
+		note "pushing $branch to origin, into #$open_pr"
+	fi
+else
+	note "pushing $branch to origin"
 fi
-if ! there=$(remote_head "$cwd" "$branch"); then
-	die "$branch was pushed but its head could not be read back from origin (git ls-remote failed), so the push is unconfirmed — nothing was published"
+if [ -n "$push_needed" ]; then
+	if ! git -C "$cwd" push -u origin "$branch"; then
+		die "git push failed, so no pull request was opened"
+	fi
+	if ! there=$(remote_head "$cwd" "$branch"); then
+		die "$branch was pushed but its head could not be read back from origin (git ls-remote failed), so the push is unconfirmed — nothing was published"
+	fi
+	if [ -z "$there" ]; then
+		die "$branch was pushed but origin lists no branch of that name, so the push did not land — nothing was published"
+	fi
+	if [ "$there" != "$pushed" ]; then
+		die "the push reported success but origin/$branch is at ${there:0:7}, not ${pushed:0:7} (the commit just pushed), so nothing was published — the remote is not where this publish thinks it is"
+	fi
+	note "origin/$branch is at ${there:0:7}, the commit just pushed"
 fi
-if [ -z "$there" ]; then
-	die "$branch was pushed but origin lists no branch of that name, so the push did not land — nothing was published"
+
+# An open PR is refreshed, not duplicated: the body is built above by the same path a new PR's is,
+# so a report with no tier line was refused before this point and a body gate refused here before
+# the push. What is printed says what happened, because `published` is what made the stranded
+# commit invisible: the PR body is this command's output, and it has to be described as such.
+if [ -n "$open_pr" ]; then
+	if ! out=$(cd "$cwd" && gh pr edit "$open_pr" --body-file "$body" 2>&1); then
+		printf '%s\n' "$out" >&2
+		die "the branch reached origin/$branch but #$open_pr's description could not be refreshed (gh pr edit failed), so the pull request does not carry this report yet"
+	fi
+	if [ -n "$push_needed" ]; then
+		printf 'updated #%s (pushed %s, body from reports/%s.md)\n' "$open_pr" "${pushed:0:7}" "$slug"
+	else
+		printf 'updated #%s (no new commits, body from reports/%s.md)\n' "$open_pr" "$slug"
+	fi
+	printf '%s\n' "$pr_url"
+	exit 0
 fi
-if [ "$there" != "$pushed" ]; then
-	die "the push reported success but origin/$branch is at ${there:0:7}, not ${pushed:0:7} (the commit just pushed), so nothing was published — the remote is not where this publish thinks it is"
-fi
-note "origin/$branch is at ${there:0:7}, the commit just pushed"
 
 title=$(git -C "$cwd" log -1 --format=%s "$branch" 2>/dev/null || true)
 [ -n "$title" ] || title="Worker $slug"
