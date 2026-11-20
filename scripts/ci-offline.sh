@@ -10,11 +10,42 @@
 # no real systemd, no real state/ directory is touched. Guard is the one that could otherwise
 # create a real Herdr space, so herdr-app is stripped from PATH for every case.
 #
+# The cases that run one of this repo's own test scripts go through bin/receipts.sh, the ledger
+# `bin/preflight` writes: same tree, same script, same gates means the script already answered and
+# is not run again — the two gates exist for the same reason (no CI here), so the second one to ask
+# reads the first one's answer instead of paying for it again. Both directions work: a receipt this
+# writes is reused by `preflight --only suites`, and the last line says which happened —
+# `offline behaviour: ok (18 cached, 4 ran)`. A cached FAIL is still a FAIL.
+#
 #   bash scripts/ci-offline.sh      exit 0 = all behaviours held
+#   bash scripts/ci-offline.sh --fresh   ignore every receipt, empty the ledger, run every script
 set -uo pipefail
 
 root=$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)
 bin=$root/bin
+
+# shellcheck source=bin/receipts.sh
+. "$root/bin/receipts.sh"
+receipt_init "$root"
+fresh=0
+for arg in "$@"; do
+	case $arg in
+	--fresh) fresh=1 ;;
+	-h | --help)
+		printf 'usage: bash scripts/ci-offline.sh [--fresh]\n' >&2
+		printf '  --fresh  ignore every receipt, empty the ledger, run every script\n' >&2
+		exit 0
+		;;
+	*)
+		printf 'ci-offline: no such option: %s (usage: bash scripts/ci-offline.sh [--fresh])\n' "$arg" >&2
+		exit 2
+		;;
+	esac
+done
+if [ "$fresh" = 1 ]; then
+	receipt_forget
+	export PI_RECEIPT_FRESH=1
+fi
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -43,20 +74,63 @@ closed=http://127.0.0.1:9/api/chat
 fails=0
 pass() { printf '  ok    %s\n' "$*"; }
 fail() { printf '  FAIL  %s\n' "$*"; fails=$((fails + 1)); }
+cached=0
+script_ran=0
 
-# expect <name> <want-code> <want-text|-> -- <command...>
-expect() {
-	local name=$1 want=$2 text=$3
-	shift 4 # name, code, text, --
-	local out rc
-	out=$(timeout 30 "$@" 2>&1) && rc=0 || rc=$?
+# verdict <name> <want-code> <want-text|-> <rc> <out> [note] — the comparison every case makes,
+# shared by a case that ran and a case a receipt answered: a cached verdict is read exactly like a
+# fresh one, same exit code, same required text, same FAIL line.
+verdict() {
+	local name=$1 want=$2 text=$3 rc=$4 out=$5 note=${6:-}
+	[ -z "$note" ] || note=", $note"
 	if [ "$rc" != "$want" ]; then
 		fail "$name: exit $rc, wanted $want — $out"
 	elif [ "$text" != - ] && ! printf '%s' "$out" | grep -qF -- "$text"; then
 		fail "$name: no '$text' in output — $out"
 	else
-		pass "$name (exit $want)"
+		pass "$name (exit $want$note)"
 	fi
+}
+
+# expect <name> <want-code> <want-text|-> -- <command...> — a case that always runs: it costs a
+# process, not a suite.
+expect() {
+	local name=$1 want=$2 text=$3
+	shift 4 # name, code, text, --
+	local out rc
+	out=$(timeout 30 "$@" 2>&1) && rc=0 || rc=$?
+	verdict "$name" "$want" "$text" "$rc" "$out"
+}
+
+# expect_script <name> <want-code> <want-text|-> <repo-relative script> [args...] — a case that
+# runs one of this repo's own test scripts, through the ledger bin/preflight writes. The key is the
+# tree, the script and the gates (bin/receipts.sh), so a script that already answered on this tree
+# is not run again — and the reuse is symmetric: bin/preflight's `suites` check reads what this
+# writes, and this reads what the suites wrote. A cached FAIL is still a FAIL, printed with the
+# transcript that failed; --fresh bypasses the ledger and empties it.
+expect_script() {
+	local name=$1 want=$2 text=$3 rel=$4
+	shift 4
+	local key file out rc ms s e
+	key="script:$rel${*:+ $*}"
+	file=$work/transcript
+	if receipt_lookup "$key" "$file"; then
+		cached=$((cached + 1))
+		verdict "$name" "$want" "$text" "$RECEIPT_RC" "$(cat "$file" 2>/dev/null)" \
+			"cached $(receipt_age_human "$RECEIPT_AGE") from the run at $(receipt_stamp "$RECEIPT_TS")"
+		return 0
+	fi
+	s=$(date +%s%N)
+	# A script case runs a whole suite, and the slowest of them (test-preflight.sh) runs this gate
+	# itself, so its budget is wider than a single process's: the cap stops a hang, it is not a
+	# timed contest, and a run that shares the machine with three other suites must not lose it.
+	out=$(timeout 120 bash "$root/$rel" "$@" 2>&1) && rc=0 || rc=$?
+	e=$(date +%s%N)
+	ms=$(((e - s) / 1000000))
+	script_ran=$((script_ran + 1))
+	printf '%s' "$out" >"$file"
+	receipt_write "$key" "$rc" "$ms" "$file"
+	verdict "$name" "$want" "$text" "$rc" "$out"
 }
 
 # 1. The model client: an unreachable model is exit 3 and says so. Exit 3 is the whole point
@@ -125,118 +199,103 @@ expect "delegate list, empty temp root" 0 "no workers" -- \
 # 5b. The close guard reads prose, not pasted output. It has its own script because every case
 #     drives a real `delegate close` against its own temporary root; running it here is what
 #     keeps those cases in CI without a second workflow step.
-expect "placeholder scan over fenced reports" 0 "placeholder scan: ok" -- \
-	bash "$root/scripts/test-placeholders.sh"
+expect_script "placeholder scan over fenced reports" 0 "placeholder scan: ok" scripts/test-placeholders.sh
 # 5c. The wipe step between features: five checklist lines, a loud refusal on an unknown slug,
 #     and a skip recorded with its reason in state/decisions.jsonl. Same pattern, same reason
 #     for a separate script: each case needs its own temporary root and a stub herdr-app.
-expect "wipe checklist, refusal and skip log" 0 "wipe: ok" -- \
-	bash "$root/scripts/test-wipe.sh"
+expect_script "wipe checklist, refusal and skip log" 0 "wipe: ok" scripts/test-wipe.sh
 # 5d. Provenance (Radar blips 79 and 82): a report's commit sha has to carry an Agent-Slug trailer
 #     before the close goes through, a wiped spec moves into specs/archive/, and the spawn template
 #     names both the archive and the trailers. Same pattern: the script owns a throwaway git repo
 #     and a temporary root, so nothing here touches the real workspace.
-expect "provenance trailers, spec archive and PR template" 0 "provenance: ok" -- \
-	bash "$root/scripts/test-provenance.sh"
+expect_script "provenance trailers, spec archive and PR template" 0 "provenance: ok" scripts/test-provenance.sh
 # 5e. Spawn speed and count: one jev call per spawn, N spaces for a count of N, in-flight blocking
 #     on the paths a report actually touched, and the Evidence scaffold in the generated spec. Its
 #     own script because it needs a fake ollama, real git branches and a stub herdr-app at once.
-expect "spawn plan, worker count, path blocking and evidence scaffold" 0 "spawn speed: ok" -- \
-	bash "$root/scripts/test-spawn-speed.sh"
+expect_script "spawn plan, worker count, path blocking and evidence scaffold" 0 "spawn speed: ok" scripts/test-spawn-speed.sh
 # 5f. The guard's repair path (Radar blip 20): a stale tab is resumed from its resume entry when
 #     it has one, and only opened fresh when it never held pi — or when the resume did not start
 #     pi. Fake herdr-app, fake resume map, fake resume script; no desktop app, no session, no
 #     real space.
-expect "guard resumes before it reopens a tab" 0 "guard-resume: ok" -- \
-	bash "$root/scripts/test-guard-resume.sh"
+expect_script "guard resumes before it reopens a tab" 0 "guard-resume: ok" scripts/test-guard-resume.sh
 # 5f2. The same guard under Git Bash on Windows, which is the only thing that creates the space
 #      there: a simulated msys shell, a stub herdr-app that records the exact argv it received,
 #      so --folder is native and --argv keeps the POSIX path a `sh -lc` line needs, plus a
 #      missing hc, a root with a space, the state file written once, and the POSIX shape as it was.
-expect "guard creates the space with the argv Windows can read" 0 "guard-windows: ok" -- \
-	bash "$root/scripts/test-guard-windows.sh"
+expect_script "guard creates the space with the argv Windows can read" 0 "guard-windows: ok" scripts/test-guard-windows.sh
 # 5g. Typed decisions: jev asks TypeSafe one question (four for a plan) and acts on the
 #     probability; a low-probability field, an unoffered option, a 401, a timeout, a malformed
 #     body and a missing key are all exit 3, and the API key never reaches stdout or stderr. A
 #     fake System One endpoint on a loopback port, so no key, no network, no real decision model.
-expect "typed decisions, probabilities and a key that stays secret" 0 "jev/typesafe: ok" -- \
-	bash "$root/scripts/tests/test-jev-typesafe.sh"
+expect_script "typed decisions, probabilities and a key that stays secret" 0 "jev/typesafe: ok" scripts/tests/test-jev-typesafe.sh
 # 5h. The boss's tail in one command (Radar blip 20): publish, wipe and close run in that order,
 #     each keeps its own gate, and a failure stops at the step that failed with the state named. Its
 #     own script because it needs a fake `publish` on PATH and a fake herdr-app at once, and reads
 #     the decisions log and the delegation entry rather than the command's own output.
-expect "delegate finish publishes, wipes and closes in order" 0 "finish: ok" -- \
-	bash "$root/scripts/tests/test-finish.sh"
+expect_script "delegate finish publishes, wipes and closes in order" 0 "finish: ok" scripts/tests/test-finish.sh
 # 5i. The local copy of this workflow's four jobs (scripts/ci-local.sh): a planted syntax error
 #     and an AGENTS.md over budget exit non-zero with the file named, an absent shellcheck says
 #     SKIPPED instead of reading as a pass, and a clean tree passes. Its own suite of throwaway
 #     checkouts; it only ever asks ci-local for the jobs that cannot recurse back into here.
-expect "ci-local: four jobs, planted failures, no silent skip" 0 "ci-local: ok" -- \
-	bash "$root/scripts/tests/test-ci-local.sh"
+expect_script "ci-local: four jobs, planted failures, no silent skip" 0 "ci-local: ok" scripts/tests/test-ci-local.sh
 # 5j. Dead refs and two proofs before anything is deleted: a branch merged into trunk and a
 #     squash-merged branch go (the second is not an ancestor, so ancestry alone would keep it); an
 #     unpushed commit, a partially merged branch, an open PR and the current branch stay with their
 #     reason; a worktree whose directory is gone is pruned while the live one stays; and `--apply`
 #     without `--yes` on a non-interactive stdin refuses with exit 2. Throwaway repos with a bare
 #     origin and a stub gh, so no real branch and no network.
-expect "prune-refs: two proofs, a stub gh and a second yes" 0 "prune-refs: ok" -- \
-	bash "$root/scripts/tests/test-prune-refs.sh"
+expect_script "prune-refs: two proofs, a stub gh and a second yes" 0 "prune-refs: ok" scripts/tests/test-prune-refs.sh
 # 5k. A worker that legitimately landed nothing: `close --nothing` takes a 20-character reason, still
 #     wants an Evidence block, refuses a report that names a sha, and still runs the wipe step. Same
 #     shape as the others: throwaway repo, stub herdr-app, temporary root.
-expect "close --nothing: reason, evidence, and no sha" 0 "nothing: ok" -- \
-	bash "$root/scripts/test-nothing.sh"
+expect_script "close --nothing: reason, evidence, and no sha" 0 "nothing: ok" scripts/test-nothing.sh
 # 5l. `bin/publish` is what the boss runs on every finished worker, and nothing else in this script
 #     reaches it. Its fake `git` and `gh` log every call, so the cases read what the command did —
 #     no network and no gh auth are involved, which is why this one needs no gate: it runs the same
 #     on a fresh clone.
-expect "publish: refusals, body gates and the push it reports" 0 "test-publish: ok" -- \
-	bash "$root/scripts/tests/test-publish.sh"
+expect_script "publish: refusals, body gates and the push it reports" 0 "test-publish: ok" scripts/tests/test-publish.sh
 # 5l2. The push a rebase breaks: a branch whose own history was rewritten (the shape `preflight`'s
 #     `behind` check asks for) is re-pushed under a lease that names the sha it expects, and a
 #     branch origin holds somebody else's commit on is refused with that commit named. Real pushes
 #     into a throwaway bare origin and a logged git argv, so the flags are read from the log.
-expect "publish: a rewritten branch is leased, a foreign commit refuses" 0 "publish force: ok" -- \
-	bash "$root/scripts/test-publish-force.sh"
+expect_script "publish: a rewritten branch is leased, a foreign commit refuses" 0 "publish force: ok" scripts/test-publish-force.sh
 # 5l3. The verdict a publish prints is the pull request's answer, not its own: a push origin does not
 #     take fails naming both shas, a push GitHub has not caught up with fails too, a branch origin
 #     already holds says `nothing new to push` and never `published`, and a branch neither the
 #     delegation record nor the `Agent-Slug:` trailer names is refused before `git push` is called.
 #     Real pushes into a throwaway bare origin, a logged git argv and a stub gh, so no network.
-expect "publish: the verdict is read back from the pull request" 0 "publish verdict: ok" -- \
-	bash "$root/scripts/test-publish-verdict.sh"
+expect_script "publish: the verdict is read back from the pull request" 0 "publish verdict: ok" scripts/test-publish-verdict.sh
 # 5m. Which sha a close reads, when a report names more than one. A report quotes another branch's
 #     commit as evidence, and the reader used to take the first one it found and refuse over a sha
 #     the worker does not own. Its own script because the answer depends on three commits in one
 #     throwaway repo and on the trailer each of them carries.
-expect "close reads the sha that belongs to this worker" 0 "close-provenance: ok" -- \
-	bash "$root/scripts/tests/test-close-provenance.sh"
+expect_script "close reads the sha that belongs to this worker" 0 "close-provenance: ok" scripts/tests/test-close-provenance.sh
 # 5n. The gate before the publish (bin/preflight): a syntax error, a semgrep finding and a test that
 #     needs the developer's PATH each stop `delegate finish` before the push; a docs-only diff takes
 #     the fast path and still refuses a bad tier; --skip-preflight publishes and records its reason.
 #     Throwaway repos with a bare origin and stub gh/herdr-app, so nothing is pushed and no PR exists.
-expect "preflight: the checks CI would run, before the push" 0 "preflight: ok" -- \
-	bash "$root/scripts/tests/test-preflight.sh"
+expect_script "preflight: the checks CI would run, before the push" 0 "preflight: ok" scripts/tests/test-preflight.sh
+# The ledger the two gates above share: what one writes the other reads, keyed by the tree, the
+# script and the gates' own bytes, with a cached FAIL still blocking. It builds its own throwaway
+# checkouts and stubs every script in this list, so it costs fixtures, not suites — and so it does
+# not recurse into itself.
+expect_script "receipts: one ledger, two gates, no re-run" 0 "receipts: ok" scripts/tests/test-receipts.sh
 # 5o. No tracked file carries an absolute home directory (the one bug that gave a Windows machine
 #     five symptoms), and the three worker wrappers find pi the same way on every platform: $PI_BIN,
 #     PATH, $PNPM_HOME, $HOME, %APPDATA% — with bin/pi-sandboxed refusing on native Windows instead
 #     of running bare. Both are sweeps over this tree, so they need nothing but the tree.
-expect "no tracked file carries a home directory" 0 "no-hardcoded-home: ok" -- \
-	bash "$root/scripts/tests/test-no-hardcoded-home.sh"
-expect "pi resolution order, wrappers and the Windows refusal" 0 "pi-resolve: ok" -- \
-	bash "$root/scripts/tests/test-pi-resolve.sh"
+expect_script "no tracked file carries a home directory" 0 "no-hardcoded-home: ok" scripts/tests/test-no-hardcoded-home.sh
+expect_script "pi resolution order, wrappers and the Windows refusal" 0 "pi-resolve: ok" scripts/tests/test-pi-resolve.sh
 # 5o2. Which bash runs a bin/ entry point (bin/shell-resolve.sh): run by dash it re-execs under a
 #      bash it found with the argv untouched, a PATH with no bash at all is one line and exit 127
 #      instead of a half-run command, PI_GIT_BASH wins over a bash on PATH, a %ProgramFiles% fixture
 #      is chosen when nothing is on PATH, and a run that is already bash resolves nothing at all.
 #      Its own script because every case needs a throwaway copy of bin/ and its own stripped PATH.
-expect "bash is resolved at runtime, or the run stops with a reason" 0 "shell-resolve: ok" -- \
-	bash "$root/scripts/tests/test-shell-resolve.sh"
+expect_script "bash is resolved at runtime, or the run stops with a reason" 0 "shell-resolve: ok" scripts/tests/test-shell-resolve.sh
 # 5p. One failed guard pass is one pass: a refused space.new or a tab that cannot be opened is
 #     logged and the next interval tries again, in the same process, so the space still comes back
 #     after it is closed. One stub herdr-app, one real guard process per case.
-expect "the guard survives a failed iteration" 0 "guard-iteration: ok" -- \
-	bash "$root/scripts/tests/test-guard-iteration.sh"
+expect_script "the guard survives a failed iteration" 0 "guard-iteration: ok" scripts/tests/test-guard-iteration.sh
 
 # 6. Routing is a refusal, not a warning. delegate reads jev from $PI_BOSS_ROOT/bin, so a
 #    fake jev there answers route=local without a model and without touching the real tree.
@@ -550,15 +609,12 @@ expect "delegate close, no wipe step recorded" 1 "no wipe step recorded" -- \
 expect "delegate wipe, no slug" 1 "usage: delegate wipe" -- \
 	env PI_BOSS_ROOT=$wipe_root "$bin/delegate" wipe
 
-expect "futures panel: thrown away, cycles, evidence" 0 "futures stats: ok" -- \
-	bash "$root/scripts/test-futures-stats.sh"
-expect "acceptance mode, flag, generated spec and recorded mode" 0 "acceptance mode: ok" -- \
-	bash "$root/scripts/test-acceptance.sh"
+expect_script "futures panel: thrown away, cycles, evidence" 0 "futures stats: ok" scripts/test-futures-stats.sh
+expect_script "acceptance mode, flag, generated spec and recorded mode" 0 "acceptance mode: ok" scripts/test-acceptance.sh
 # 9. An open PR for the branch is the destination, not a stop sign: a second worker's commit is
 #    pushed into it and the description is rebuilt from that worker's report, in that order. Its own
 #    script because every case needs a real bare origin to push into and a gh that records its argv.
-expect "an open PR gets the push and the refreshed body" 0 "open PR update: ok" -- \
-	bash "$root/scripts/test-open-pr-update.sh"
+expect_script "an open PR gets the push and the refreshed body" 0 "open PR update: ok" scripts/test-open-pr-update.sh
 
-printf '\n%s\n' "$([ "$fails" = 0 ] && echo "offline behaviour: ok" || echo "offline behaviour: $fails failure(s)")"
+printf '\n%s\n' "$([ "$fails" = 0 ] && echo "offline behaviour: ok ($cached cached, $script_ran ran)" || echo "offline behaviour: $fails failure(s) ($cached cached, $script_ran ran)")"
 [ "$fails" = 0 ]

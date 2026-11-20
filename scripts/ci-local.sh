@@ -11,7 +11,18 @@
 #
 #   bash scripts/ci-local.sh                    all four jobs, exit 0 only when all pass
 #   bash scripts/ci-local.sh --only lint        one job (repeatable, or comma-separated)
+#   bash scripts/ci-local.sh --fresh            ignore every receipt, empty the ledger
 #   bash scripts/ci-local.sh --list             the four job names, nothing run
+#
+# The `offline` job is the expensive one: it runs the repo's own test scripts. Those go through
+# bin/receipts.sh, the ledger `bin/preflight` writes, so a script already answered on this tree is
+# read instead of run — in either direction, since `preflight`'s `suites` check reads what this
+# wrote. The job's line carries the split, and so does the summary:
+#
+#   pass offline behaviour (no ollama, no herdr-app)    offline behaviour: ok (20 cached, 2 ran)
+#   ci-local: 4/4 passed at commit abc1234 (main); offline: 20 cached, 2 ran
+#
+# --fresh bypasses the ledger and empties it, so the next run cannot reuse what this one refused to.
 #
 # No colour, no progress bars: the output is meant to be pasted into a report.
 set -uo pipefail
@@ -20,6 +31,8 @@ root=$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)
 cd -- "$root" || exit 1
 
 agents_md_limit=${AGENTS_MD_LIMIT:-8192}
+fresh=0
+offline_split=""
 
 # The same two lists the workflow builds. Kept here, deliberately, in one place.
 bash_files() { git ls-files 'bin/*' 'scripts/*.sh' ':!bin/*.mjs'; }
@@ -76,18 +89,23 @@ job_lint() {
 # --- job: offline behaviour (no ollama, no herdr-app) ------------------------------------------
 
 job_offline() {
-	local out rc
+	local out rc last
+	local -a extra=()
+	# Only an explicit --fresh is forwarded: `fresh=0` is a set variable, and a bare `${fresh:+…}`
+	# would have handed the offline suite --fresh on every ordinary run.
+	[ "$fresh" = 1 ] && extra=(--fresh)
 	if [ ! -f scripts/ci-offline.sh ]; then
 		printf 'scripts/ci-offline.sh is missing\n'
 		return 1
 	fi
-	out=$(bash scripts/ci-offline.sh 2>&1)
+	out=$(bash scripts/ci-offline.sh ${extra[@]+"${extra[@]}"} 2>&1)
 	rc=$?
+	last=$(printf '%s\n' "$out" | tail -n 1)
 	if [ "$rc" != 0 ]; then
 		printf '%s\n' "$out" | grep -E '^  FAIL|failure' | first_lines 12
 		[ -n "$out" ] && printf 'last lines:\n%s\n' "$(printf '%s\n' "$out" | tail -n 5 | sed 's/^/    /')"
 	else
-		printf '%s\n' "$out" | tail -n 1
+		printf '%s\n' "$last"
 	fi
 	return $rc
 }
@@ -135,7 +153,7 @@ resolve() {
 }
 
 usage() {
-	printf 'usage: bash scripts/ci-local.sh [--only JOB]... [--list]\n' >&2
+	printf 'usage: bash scripts/ci-local.sh [--only JOB]... [--fresh] [--list]\n' >&2
 	printf 'jobs: %s\n' "${job_ids[*]}" >&2
 	exit 2
 }
@@ -172,6 +190,7 @@ while [ $# -gt 0 ]; do
 		done
 		shift
 		;;
+	--fresh) fresh=1; shift ;;
 	-h | --help) usage ;;
 	*) usage ;;
 	esac
@@ -187,6 +206,12 @@ for id in "${selected[@]}"; do
 	ran=$((ran + 1))
 	out=$(job_"$id" 2>&1)
 	rc=$?
+	# What the ledger answered and what it did not, read off ci-offline's own last line — the job
+	# runs in a subshell here, so the split is parsed here and the summary repeats it: a warm run
+	# must not read as a full one.
+	case $id in
+	offline) offline_split=$(printf '%s' "$out" | sed -nE 's/.*\(([0-9]+ cached, [0-9]+ ran)\).*/\1/p') ;;
+	esac
 	if [ "$rc" = 0 ]; then
 		verdict=pass
 		detail=$out
@@ -206,5 +231,5 @@ done
 
 sha=$(git rev-parse --short HEAD 2>/dev/null || printf 'unknown')
 branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || printf 'unknown')
-printf '\n%s\n' "ci-local: $((ran - fails))/$ran passed at commit $sha ($branch)"
+printf '\n%s\n' "ci-local: $((ran - fails))/$ran passed at commit $sha ($branch)${offline_split:+; offline: $offline_split}"
 [ "$fails" = 0 ]

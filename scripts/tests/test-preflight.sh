@@ -936,15 +936,21 @@ else
 	pass "an unstaged edit to a tracked file invalidates the receipt"
 fi
 
-# L3. A changed check set invalidates: the same tree under a different set is a different run.
+# L3. A changed check set invalidates the check's own verdict: the same tree under a different set
+# is a different run, and the old summary is not reused for it. The suites that run inside it may
+# still answer from the shared ledger bin/receipts.sh keeps — one test script's verdict is the
+# same whoever asked for it, which is the point of the sharing — so what is pinned here is the
+# check: it ran again, and it says so in its own summary.
 : >"$CASE/suite.log"
 run env SUITE_LOG="$CASE/suite.log" "$pf" --only suites,syntax --cwd "$REPO" feat/w1
 if [ "$RC" != 0 ]; then
 	fail "a two-check run failed: exit $RC — $OUT"
-elif [ "$(suite_runs)" != 1 ] || said "pass (cached"; then
-	fail "a different check set reused the old receipt ($(suite_runs) suite run(s)) — $OUT"
+elif said "pass (cached"; then
+	fail "a different check set reused the old verdict — $OUT"
+elif ! said "(0 cached, 2 ran)"; then
+	fail "a different check set did not re-run both checks — $OUT"
 else
-	pass "a changed check set invalidates the receipt"
+	pass "a changed check set invalidates the check's own verdict and re-runs it"
 fi
 
 # L4. A changed bin/preflight is a changed gate: the verdict an older gate reached is not its.

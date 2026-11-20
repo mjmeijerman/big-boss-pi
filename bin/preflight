@@ -53,7 +53,7 @@
 #   bin/preflight --list                      the six check names, nothing run
 #   bin/preflight --only semgrep feat/x       one check, on that branch
 #   bin/preflight --slug w1                   the branch and body of worker w1
-#   bin/preflight --fresh --slug w1           run everything, ignore every receipt
+#   bin/preflight --fresh --slug w1           run everything, forget this tree's receipts
 #
 # The same tree is checked twice per publish — the worker checks it to paste the Evidence block, then
 # `delegate finish` checks it again before it pushes — and neither run is redundant: the second is
@@ -65,8 +65,9 @@
 #   pass  suites (the repo's own tests)           12s  pass (cached 4m from the run at 2026-11-20T09:58:11Z)
 #
 # A cached FAIL still blocks and still shows the transcript that failed. --fresh ignores every
-# receipt, PI_PREFLIGHT_CACHE_TTL (default 6h, 0 disables) expires them, and a check a fast path
-# skipped writes none: a skip is not a verdict to reuse. `behind` is never cached either: its answer
+# receipt and empties the ledger, so the gate that runs next cannot reuse the verdict this run
+# refused to reuse. PI_PREFLIGHT_CACHE_TTL (default 6h, 0 disables) expires receipts, and a check a
+# fast path skipped writes none: a skip is not a verdict to reuse. `behind` is never cached either: its answer
 # is about origin, which moves without this tree moving, and a remembered pass there is exactly the
 # CONFLICTING publish it exists to stop. It is one quiet fetch, so it runs every time.
 #
@@ -125,8 +126,22 @@ want_cmd() { command -v "$1" >/dev/null 2>&1; }
 # report the body is built from (reports/<slug>.md, outside the checkout) and the environment the
 # target repo's own gate reads. Both are cheap to hash, and they stop the one staleness that could
 # publish a body nobody would send.
+# The body check adds the two inputs its verdict really comes from and no tree hash can see: the
+# report the body is built from (reports/<slug>.md, outside the checkout) and the environment the
+# target repo's own gate reads. Both are cheap to hash, and they stop the one staleness that could
+# publish a body nobody would send.
+#
+# The ledger itself is bin/receipts.sh, shared with `scripts/ci-local.sh` and `scripts/ci-offline.sh`:
+# the suites below are the same test scripts those two run, so each suite is asked for by the same
+# (tree, script, gate) key from both sides and its answer is kept once — a test script ci-offline
+# ran is not run here, and one this check ran is not run there. PI_RECEIPT_DIR is the handle a
+# caller pins it with; this file exports it to every suite it starts, so a gate that runs inside
+# this one (ci-local, and ci-offline inside that) writes exactly where this run reads.
+# shellcheck source=bin/receipts.sh
+. "$self_root/bin/receipts.sh"
 PF_CACHE_DIR=$ROOT/state/preflight
 PF_CACHE_VERSION=""
+export PI_RECEIPT_DIR=$PF_CACHE_DIR
 
 pf_sha() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
 
@@ -580,16 +595,35 @@ pf_suite_units() {
 # suite with its own elapsed time, the wall clock, and every failure's own tail at the end. Nothing
 # interleaves because nothing shares a stream: each unit writes its own log.
 pf_run_units() {
-	local n=${#PF_UNIT_CMD[@]} i=0 j=0 idx pid rc ms fails=0 dir started ended
-	local -a pids=() unit_rc=() unit_ms=()
+	local n=${#PF_UNIT_CMD[@]} i=0 j=0 idx pid rc ms fails=0 dir started ended cached=0 note
+	local -a pids=() unit_rc=() unit_ms=() unit_cached=() unit_ts=() unit_name=()
 	dir=$PREFLIGHT_TMP/units
 	mkdir -p "$dir"
+	# Every unit is asked for by name before anything is launched: a suite that already answered
+	# on this tree, under these gates, answers again from its receipt and is never started. That is
+	# the shared half — a test script ci-offline ran is not run here, and one this check ran is not
+	# run there — and the line under it says where the answer came from.
+	for ((i = 0; i < n; i++)); do
+		unit_name[i]=$(receipt_unit_name "${PF_UNIT_CMD[i]}")
+		unit_cached[i]=""
+		if receipt_lookup "${unit_name[i]}" "$dir/$i.log"; then
+			unit_rc[i]=$RECEIPT_RC
+			unit_ms[i]=$RECEIPT_MS
+			unit_cached[i]=$RECEIPT_AGE
+			unit_ts[i]=$RECEIPT_TS
+			printf '%s %s\n' "$RECEIPT_RC" "$RECEIPT_MS" >"$dir/$i.status"
+			cached=$((cached + 1))
+		fi
+	done
 	started=$(date +%s%N)
+	i=0
 	while [ "$i" -lt "$n" ]; do
 		pids=()
 		j=0
 		while [ "$j" -lt "$PF_JOBS" ] && [ "$i" -lt "$n" ]; do
 			idx=$i
+			i=$((i + 1))
+			[ -z "${unit_cached[$idx]}" ] || continue
 			(
 				local s e r
 				s=$(date +%s%N)
@@ -599,7 +633,6 @@ pf_run_units() {
 				printf '%s %s\n' "$r" "$(((e - s) / 1000000))" >"$dir/$idx.status"
 			) &
 			pids+=($!)
-			i=$((i + 1))
 			j=$((j + 1))
 		done
 		for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
@@ -611,15 +644,22 @@ pf_run_units() {
 		[ -f "$dir/$i.status" ] && read -r rc ms <"$dir/$i.status"
 		unit_rc[i]=$rc
 		unit_ms[i]=$ms
+		# A verdict reached here is one the other gate may reuse — a failure too, stored as it is
+		# and never read back as anything else.
+		[ -n "${unit_cached[$i]}" ] || [ ! -f "$dir/$i.status" ] ||
+			receipt_write "${unit_name[$i]}" "$rc" "$ms" "$dir/$i.log"
 	done
-	printf '%s: %d suite(s) discovered, %d ran once each, wall %ss (at most %s at a time)\n' \
-		"$PF_SHAPE_NAME" "$n" "$n" "$(((ended - started) / 1000000000))" "$PF_JOBS"
+	printf '%s: %d suite(s) discovered, %d ran once each, %d from receipts, wall %ss (at most %s at a time)\n' \
+		"$PF_SHAPE_NAME" "$n" "$((n - cached))" "$cached" "$(((ended - started) / 1000000000))" "$PF_JOBS"
 	for ((i = 0; i < n; i++)); do
+		note=""
+		[ -z "${unit_cached[$i]}" ] ||
+			note=" (cached $(pf_age_human "${unit_cached[$i]}") from the run at $(date -u -d "@${unit_ts[$i]}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'ts %s' "${unit_ts[$i]}"))"
 		if [ "${unit_rc[i]}" = 0 ]; then
-			printf '%-58s %5ss  ok\n' "${PF_UNIT_NAME[i]}" "$((unit_ms[i] / 1000))"
+			printf '%-58s %5ss  ok%s\n' "${PF_UNIT_NAME[i]}" "$((unit_ms[i] / 1000))" "$note"
 		else
 			fails=$((fails + 1))
-			printf '%-58s %5ss  FAILED (exit %s)\n' "${PF_UNIT_NAME[i]}" "$((unit_ms[i] / 1000))" "${unit_rc[i]}"
+			printf '%-58s %5ss  FAILED (exit %s)%s\n' "${PF_UNIT_NAME[i]}" "$((unit_ms[i] / 1000))" "${unit_rc[i]}" "$note"
 		fi
 	done
 	[ "$fails" = 0 ] && return 0
@@ -1089,6 +1129,13 @@ preflight_main() {
 	*) PF_SHAPE_NAME="a checkout with no suite" ;;
 	esac
 	pf_collect "$cwd" "$branch"
+	# The ledger's handle is already exported above: receipt_init keeps it and takes the tree hash
+	# from the checkout being checked, not from the tree this program sits in.
+	receipt_init "$cwd"
+	if [ "$fresh" = 1 ]; then
+		receipt_forget
+		export PI_RECEIPT_FRESH=1
+	fi
 
 	if [ "${#selected[@]}" -eq 0 ]; then
 		selected=("${preflight_ids[@]}")
