@@ -41,6 +41,10 @@
 #      skip the summary counts — never by feeding a .ts file to bash -n, and never green on the
 #      strength of a skip while another file in the same run really failed.
 #
+#   N. the mutation check: opt-in, the CI job's own changed-line scope, a verdict from the script's
+#      exit code and never from a score line, a named skip for each of the three reasons it cannot
+#      run, a FAIL that blocks, and a receipt that makes the second run free.
+#
 #   bash scripts/tests/test-preflight.sh      exit 0 = every case held
 set -uo pipefail
 
@@ -1158,6 +1162,148 @@ else
 fi
 
 unset SUITE_LOG
+
+# --- N. mutation: opt-in, the CI job's scope, and never a pass that did not run -------------------
+
+# The seventh check exists because a red CI round on the changed-line stryker job (75.34 under a
+# break of 100) was the first time those survivors were visible to anyone. What is pinned here is
+# the shape the cost demands: not in the default set, never silent when it is skipped, the exit
+# code and nothing else as the verdict, and a receipt so a publish's second run is free.
+mutation_repo() { # a pi-shaped checkout with a mutant host, a stryker config and the range rule
+	mkdir -p "$REPO/agent/extensions/lib" "$REPO/scripts"
+	printf '{ "mutate": ["extensions/**/*.ts"], "thresholds": { "break": 100 } }\n' >"$REPO/agent/stryker.conf.json"
+	printf 'export const twice = (n: number): number => n * 2;\n' >"$REPO/agent/extensions/lib/double.ts"
+	cat >"$REPO/scripts/mutate-changed.sh" <<'SH'
+#!/usr/bin/env bash
+[ -z "${MUTATE_LOG:-}" ] || printf 'ran\n' >>"$MUTATE_LOG"
+printf '== mutate-changed: 1 added range(s) against origin/main\n'
+printf '   agent/extensions/lib/double.ts:1-1\n'
+printf 'Mutation score based on covered code: %s\n' "${MUTATE_SCORE:-100.00}"
+exit "${MUTATE_RC:-0}"
+SH
+	chmod +x "$REPO/scripts/mutate-changed.sh"
+	: >"$CASE/mutate.log"
+}
+mutate_runs() { wc -l <"$CASE/mutate.log" 2>/dev/null | tr -d ' '; }
+
+# N1. `--list` names it: an opt-in check that is not listed is a check nobody finds.
+reset_case mutation-list
+run "$pf" --list
+if [ "$RC" != 0 ]; then
+	fail "--list failed: exit $RC — $OUT"
+elif ! printf '%s\n' "$OUT" | grep -qE '^mutation[[:space:]]'; then
+	fail "--list does not name the mutation check — $OUT"
+else
+	pass "--list names the mutation check"
+fi
+
+# N2. The default run prints it as a named skip and pays nothing for it — the whole point of opt-in.
+reset_case mutation-default
+reset_cache
+printf 'the trunk\n\nOne more paragraph of documentation.\n' >"$REPO/README.md"
+commit_branch "docs: one more paragraph"
+run "$pf" --cwd "$REPO" feat/w1
+if [ "$RC" != 0 ]; then
+	fail "a docs-only default run failed: exit $RC — $OUT"
+elif ! said "not requested (--only mutation) — the CI job mutates the changed lines and breaks at 100"; then
+	fail "the default run does not name the mutation skip — $OUT"
+elif ! printf '%s\n' "$OUT" | grep -qE '^skip +mutation'; then
+	fail "the mutation skip is not printed as a skip line of its own — $OUT"
+else
+	pass "the default run prints mutation as a named skip, and runs nothing"
+fi
+
+# N3. `--only mutation` on a diff with no extension file is a named skip, not a FAIL and not a pass.
+reset_case mutation-no-scope-in-diff
+reset_cache
+mkdir -p "$REPO/scripts"
+printf '#!/usr/bin/env bash\nprintf "ok\\n"\n' >"$REPO/scripts/tool.sh"
+commit_branch "feat(scripts): a shell-only diff"
+run "$pf" --only mutation --cwd "$REPO" feat/w1
+if [ "$RC" != 0 ]; then
+	fail "a diff with no extension file failed the mutation check: exit $RC — $OUT"
+elif ! said "no changed agent/extensions/**/*.ts"; then
+	fail "the mutation skip does not name the reason — $OUT"
+else
+	pass "--only mutation on a diff with no agent/extensions file is a named skip"
+fi
+
+# N4. A stub that exits 1 makes the check FAIL, blocks the run, and its verdict is the exit code —
+# the score line it prints is a display and changes nothing.
+reset_case mutation-fails
+reset_cache
+mutation_repo
+commit_branch "feat(agent): a changed extension line"
+run env MUTATE_RC=1 MUTATE_SCORE=75.34 MUTATE_LOG="$CASE/mutate.log" "$pf" --only mutation --cwd "$REPO" feat/w1
+if [ "$RC" = 0 ]; then
+	fail "a failing mutate-changed.sh passed the gate, so the check cannot block anything — $OUT"
+elif ! said "FAIL"; then
+	fail "the runner is not shown as a FAIL — $OUT"
+elif ! said "mutate-changed.sh exited 1"; then
+	fail "the FAIL does not name the exit code as its verdict — $OUT"
+elif ! said "Mutation score based on covered code: 75.34"; then
+	fail "the script's transcript is not shown under the FAIL — $OUT"
+elif [ "$(mutate_runs)" != 1 ]; then
+	fail "the range rule ran $(mutate_runs) time(s) in one check, wanted once"
+else
+	pass "a survivor makes the mutation check FAIL and blocks the run, on the script's exit code"
+fi
+
+# N5. The second run on an unchanged tree is free: that receipt is what makes a minutes-long check
+# affordable inside a pre-publish gate.
+reset_case mutation-cached
+reset_cache
+mutation_repo
+commit_branch "feat(agent): a killed extension line"
+run env MUTATE_RC=0 MUTATE_LOG="$CASE/mutate.log" "$pf" --only mutation --cwd "$REPO" feat/w1
+first_rc=$RC
+first_runs=$(mutate_runs)
+run env MUTATE_RC=0 MUTATE_LOG="$CASE/mutate.log" "$pf" --only mutation --cwd "$REPO" feat/w1
+if [ "$first_rc" != 0 ] || [ "$RC" != 0 ]; then
+	fail "a passing mutation run failed: exit $first_rc then $RC — $OUT"
+elif [ "$first_runs" != 1 ]; then
+	fail "the first run invoked the range rule $first_runs time(s), wanted once"
+elif [ "$(mutate_runs)" != 1 ]; then
+	fail "the second run did the work again ($(mutate_runs) invocations): no receipt was reused"
+elif ! said "pass (cached"; then
+	fail "the second run does not say the verdict was cached — $OUT"
+else
+	pass "a second mutation run on an unchanged tree reuses the receipt and runs nothing"
+fi
+
+# N6. A checkout with no range rule or no stryker config has no mutation scope: a named skip, never
+# a pass. This is the big-boss-pi shape, where there is no stryker at all.
+reset_case mutation-no-tooling
+reset_cache
+mkdir -p "$REPO/agent/extensions"
+printf 'export const ok: string = "fine";\n' >"$REPO/agent/extensions/tool.ts"
+commit_branch "feat(agent): an extension file, in a checkout with no stryker"
+run "$pf" --only mutation --cwd "$REPO" feat/w1
+if [ "$RC" != 0 ]; then
+	fail "a checkout with no stryker failed instead of skipping: exit $RC — $OUT"
+elif ! said "no mutation scope in this checkout"; then
+	fail "the missing tooling is not named — $OUT"
+else
+	pass "a checkout with no stryker skips the mutation check by name"
+fi
+
+# N7. A pass is only worth something when the script can fail. pi's own stryker config sets
+# `break: null` on purpose (the weekly whole-file run has no threshold) and the pull-request job
+# writes its own break-100 config, so `mutate-changed.sh` there exits 0 with survivors — measured:
+# 7 survivors, exit 0. A pass in that checkout says so out loud instead of reading as "no survivor".
+reset_case mutation-no-break
+reset_cache
+mutation_repo
+printf '{ "mutate": ["extensions/**/*.ts"], "thresholds": { "break": null } }\n' >"$REPO/agent/stryker.conf.json"
+commit_branch "feat(agent): a killed extension line, in a config with no break"
+run env MUTATE_RC=0 MUTATE_LOG="$CASE/mutate.log" "$pf" --only mutation --cwd "$REPO" feat/w1
+if [ "$RC" != 0 ]; then
+	fail "a passing run in a break-less checkout failed: exit $RC — $OUT"
+elif ! said "does not break at 100"; then
+	fail "a pass from a checkout that cannot break is not qualified — $OUT"
+else
+	pass "a pass in a checkout whose stryker cannot break says so instead of reading as no survivor"
+fi
 
 # --- summary -----------------------------------------------------------------------------------
 
