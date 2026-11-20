@@ -25,6 +25,9 @@
 #      whole and exactly once, the two globs are run directly (the node suite never twice, which is
 #      what the old shape did), every discovered suite is reported with its own time, the cap holds,
 #      a failing suite fails the gate with its name, and a prose-only diff names both fast paths.
+#   J. the body gate runs in the checkout that holds the branch: a worktree for a branch in a
+#      worktree, in place for a main checkout that is on the branch, and a throwaway worktree for a
+#      branch only a ref holds — removed afterwards, on the refused path too.
 #
 #   bash scripts/tests/test-preflight.sh      exit 0 = every case held
 set -uo pipefail
@@ -149,8 +152,12 @@ write_report() { # <tier> <names-a-preflight-run: yes|no> [extra line]
 }
 
 track_worker() { # a delegation entry pointing at the throwaway repo
-	printf '{"w1":{"space":"space-w1","cwd":"%s","branch":"feat/w1","report":"%s"}}\n' \
-		"$REPO" "$PI_BOSS_ROOT/reports/w1.md" >"$PI_BOSS_ROOT/state/delegations.json"
+	track_worker_at "$REPO" feat/w1
+}
+
+track_worker_at() { # <cwd> <branch>
+	printf '{"w1":{"space":"space-w1","cwd":"%s","branch":"%s","report":"%s"}}\n' \
+		"$1" "$2" "$PI_BOSS_ROOT/reports/w1.md" >"$PI_BOSS_ROOT/state/delegations.json"
 }
 
 pushed() { grep -qF -- "git push" "$1" 2>/dev/null; }
@@ -658,6 +665,156 @@ elif ! said "docs-only diff: no changed test file"; then
 	fail "the scrub skip does not name the diff as prose — $OUT"
 else
 	pass "a prose-only diff skips syntax and scrub, each with its own named line"
+fi
+
+# --- J. the body gate runs in the checkout that holds the branch -------------------------------
+
+# Three publishes in a row were blocked by a body gate pointed at the wrong tree: it ran in the main
+# checkout, which sat on trunk, so the target repo's own `pr-check` — right to refuse a checkout that
+# is not on the branch it gates — refused every worker publish, and said so about the wrong tree.
+# The gate now runs where the branch is, and every line it prints names that directory. The fixture's
+# gate is that shape: it logs the directory it ran in, and refuses a checkout that is not on the
+# branch it was handed, so a regression back to the main checkout fails here instead of at publish.
+gate_fixture() { # a body gate on trunk: logs where it ran, refuses another branch's checkout
+	mkdir -p "$REPO/scripts"
+	cat >"$REPO/Makefile" <<'MAKE'
+pr-check:
+	@bash $(CURDIR)/scripts/body-gate.sh "$(BODY)" "$(BRANCH)"
+MAKE
+	cat >"$REPO/scripts/body-gate.sh" <<'GATE'
+#!/usr/bin/env bash
+body=${1:-}
+branch=${2:-}
+[ -f "$body" ] || { printf 'pr-check: no body file\n' >&2; exit 1; }
+[ -z "${GATE_LOG:-}" ] || printf '%s %s\n' "$PWD" "$(git -C "$PWD" rev-parse --short HEAD 2>/dev/null || printf -)" >>"$GATE_LOG"
+[ -z "${GATE_REFUSE:-}" ] || { printf 'pr-check: %s\n' "$GATE_REFUSE" >&2; exit 1; }
+grep -qE '^Review tier: ' "$body" || { printf 'pr-check: no Review tier: line\n' >&2; exit 1; }
+grep -q '^## Evidence' "$body" || { printf 'pr-check: no Evidence section\n' >&2; exit 1; }
+if [ -n "$branch" ]; then
+	# The shape pi's own pr-gate has: the checkout must be on the branch it gates. A detached
+	# checkout of the branch's own commit is the same tree, and that is what a throwaway is.
+	here=$(git -C "$PWD" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+	head=$(git -C "$PWD" rev-parse HEAD 2>/dev/null || true)
+	want=$(git -C "$PWD" rev-parse --verify --quiet "refs/heads/$branch^{commit}" 2>/dev/null || true)
+	[ "$here" = "$branch" ] || [ "$head" = "$want" ] ||
+		{ printf 'pr-check: this checkout is on %s, not %s\n' "${here:-a detached HEAD}" "$branch" >&2; exit 1; }
+fi
+printf 'pr-check: body ok\n'
+GATE
+	chmod +x "$REPO/scripts/body-gate.sh"
+	git -C "$REPO" add -A
+	git -C "$REPO" commit -q -m "chore: a body gate that reads the body and its own branch"
+	git -C "$REPO" push -q origin main
+}
+
+worktrees_held() { git -C "$REPO" worktree list --porcelain | grep -c '^worktree '; }
+gate_ran_in() { head -n 1 "$CASE/gate.log" 2>/dev/null | cut -d' ' -f1 || true; }
+gate_ran_at() { head -n 1 "$CASE/gate.log" 2>/dev/null | cut -d' ' -f2 || true; }
+
+# J1. The shape every worker publish has: trunk in the main checkout, the branch in a worktree. The
+# gate runs in that worktree, passes there, and the line says which directory it used.
+reset_case gate-worktree
+git -C "$REPO" checkout -q main
+gate_fixture
+git -C "$REPO" worktree add -q "$CASE/wt-gated" -b feat/gated
+printf 'the branch\n' >"$CASE/wt-gated/feature.txt"
+git -C "$CASE/wt-gated" add -A
+git -C "$CASE/wt-gated" commit -q -m "feat: the branch under gate" -m "Agent-Slug: w1"
+SHA=$(git -C "$CASE/wt-gated" rev-parse HEAD)
+write_report Medium yes
+track_worker_at "$CASE/wt-gated" feat/gated
+: >"$CASE/gate.log"
+run env GATE_LOG="$CASE/gate.log" "$pf" --only body --slug w1 --cwd "$REPO" feat/gated
+if [ "$RC" != 0 ]; then
+	fail "a branch in a worktree did not pass its own body gate: exit $RC — $OUT"
+elif [ "$(gate_ran_in)" != "$CASE/wt-gated" ]; then
+	fail "the body gate ran in '$(gate_ran_in)', not in the worktree that holds the branch — $OUT"
+elif ! said "body gate: make -C $CASE/wt-gated pr-check"; then
+	fail "the line does not name the directory the gate ran in — $OUT"
+elif ! said "body gate: make pr-check passed"; then
+	fail "the body gate did not pass in the worktree — $OUT"
+else
+	pass "a branch in a worktree is gated in that worktree, and the line names it"
+fi
+
+# J2. A main checkout that *is* on the branch keeps working: no worktree is made, and nothing is
+# moved out from under the caller.
+reset_case gate-main-checkout
+gate_fixture
+printf 'the branch\n' >"$REPO/feature.txt"
+commit_branch "feat: the branch under gate, in the main checkout"
+write_report Medium yes
+track_worker
+: >"$CASE/gate.log"
+run env GATE_LOG="$CASE/gate.log" "$pf" --only body --slug w1 --cwd "$REPO" feat/w1
+if [ "$RC" != 0 ]; then
+	fail "a main checkout on the branch stopped passing its own body gate: exit $RC — $OUT"
+elif [ "$(gate_ran_in)" != "$REPO" ]; then
+	fail "the body gate ran in '$(gate_ran_in)', not in the main checkout that holds the branch — $OUT"
+elif [ "$(worktrees_held)" != 1 ]; then
+	fail "a checkout on the branch still had a worktree made for it ($(worktrees_held) held) — $OUT"
+else
+	pass "a main checkout that is on the branch is gated in place, with no worktree made"
+fi
+
+# J3. A branch no checkout holds — a ref and nothing else — is gated in a throwaway worktree of it,
+# and that worktree is gone afterwards. Asserted from the gate's own log and the repo's worktree
+# list: a directory named in a message that is still on disk is the leak this case is for.
+reset_case gate-ref-only
+git -C "$REPO" checkout -q main
+gate_fixture
+refonly=$(git -C "$REPO" commit-tree "$(git -C "$REPO" rev-parse "main^{tree}")" -p main \
+	-m "feat: a branch no checkout holds" -m "Agent-Slug: w1")
+git -C "$REPO" branch feat/refonly "$refonly"
+SHA=$refonly
+write_report Medium yes
+track_worker_at "$REPO" feat/refonly
+: >"$CASE/gate.log"
+run env GATE_LOG="$CASE/gate.log" "$pf" --only body --slug w1 --cwd "$REPO" feat/refonly
+thrown=$(gate_ran_in)
+if [ "$RC" != 0 ]; then
+	fail "a branch that exists only as a ref did not pass its gate: exit $RC — $OUT"
+elif ! said "no checkout holds feat/refonly"; then
+	fail "the throwaway checkout was made without saying so — $OUT"
+elif [ -z "$thrown" ]; then
+	fail "the gate wrote nothing to its log, so it never ran — $OUT"
+elif [ -e "$thrown" ]; then
+	fail "the throwaway checkout $thrown is still on disk after the gate passed"
+elif [ "$(worktrees_held)" != 1 ]; then
+	fail "the repo still holds $(worktrees_held) worktrees after the gate: the throwaway was not removed — $OUT"
+elif [ "$(gate_ran_at)" != "$(git -C "$REPO" rev-parse --short feat/refonly)" ]; then
+	fail "the throwaway checkout was on $(gate_ran_at), not on the branch's own commit — $OUT"
+elif ! said "body gate: make -C $thrown pr-check"; then
+	fail "the line does not name the throwaway directory the gate ran in — $OUT"
+else
+	pass "a branch only a ref holds is gated in a throwaway worktree, on its own commit, gone after"
+fi
+
+# J4. The same throwaway, with a gate that refuses: the worktree is removed on the failure path too,
+# which is the path a trap is for and the path a manual cleanup forgets.
+reset_case gate-ref-only-fails
+git -C "$REPO" checkout -q main
+gate_fixture
+refonly=$(git -C "$REPO" commit-tree "$(git -C "$REPO" rev-parse "main^{tree}")" -p main \
+	-m "feat: a branch no checkout holds" -m "Agent-Slug: w1")
+git -C "$REPO" branch feat/refonly "$refonly"
+SHA=$refonly
+write_report Medium yes
+track_worker_at "$REPO" feat/refonly
+: >"$CASE/gate.log"
+run env GATE_LOG="$CASE/gate.log" GATE_REFUSE="the body is not good enough" \
+	"$pf" --only body --slug w1 --cwd "$REPO" feat/refonly
+thrown=$(gate_ran_in)
+if [ "$RC" = 0 ]; then
+	fail "a gate that refused the body passed the check — $OUT"
+elif ! said "the body is not good enough"; then
+	fail "the gate's refusal is not shown — $OUT"
+elif [ -n "$thrown" ] && [ -e "$thrown" ]; then
+	fail "the throwaway checkout $thrown survived a refused gate"
+elif [ "$(worktrees_held)" != 1 ]; then
+	fail "the repo still holds $(worktrees_held) worktrees after a refused gate — $OUT"
+else
+	pass "a throwaway checkout is removed after a refused gate, not only after a passing one"
 fi
 
 # --- summary -----------------------------------------------------------------------------------
