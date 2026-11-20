@@ -218,6 +218,13 @@ expect "no tracked file carries a home directory" 0 "no-hardcoded-home: ok" -- \
 	bash "$root/scripts/tests/test-no-hardcoded-home.sh"
 expect "pi resolution order, wrappers and the Windows refusal" 0 "pi-resolve: ok" -- \
 	bash "$root/scripts/tests/test-pi-resolve.sh"
+# 5o2. Which bash runs a bin/ entry point (bin/shell-resolve.sh): run by dash it re-execs under a
+#      bash it found with the argv untouched, a PATH with no bash at all is one line and exit 127
+#      instead of a half-run command, PI_GIT_BASH wins over a bash on PATH, a %ProgramFiles% fixture
+#      is chosen when nothing is on PATH, and a run that is already bash resolves nothing at all.
+#      Its own script because every case needs a throwaway copy of bin/ and its own stripped PATH.
+expect "bash is resolved at runtime, or the run stops with a reason" 0 "shell-resolve: ok" -- \
+	bash "$root/scripts/tests/test-shell-resolve.sh"
 # 5p. One failed guard pass is one pass: a refused space.new or a tab that cannot be opened is
 #     logged and the next interval tries again, in the same process, so the space still comes back
 #     after it is closed. One stub herdr-app, one real guard process per case.

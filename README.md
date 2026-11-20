@@ -27,6 +27,11 @@ Every script lives on its own tree: it resolves the workspace root from its own 
 works from any cwd and when sourced. `PI_BOSS_ROOT` overrides the root; `PI_MASTER_ROOT` is
 still accepted as a deprecated fallback.
 
+`bin/delegate`, `bin/publish`, `bin/jev`, `bin/local-run` and `bin/guard` are bash programs, so they
+resolve bash at runtime (`bin/shell-resolve.sh`) and re-exec themselves under it — a shebang is not a
+promise on Windows. `PI_GIT_BASH=/path/to/bash.exe` sets it explicitly, ahead of a `bash` on `PATH`;
+with none found they print `no bash found — set PI_GIT_BASH=/path/to/bash.exe` and exit 127.
+
 ## Routing: decide before you work
 
 The first question is not "how many workers" but "is this work at all". `jev route "<task>"`
