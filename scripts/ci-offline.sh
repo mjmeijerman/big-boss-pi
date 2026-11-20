@@ -143,6 +143,12 @@ expect "provenance trailers, spec archive and PR template" 0 "provenance: ok" --
 #     own script because it needs a fake ollama, real git branches and a stub herdr-app at once.
 expect "spawn plan, worker count, path blocking and evidence scaffold" 0 "spawn speed: ok" -- \
 	bash "$root/scripts/test-spawn-speed.sh"
+# 5e2. The shape of a spec (AGENTS.md rule 10): two `Measure:` lines refuse the spawn and quote both,
+#      one spawns and writes the five-line report skeleton, and that skeleton can neither publish
+#      (`close` refuses the placeholders) nor be waited on as a finished report. One measurement, not
+#      a matrix, is what a worker's proof costs.
+expect "spawn refuses a matrix and writes the report skeleton" 0 "spawn shape: ok" -- \
+	bash "$root/scripts/tests/test-spawn-shape.sh"
 # 5f. The guard's repair path (Radar blip 20): a stale tab is resumed from its resume entry when
 #     it has one, and only opened fresh when it never held pi — or when the resume did not start
 #     pi. Fake herdr-app, fake resume map, fake resume script; no desktop app, no session, no

@@ -15,7 +15,8 @@ fi
 
 #
 #   delegate spawn <slug> --cwd DIR [--mode bare|sandboxed|no-net] [--thinking LEVEL]
-#                  [--count N] [--acceptance] [--override-jev --reason TEXT] [--no-restore] "<task>"
+#                  [--count N] [--acceptance] [--allow-matrix --reason TEXT]
+#                  [--override-jev --reason TEXT] [--no-restore] "<task>"
 #   delegate wait <slug> [--timeout SECONDS]
 #   delegate list
 #   delegate close <slug> [--merged PR-URL-OR-NUMBER]
@@ -50,6 +51,21 @@ fi
 # not yet done. The mode is auditable: the spawn's state line and its printed result both carry
 # `acceptance`, so a later reader can tell a second opinion from an implementer without reading
 # the spec.
+#
+# A spec measures one thing, and spawn checks that before anything is started. The task text's
+# `Measure:` lines are counted: two of them, or none plus prose asking for before/after numbers, is
+# refused with each offending line quoted. Proof proportional to the diff is the reason (AGENTS.md
+# rule 10): a worker spent twenty minutes after its commit landed on a matrix its own spec asked
+# for, and no decision changed because of it. `--allow-matrix --reason '<why>'` goes through and
+# lands in state/decisions.jsonl, so a matrix is a decision somebody made and can be argued with.
+#
+# The report skeleton is spawn's to write: reports/<slug>.md is created with the five lines every
+# report carries — `Mission:`, `Review tier:`, `Test change:`, `## Evidence` (which asks for
+# `bin/preflight` by name) and `Commit:` — each left as a `<fill …>` placeholder. The worker fills
+# them in or overwrites the file. `delegate close` already refuses a report that still carries a
+# placeholder, so a skeleton can never publish; and a report that is only a skeleton is not a
+# report: `delegate wait` keeps waiting, the in-flight block does not count it as unread, and
+# `worker_state` keeps saying `working`. A worker is finished when its report is written.
 #
 # Work in flight is capped by review, not by generation. A report is "read" once something marks
 # it so: `delegate wait` and `delegate close` write state/read/<slug> as they print or check the
@@ -375,7 +391,7 @@ reap_finished_learners() {
 worker_state() {
 	local slug=${1:-} report terminal terms
 	report=$REPORTS/$slug.md
-	if [ -s "$report" ]; then
+	if report_written "$report"; then
 		printf 'reported'
 		return 0
 	fi
@@ -423,7 +439,15 @@ mark_read() {
 # did, the branch diff names what it actually changed.
 unread_reports_in() {
 	[ -f "$DELEGATIONS" ] || return 0
-	node -e '
+	local line report
+	# A report that is still a skeleton is a worker mid-work, not a report waiting to be read: the
+	# spawn writes it, and counting it would make every running worker block the next spawn.
+	while read -r line; do
+		[ -n "$line" ] || continue
+		report=$(printf '%s\n' "$line" | awk '{print $3}')
+		report_written "$report" || continue
+		printf '%s\n' "$line"
+	done < <(node -e '
 		const fs = require("fs"), path = require("path");
 		let j = {}; try { j = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch {}
 		const marks = process.argv[2], cwd = path.resolve(process.argv[3]), now = Date.now();
@@ -434,7 +458,7 @@ unread_reports_in() {
 			if (!st.size) continue;
 			if (fs.existsSync(path.join(marks, slug))) continue;
 			process.stdout.write([slug, Math.max(0, Math.round((now - st.mtimeMs) / 1000)), r.report, r.branch || ""].join(" ") + "\n");
-		}' "$DELEGATIONS" "$READ_MARKS" "$1"
+		}' "$DELEGATIONS" "$READ_MARKS" "$1")
 }
 
 # worker_paths <cwd> <branch> -- the paths a worker's branch actually changes, one per line, and
@@ -598,6 +622,16 @@ report_placeholders() {
 			}
 		}
 	' < "$report"
+}
+
+# report_written <report> -- true when the report is written, not merely present: a non-empty
+# file with no fill-in placeholder left in it. Since `spawn` writes the skeleton, "the file exists"
+# stopped meaning "the worker reported", and an unfilled skeleton is the worker still writing,
+# exactly like no file at all. Every question of the shape "has this worker finished?" asks here.
+report_written() {
+	local report=${1:-}
+	[ -s "$report" ] || return 1
+	[ -z "$(report_placeholders "$report" 2>/dev/null)" ]
 }
 
 # report_commit_candidates <report> -- every sha the report could be naming, in the order it names
@@ -1367,9 +1401,23 @@ acceptance_source_spec() {
 	return 1
 }
 
+# measure_lines <text> -- the `Measure:` lines a task declares its one measurement on, exactly as
+# written, one per line; empty when it declares none. A line counts after any list bullet and bold
+# marker, because that is how specs are written, and the refusal quotes the line back as written.
+measure_lines() {
+	printf '%s\n' "${1:-}" | grep -E '^[[:space:]]*([-*][[:space:]]+)?(\*\*)?Measure:' || true
+}
+
+# measure_prose <text> -- the lines asking for more than one number in prose instead: a before/after
+# pair, or the word "matrix". Only consulted when no `Measure:` line was declared, because a task
+# that declared its measurement answered the question rather than dodging it.
+measure_prose() {
+	printf '%s\n' "${1:-}" | grep -Ei 'before[[:space:]]*[-/][[:space:]]*(and[[:space:]]+)?after|before[[:space:]]+and[[:space:]]+after|matrix' || true
+}
+
 cmd_spawn() {
-	local slug="" cwd="" mode="" thinking="" count_flag="" task="" override_jev=0 reason="" runner="" no_restore=0 acceptance=0
-	[ "$#" -ge 1 ] || die 'usage: delegate spawn <slug> --cwd DIR [--mode M] [--thinking LEVEL] [--count N] [--acceptance] [--override-jev --reason TEXT] [--no-restore] "<task>"'
+	local slug="" cwd="" mode="" thinking="" count_flag="" task="" override_jev=0 allow_matrix=0 reason="" runner="" no_restore=0 acceptance=0
+	[ "$#" -ge 1 ] || die 'usage: delegate spawn <slug> --cwd DIR [--mode M] [--thinking LEVEL] [--count N] [--acceptance] [--allow-matrix --reason TEXT] [--override-jev --reason TEXT] [--no-restore] "<task>"'
 	slug=$1; shift
 	local words=()
 	while [ "$#" -gt 0 ]; do
@@ -1379,6 +1427,7 @@ cmd_spawn() {
 		--thinking) thinking=${2:-}; shift 2 ;;
 		--count) count_flag=${2:-}; shift 2 ;;
 		--acceptance) acceptance=1; shift ;;
+		--allow-matrix) allow_matrix=1; shift ;;
 		--override-jev) override_jev=1; shift ;;
 		--reason) reason=${2:-}; shift 2 ;;
 		--no-restore) no_restore=1; shift ;;
@@ -1395,6 +1444,45 @@ cmd_spawn() {
 	"" | off | minimal | low | medium | high | xhigh | max) ;;
 	*) die "thinking must be off, minimal, low, medium, high, xhigh or max: '$thinking'" ;;
 	esac
+	# One measurement, declared on a `Measure:` line (AGENTS.md rule 10: proof proportional to the
+	# diff). The matrix refused here is the one a worker already ran: twenty minutes after its
+	# commit landed, changing no decision. Both shapes are counted — two declared measurements, or
+	# none declared and prose asking for a before/after pair — and the offending lines are quoted,
+	# because a refusal over text the caller cannot see is a guessing game.
+	local mlines mprose mcount mwhat mquote
+	mlines=$(measure_lines "$task")
+	mprose=""
+	mcount=0
+	if [ -n "$mlines" ]; then
+		mcount=$(printf '%s\n' "$mlines" | grep -c .)
+	else
+		mprose=$(measure_prose "$task")
+	fi
+	if [ "$mcount" -gt 1 ] || [ -n "$mprose" ]; then
+		if [ "$mcount" -gt 1 ]; then
+			mwhat="this task declares $mcount measurements; a spec gets one"
+			mquote=$mlines
+		else
+			mwhat="this task declares no Measure: line and asks for more than one number in prose; a spec gets one measurement, on one Measure: line"
+			mquote=$mprose
+		fi
+		if [ "$allow_matrix" = 1 ] && [ -n "${reason// /}" ]; then
+			record_decision matrix "$task" override "$reason — $mwhat" true "$slug"
+			printf '%s: note: %s; spawning because --allow-matrix --reason was given (%s).\n' "$prog" "$mwhat" "$reason" >&2
+		elif [ "$allow_matrix" = 1 ]; then
+			record_decision matrix "$task" refused "--allow-matrix without --reason" false "-"
+			die "--allow-matrix needs a non-empty --reason: a matrix without a reason is a guess, and a matrix is what cost a worker twenty minutes after its commit landed.
+$mwhat:
+$(printf '%s\n' "$mquote" | sed 's/^/  /')"
+		else
+			record_decision matrix "$task" refused "$mwhat" false "-"
+			die "$mwhat.
+The lines:
+$(printf '%s\n' "$mquote" | sed 's/^/  /')
+One command pair, measured once before and once after, is the whole proof; a second pair changes no decision and costs the worker the minutes between them.
+Declare the one measurement, or re-run with --allow-matrix --reason '<why this one has to be a matrix>'."
+		fi
+	fi
 	# --count asks for a number of workers, bounded by the live-space hard stop. A number outside
 	# it is refused here, before jev is asked, and the message names where the ceiling comes from.
 	if [ -n "$count_flag" ]; then
@@ -1756,6 +1844,36 @@ Output (last 20 lines):
 \`delegate close\` refuses a report with no Evidence block or with a placeholder left in.
 EOF
 
+		# The report skeleton, written before the space exists: the worker starts inside
+		# `space.new`'s argv, so this is the last point at which the five lines every report
+		# carries are guaranteed to be there before it writes prose. An unfilled skeleton is refused
+		# as a placeholder at close and read as "still working" everywhere else, so it cannot
+		# publish and cannot be mistaken for a finished worker. Overwriting the whole file is fine.
+		cat >"$report" <<EOF
+# Report — $spawn_slug
+
+Mission: <fill in: who is better off and what shows it, in one line>
+
+Review tier: <fill in: High|Medium|Low>
+
+Test change: <fill in: what the test file pins, or "none: no test file changed">
+
+## Evidence
+
+\`bin/preflight\` ran once on this branch — paste it under the command below, by name, with its
+summary line:
+
+Command: <fill in: the exact command you ran, flags and all>
+
+Output (last 20 lines):
+
+\`\`\`
+<paste the last 20 lines of that command's output here>
+\`\`\`
+
+Commit: <fill in: the sha on this branch>
+EOF
+
 	argv=$(node -e 'process.stdout.write(JSON.stringify(["sh","-lc",process.argv[1]]))' \
 		"cd $(printf '%q' "$cwd") && export AGENT_SLUG=$(printf '%q' "$spawn_slug") && exec $(printf '%q' "$runner") --thinking $(printf '%q' "$jev_level") -a")
 	# space.new has no hidden or background mode: the new space is shown, which takes the person
@@ -1822,13 +1940,13 @@ cmd_wait() {
 	local report=$REPORTS/$slug.md
 	# A worker whose terminal is gone will never write that report: waiting the timeout out is the
 	# bug this state exists to name, so it is said once and now, not after ten minutes.
-	if [ ! -s "$report" ] && [ "$(worker_state "$slug")" = gone ]; then
+	if ! report_written "$report" && [ "$(worker_state "$slug")" = gone ]; then
 		die "$slug is gone: its recorded herdr terminal $(delegation_field "$slug" terminal) is no longer listed and it never wrote $report — waiting cannot make it report. Check the space, then spawn the task again or write the report by hand"
 	fi
 	command -v timeout >/dev/null 2>&1 || die "timeout not found"
 	local waited=0
 	while [ "$waited" -lt "$timeout" ]; do
-		if [ -s "$report" ]; then
+		if report_written "$report"; then
 			say "== $slug reported =="
 			cat "$report"
 			# Printing the report is reading it: the marker clears this cwd's in-flight block.
@@ -2413,7 +2531,7 @@ cmd_sweep() {
 	while IFS= read -r slug; do
 		[ -n "$slug" ] || continue
 		report=$REPORTS/$slug.md
-		if [ ! -s "$report" ]; then
+		if ! report_written "$report"; then
 			case $(worker_state "$slug") in
 			gone) say "keep   $slug (gone: its herdr terminal is no longer listed and it never reported — nothing to publish, nothing to close)" ;;
 			*) say "keep   $slug (still working)" ;;

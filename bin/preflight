@@ -15,10 +15,12 @@
 #
 #   behind    the branch's base against a just-fetched origin/<trunk>: a branch cut before a pull
 #             request merged publishes a CONFLICTING one (#68 was spawned at 19:27:52Z, #67 merged at
-#             19:32:04Z, AGENTS.md and README.md colliding). Names how far behind, which of the
-#             branch's own touched paths also moved, and the rebase — it never rebases for you, and
-#             an unreachable origin is a named pass, because a gate that blocks on a flaky network
-#             gets bypassed
+#             19:32:04Z, AGENTS.md and README.md colliding) — but only when a path the branch touched
+#             also moved on trunk. That is the FAIL: it names how far behind, which paths collided,
+#             and the rebase. Behind with no touched path moved is a named PASS ("merges without a
+#             rebase"): GitHub merges it, the extra commits are history. It never rebases for you,
+#             and an unreachable origin is a named pass, because a gate that blocks on a flaky
+#             network gets bypassed
 #   syntax    bash -n on the changed shell files, node --check on the changed .mjs/.js, and the
 #             checkout's own `tsc --noEmit` on a changed .ts/.tsx — a project with no type checker
 #             gets one named skip line per file and a summary that counts it as skipped, never as
@@ -253,7 +255,7 @@ pf_receipt_write() {
 
 preflight_ids=(behind syntax suites semgrep scrub body)
 preflight_names=(
-	"behind (is this branch cut from a stale trunk?)"
+	"behind (did a touched path also move on trunk?)"
 	"syntax (bash -n, node --check, shellcheck)"
 	"suites (the repo's own tests)"
 	"semgrep (the changed files)"
@@ -400,12 +402,16 @@ pf_repo_shape() {
 # syntax, semgrep, scrub and the body gate all pass on a stale base.
 #
 # One question, asked after a quiet bounded fetch: is origin/<trunk> already an ancestor of HEAD?
-# When it is not, the branch is behind or diverged, and the publish is the person's minutes. So it
-# names the two facts that person needs — how far behind, and which of this branch's own touched
-# paths also moved on trunk since the merge base — and the exact remedy, in that worktree.
+# When it is not, the branch is behind or diverged. Being behind is not itself the problem — GitHub
+# merges a branch behind trunk, and those extra commits are history, not conflict. The problem is a
+# path this branch touched that also moved on trunk: that is a merge to resolve, and the person's
+# minutes. So the verdict is the intersection. Collisions fail, naming how far behind, the colliding
+# paths, and the exact remedy in that worktree. No collision passes, with a line that says so by
+# name: an unconditional fail here refuses a branch GitHub would merge, and five branches in one day
+# paid a rebase worker for nothing.
 #
-# It never rebases. A rebase can conflict, and a gate that rewrites history is worse than one that
-# refuses: an automatic rebase turns a visible refusal into a half-resolved tree. And an
+# It never rebases either way. A rebase can conflict, and a gate that rewrites history is worse than
+# one that refuses: an automatic rebase turns a visible refusal into a half-resolved tree. And an
 # unreachable origin is a named PASS, because a gate that blocks on a flaky network is a gate
 # people learn to skip — the line says what was not checked, so "pass" never reads as "level".
 pf_check_behind() {
@@ -443,14 +449,18 @@ pf_check_behind() {
 			fi
 		done
 	done
+	if [ "${#collide[@]}" -eq 0 ]; then
+		# Behind, and not one path this branch touched moved on trunk: a clean merge on GitHub,
+		# with the extra commits as history. Passed by name, because this line is the whole answer
+		# and "pass" alone would read as "level with trunk".
+		printf '%s is %s commit(s) behind origin/%s, no touched path moved: this branch merges without a rebase\n' \
+			"$PF_BRANCH" "$n" "$trunk"
+		return 0
+	fi
 	printf '%s is %s commit(s) behind origin/%s; %d of the %d touched path(s) also moved on trunk\n' \
 		"$PF_BRANCH" "$n" "$trunk" "${#collide[@]}" "${#touched[@]}"
-	if [ "${#collide[@]}" -gt 0 ]; then
-		printf 'the collisions, by path:\n'
-		printf '  %s\n' "${collide[@]}"
-	else
-		printf 'no path this branch touched moved on trunk, so this rebase would be clean — it is still yours to run, not the gate\x27s\n'
-	fi
+	printf 'the collisions, by path:\n'
+	printf '  %s\n' "${collide[@]}"
 	printf 'Fix: git -C %s rebase origin/%s\n' "$cwd" "$trunk"
 	return 1
 }
@@ -1006,8 +1016,14 @@ pf_check_body() {
 # --- dispatch ----------------------------------------------------------------------------------
 
 usage() {
+	local id
 	printf 'usage: %s [--cwd DIR] [--slug SLUG] [--only NAME]... [--list] [--fresh] [BRANCH]\n' "$prog" >&2
-	printf 'checks: %s\n' "${preflight_ids[*]}" >&2
+	# The same words `--list` prints, so help and the list cannot drift apart: what a check is
+	# called is the only place its verdict is explained before it runs.
+	printf 'checks:\n' >&2
+	for id in "${preflight_ids[@]}"; do
+		printf '  %s\t%s\n' "$id" "$(name_of "$id")" >&2
+	done
 	exit 2
 }
 

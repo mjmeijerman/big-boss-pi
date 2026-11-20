@@ -136,6 +136,34 @@ $ bin/preflight — 5/5 passed
 $ delegate close w6 — closed
 REPORT
 
+# 6b. The skeleton `delegate spawn` writes, verbatim: every one of its five lines is a placeholder
+#     until it is filled in, so an unfilled skeleton can never publish as it stands. This is the
+#     case the skeleton exists for — the required lines before the worker writes prose.
+report_case "the unfilled spawn skeleton refuses" 1 "still has fill-in placeholders" <<'REPORT'
+# Report — w7
+
+Mission: <fill in: who is better off and what shows it, in one line>
+
+Review tier: <fill in: High|Medium|Low>
+
+Test change: <fill in: what the test file pins, or "none: no test file changed">
+
+## Evidence
+
+`bin/preflight` ran once on this branch — paste it under the command below, by name, with its
+summary line:
+
+Command: <fill in: the exact command you ran, flags and all>
+
+Output (last 20 lines):
+
+```
+<paste the last 20 lines of that command's output here>
+```
+
+Commit: <fill in: the sha on this branch>
+REPORT
+
 # 7. And the scan is not fooled the other way: a placeholder after a closed fence is prose again.
 report_case "prose after a closed fence refuses" 1 "still has fill-in placeholders" <<'REPORT'
 # Report
