@@ -168,30 +168,115 @@ remote_head() { # <cwd> <branch> — the sha origin holds (empty: none); nonzero
 # recorded the head it pushed is the same evidence for a repo whose reflog has been pruned; the
 # field is optional, so a delegation record without it changes nothing.
 own_tip() {
-	git -C "$1" reflog show --format=%H "refs/heads/$2" 2>/dev/null | grep -qxF -- "$3" && return 0
+	local log
+	# the reflog is read whole, and grep reads a here-string: a `git | grep -q` pipeline ends the
+	# git side early, and `pipefail` then reports the SIGPIPE as "no match" — the same false
+	# negative that made the rewrite test below miss every conflict-resolved rebase
+	log=$(git -C "$1" reflog show --format=%H "refs/heads/$2" 2>/dev/null || true)
+	grep -qxF -- "$3" <<<"$log" && return 0
 	[ -n "$no_entry" ] && return 1
 	[ "$(field head 2>/dev/null || true)" = "$3" ] && return 0
 	[ "$(field pushed 2>/dev/null || true)" = "$3" ] && return 0
 	return 1
 }
 
+# have_ref <cwd> <ref> — does this repo know that ref? A tree that never fetched trunk still has
+# to publish, so a missing ref means "ask the other way", never a refusal on its own.
+have_ref() {
+	git -C "$1" rev-parse --verify --quiet "$2" >/dev/null 2>&1
+}
+
+# rebase_base <cwd> <local> <remote> — this branch's merge-base with trunk: the base a rebase rebuilt
+# the branch on. Origin's trunk is the answer when it is fetched; a tree without it falls back to the
+# merge-base with the remote tip, which is the same commit for a branch rebased onto that trunk.
+rebase_base() {
+	local cwd=$1 local_sha=$2 remote_sha=$3 base=""
+	if [ -n "$trunk" ] && have_ref "$cwd" "refs/remotes/origin/$trunk"; then
+		base=$(git -C "$cwd" merge-base "$local_sha" "refs/remotes/origin/$trunk" 2>/dev/null || true)
+	fi
+	[ -n "$base" ] || base=$(git -C "$cwd" merge-base "$local_sha" "$remote_sha" 2>/dev/null || true)
+	printf '%s' "$base"
+}
+
+# on_own_base <cwd> <base> <sha> — is <sha> part of this branch's own divergence, built on this
+# branch's base, rather than trunk's work or a commit from somewhere else? That is the difference
+# between "the commit I rewrote" and "a commit that happens to read the same".
+on_own_base() {
+	local cwd=$1 base=$2 sha=$3
+	[ -n "$base" ] || return 1
+	git -C "$cwd" merge-base --is-ancestor "$base" "$sha" 2>/dev/null || return 1
+	if [ -n "$trunk" ] && have_ref "$cwd" "refs/remotes/origin/$trunk"; then
+		if git -C "$cwd" merge-base --is-ancestor "$sha" "refs/remotes/origin/$trunk" 2>/dev/null; then
+			return 1
+		fi
+	fi
+	return 0
+}
+
 # rewritten_only <cwd> <local> <remote> — every commit origin has and the local branch does not is
-# the same change under another sha. `git cherry` is that question answered by git: `-` means the
-# patch is already in the local history under another sha, `+` means it is not. A `+` commit is not
-# given up on — a rebase that resolved a conflict changes the patch — so it is looked up by subject
-# in the local branch, and a subject that is not there is work a push would delete.
+# accounted for on the local branch, by one of two proofs:
+#
+#   * patch-id, the fast path — `git cherry` says `-`: the same patch is already in the local history
+#     under another sha, which is a clean rebase or amend;
+#   * subject + author + base, the second path — a rebase that resolved a conflict changes the patch,
+#     so its patch-id cannot match and `git cherry` says `+` (mjmeijerman/pi#69: rebasing onto a
+#     moved trunk resolved a conflict, and the publish then refused its own rewrite forever). The
+#     local commit with the same subject and the same author, on this branch and above this branch's
+#     merge-base with trunk, is that commit rewritten; nothing else can produce it.
+#
+# A merge commit on the remote tip is nobody's rewrite — a rebase does not create one — and a commit
+# whose subject or author appears nowhere locally is work a push would delete. Both refuse, and
+# `rewrite_detail` says which of them fired so the refusal names the case rather than the symptom.
+rewrite_detail=""
+rewrite_notes=""
 rewritten_only() {
-	local cwd=$1 local_sha=$2 remote_sha=$3 out mark sha subject missing=0
+	local cwd=$1 local_sha=$2 remote_sha=$3 out mark sha base local_log meta
+	local subject author_name author_email cand name email cand_subject won
+	local merge_sha
 	out=$(git -C "$cwd" cherry "$local_sha" "$remote_sha" 2>/dev/null) || return 1
 	[ -n "$out" ] || return 1
+	merge_sha=$(git -C "$cwd" rev-list --merges --max-count=1 "$local_sha..$remote_sha" 2>/dev/null || true)
+	if [ -n "$merge_sha" ]; then
+		rewrite_detail="origin/$branch carries merge commit ${merge_sha:0:7}, and a rebase does not make merge commits"
+		return 1
+	fi
+	base=$(rebase_base "$cwd" "$local_sha" "$remote_sha")
+	# the local branch's commits, read once: every lookup below is a field compare against this, so
+	# no `git log | grep -q` pipeline can stop the log early and be read as a mismatch
+	local_log=$(git -C "$cwd" log --format='%H%x1f%an%x1f%ae%x1f%s' "$local_sha" 2>/dev/null || true)
 	while read -r mark sha; do
 		[ "$mark" = '+' ] || continue
-		subject=$(git -C "$cwd" log -1 --format=%s "$sha" 2>/dev/null || true)
-		if [ -z "$subject" ] || ! git -C "$cwd" log --format=%s "$local_sha" 2>/dev/null | grep -qxF -- "$subject"; then
-			missing=1
+		meta=$(git -C "$cwd" log -1 --format='%an%x1f%ae%x1f%s' "$sha" 2>/dev/null || true)
+		subject="" author_name="" author_email=""
+		IFS=$'\x1f' read -r author_name author_email subject <<<"$meta"
+		if [ -z "$subject" ]; then
+			rewrite_detail="git cannot name commit ${sha:0:7} on origin/$branch, so a push cannot be proved safe"
+			return 1
 		fi
+		won=""
+		while IFS=$'\x1f' read -r cand name email cand_subject; do
+			[ "$cand_subject" = "$subject" ] || continue
+			[ "$name" = "$author_name" ] || continue
+			[ "$email" = "$author_email" ] || continue
+			on_own_base "$cwd" "$base" "$cand" || continue
+			won=$cand
+			break
+		done <<<"$local_log"
+		if [ -z "$won" ]; then
+			case $local_log in
+			*"$subject"*)
+				rewrite_detail="commit ${sha:0:7} \"$subject\" on origin/$branch is by $author_name <$author_email>, and no commit on this branch with that subject is by that author"
+				;;
+			*)
+				rewrite_detail="commit ${sha:0:7} \"$subject\" is on origin/$branch and no commit on this branch carries that subject"
+				;;
+			esac
+			return 1
+		fi
+		rewrite_notes="$rewrite_notes
+forced $branch: rewrote ${sha:0:7} → ${won:0:7} \"$subject\" (subject+author match, patch-id differs after conflict resolution)"
 	done <<<"$out"
-	[ "$missing" = 0 ]
+	return 0
 }
 
 # A rejected push is decided here, not failed blindly and never forced blindly. A `non-fast-forward`
@@ -209,6 +294,8 @@ rewritten_only() {
 rewrite_refusal=""
 rewrite_lease() { # <cwd> <branch> <local sha> — true when the rejection is this tree's rewrite
 	local cwd=$1 branch=$2 local_sha=$3 remote_sha lost_range lost
+	rewrite_detail=""
+	rewrite_notes=""
 	if ! remote_sha=$(remote_head "$cwd" "$branch"); then
 		rewrite_refusal="the push was rejected and origin's head for $branch could not be read (git ls-remote failed), so a rewrite cannot be proved"
 		return 1
@@ -239,7 +326,8 @@ $lost"
 	fi
 	if ! rewritten_only "$cwd" "$local_sha" "$remote_sha"; then
 		rewrite_refusal="the push was rejected and origin/$branch carries commit(s) this branch does not have and did not rewrite — forcing would delete:
-$lost"
+$lost
+  ${rewrite_detail:-no commit on this branch accounts for them}"
 		return 1
 	fi
 	lease="--force-with-lease=$branch:$remote_sha"
@@ -721,6 +809,11 @@ Nothing was pushed. Rebase onto origin/$branch so their commit is carried, or pu
 	fi
 	if [ -n "$lease" ]; then
 		note "forced the rewrite of origin/$branch deliberately: $lease_from was the previous head, $pushed is the rewritten one, and ${lease#--force-with-lease=} was the lease"
+		# Which proof the lease rests on: a patch-id match is a clean rebase, and a commit name pair
+		# here is the conflict-resolved rebase, named one line per rewritten commit.
+		while IFS= read -r line; do
+			[ -n "$line" ] && note "$line"
+		done <<<"$rewrite_notes"
 	fi
 	note "origin/$branch is at ${there:0:7}, the commit just pushed"
 fi

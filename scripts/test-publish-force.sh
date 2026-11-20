@@ -130,7 +130,8 @@ REPORT
 
 # rebase_onto_new_trunk — trunk gains a commit and the worker branch is rebased onto it, which is
 # the exact shape `preflight`'s `behind` check asks for: every local sha is new, origin still holds
-# the old tip.
+# the old tip. Trunk's commit touches another file, so the rebase is clean and every patch-id still
+# matches — that is the fast path, and case 1 pins it.
 rebase_onto_new_trunk() { # <branch>
 	local branch=$1
 	"$real_git" -C "$REPO" checkout -q main
@@ -140,6 +141,41 @@ rebase_onto_new_trunk() { # <branch>
 	"$real_git" -C "$REPO" push -q origin main
 	"$real_git" -C "$REPO" checkout -q "$branch"
 	"$real_git" -C "$REPO" rebase -q main
+}
+
+# trunk_moves_over <line> — trunk appends a line to the file the worker's commit also appends to, so
+# the next rebase cannot be clean: the same last line is touched twice.
+trunk_moves_over() { # <line>
+	"$real_git" -C "$REPO" checkout -q main
+	printf '%s\n' "$1" >>"$REPO/file.txt"
+	"$real_git" -C "$REPO" commit -q -am "chore: trunk moves over the same line"
+	"$real_git" -C "$REPO" push -q origin main
+	"$real_git" -C "$REPO" checkout -q worker
+}
+
+# conflict_rebase — the same rebase, but trunk changed the lines the worker's commit changed, so the
+# rebase stops on a conflict and the worker resolves it. The rebased commit carries the same subject,
+# the same author and the same work, but its patch is different: its patch-id cannot match, and
+# `git cherry` reports `+` (mjmeijerman/pi#69 — publish then refused its own rewrite and a person
+# force-pushed by hand). Returns 1 when the rebase did not conflict, so the case cannot pass quietly.
+conflict_rebase() {
+	trunk_moves_over "trunk-line"
+	if "$real_git" -C "$REPO" rebase main >/dev/null 2>&1; then
+		return 1
+	fi
+	printf 'one\ntwo\ntrunk-line\n' >"$REPO/file.txt"
+	"$real_git" -C "$REPO" add file.txt
+	GIT_EDITOR=true "$real_git" -C "$REPO" rebase --continue >/dev/null 2>&1
+}
+
+# trunk_moves_elsewhere <line> — trunk gains a commit on a file the worker's branch does not touch,
+# so the next rebase is clean: the test then isolates the merge commit and nothing else.
+trunk_moves_elsewhere() { # <line>
+	printf '%s\n' "$1" >>"$REPO/other.txt"
+	"$real_git" -C "$REPO" add other.txt
+	"$real_git" -C "$REPO" commit -q -m "chore: trunk moves on another file"
+	"$real_git" -C "$REPO" push -q origin main
+	"$real_git" -C "$REPO" checkout -q worker
 }
 
 # foreign_commit — somebody else pushes a commit onto the branch, so origin's tip is a commit this
@@ -229,6 +265,75 @@ check "  ...the push was plain" bash -c "[ \"\$(grep -E '^git .* push ' '$FAKE_L
 check "  ...and nothing claimed a rewrite" bash -c "! printf '%s' '$err' | grep -q 'forced the rewrite'"
 check "  ...a new PR was opened from the report" bash -c "grep -q 'pr create' '$FAKE_LOG'"
 check "  ...carrying this worker's Evidence" bash -c "grep -qxF 'worker: ok' '$FAKE_BODY_OUT'"
+
+# --- 3b. a conflict-resolved rebase publishes under the lease, naming both shas ------------------
+# The patch changed when the conflict was resolved, so the patch-id can never match again. The second
+# path is subject + author + base, and without it this branch is unpublishable for good.
+new_case worker worker
+export FAKE_PR_JSON='[{"number":184,"state":"OPEN","url":"https://github.com/example/repo/pull/184"}]'
+old_tip=$(remote_sha worker)
+if conflict_rebase; then pass "setup: the rebase stopped on a conflict and was resolved"; else fail "setup: the rebase did not conflict, so this case proves nothing"; fi
+new_tip=$(local_sha worker)
+if [ "$old_tip" != "$new_tip" ]; then pass "setup: the conflict-resolved rebase rewrote the branch ($old_tip -> $new_tip)"; else fail "setup: the conflict-resolved rebase did not rewrite the branch"; fi
+cherry_mark=$("$real_git" -C "$REPO" cherry worker refs/remotes/origin/worker 2>/dev/null || "$real_git" -C "$REPO" cherry worker "$old_tip")
+check "  ...and its patch-id no longer matches (git cherry reports +)" bash -c "printf '%s' '$cherry_mark' | grep -q '^+ '"
+subj=$("$real_git" -C "$REPO" log -1 --format=%s worker)
+auth=$("$real_git" -C "$REPO" log -1 --format=%an worker)
+if [ "$subj" = "feat: the worker's change" ] && [ "$auth" = worker ]; then pass "  ...the rebased commit keeps the subject and the author"; else fail "  ...the rebased commit keeps the subject and the author (got '$subj' by '$auth')"; fi
+"$real_git" -C "$REPO" fetch -q origin
+run worker
+if [ "$rc" -eq 0 ]; then pass "a conflict-resolved rebase publishes into its open PR (exit 0)"; else fail "a conflict-resolved rebase publishes into its open PR (exit $rc: $err)"; fi
+check "  ...origin now holds the rewritten tip" bash -c "[ \"\$(git -C '$REPO.git' rev-parse refs/heads/worker)\" = '$new_tip' ]"
+check "  ...the push carried a lease on the tip origin held" bash -c "grep -qE -- '--force-with-lease=worker:$old_tip' '$FAKE_LOG'"
+check "  ...and no bare --force" bash -c "! grep -qE -- '(^| )(--force|-f)( |$)' '$FAKE_LOG'"
+two_sha_line="forced worker: rewrote ${old_tip:0:7} → ${new_tip:0:7} \"feat: the worker's change\" (subject+author match, patch-id differs after conflict resolution)"
+check "  ...one line names both shas and the subject" said "$two_sha_line"
+check "  ...and says which proof the lease rests on" said 'subject+author match, patch-id differs after conflict resolution'
+check "  ...the lease is the sha origin held immediately before the leased push" bash -c "[ \"\$(grep -oE -- '--force-with-lease=worker:[0-9a-f]{40}' '$FAKE_LOG' | sort -u)\" = '--force-with-lease=worker:$old_tip' ]"
+check "  ...the leased push is the last push the command made" bash -c "[ \"\$(grep -E '^git .* push ' '$FAKE_LOG' | tail -1 | grep -c -- '--force-with-lease=worker:$old_tip')\" = 1 ]"
+check "  ...the PR was updated, not duplicated" printed 'updated #184'
+check "  ...and nothing was created" bash -c "! grep -q 'pr create' '$FAKE_LOG'"
+
+# --- 3c. a merge commit on origin's tip refuses, even though this tree once had it ----------------
+new_case worker worker
+"$real_git" -C "$REPO" checkout -q main
+printf 'four\n' >>"$REPO/other.txt"
+"$real_git" -C "$REPO" add other.txt
+"$real_git" -C "$REPO" commit -q -m "chore: trunk moves so the branch can merge it"
+"$real_git" -C "$REPO" push -q origin main
+"$real_git" -C "$REPO" checkout -q worker
+"$real_git" -C "$REPO" merge -q --no-ff -m "merge: bring trunk into the branch" main
+"$real_git" -C "$REPO" push -q origin worker
+merge_tip=$(remote_sha worker)
+if [ "$("$real_git" -C "$REPO" rev-list --parents -n1 "$merge_tip" | wc -w)" -gt 2 ]; then pass "setup: origin's tip is a merge commit ($merge_tip)"; else fail "setup: origin's tip is not a merge commit"; fi
+# trunk moves on another file, so the rebase is clean and only the merge commit is left behind
+trunk_moves_elsewhere "later-trunk"
+"$real_git" -C "$REPO" rebase -q main
+if [ "$(local_sha worker)" != "$merge_tip" ]; then pass "setup: the branch no longer has that merge commit, and this tree's reflog recorded it"; else fail "setup: the rebase left the merge commit in place"; fi
+run worker
+if [ "$rc" -ne 0 ]; then pass "a merge commit on origin's tip is refused"; else fail "a merge commit on origin's tip is refused (exit $rc)"; fi
+check "  ...the refusal names the merge commit as the case that fired" said 'merge commit'
+check "  ...and said nothing was pushed" said 'Nothing was pushed'
+check "  ...origin still holds the merge commit" bash -c "[ \"\$(git -C '$REPO.git' rev-parse refs/heads/worker)\" = '$merge_tip' ]"
+check "  ...no force of any kind in argv" bash -c "! grep -qE -- '--force' '$FAKE_LOG'"
+
+# --- 3d. the same subject by a different author refuses -----------------------------------------
+# The second path is subject and author together: a subject alone is not proof, so a rebased commit
+# whose author is somebody else is a foreign change, not this tree's rewrite.
+new_case worker worker
+old_tip=$(remote_sha worker)
+if conflict_rebase; then pass "setup: the rebase conflicted and was resolved"; else fail "setup: the rebase did not conflict, so this case proves nothing"; fi
+"$real_git" -C "$REPO" commit -q --amend --no-edit --author='other <other@example.invalid>'
+"$real_git" -C "$REPO" fetch -q origin
+subj=$("$real_git" -C "$REPO" log -1 --format=%s worker)
+auth=$("$real_git" -C "$REPO" log -1 --format=%an worker)
+if [ "$subj" = "feat: the worker's change" ] && [ "$auth" != worker ]; then pass "  ...the subject matches and the author does not ('$subj' by '$auth')"; else fail "  ...the subject matches and the author does not (got '$subj' by '$auth')"; fi
+run worker
+if [ "$rc" -ne 0 ]; then pass "a matching subject by a different author is refused"; else fail "a matching subject by a different author is refused (exit $rc)"; fi
+check "  ...the refusal names the remote author" said 'is by worker <worker@example.invalid>'
+check "  ...and says nothing was pushed" said 'Nothing was pushed'
+check "  ...origin still holds the commit this branch did not rewrite" bash -c "[ \"\$(git -C '$REPO.git' rev-parse refs/heads/worker)\" = '$old_tip' ]"
+check "  ...no force of any kind in argv" bash -c "! grep -qE -- '--force' '$FAKE_LOG'"
 
 # --- 4. the rule about the lease itself: never without the value, never without a lease ---------
 leases=$(grep -hoE -- '--force-with-lease=[^ ]*' "$work"/*.log 2>/dev/null || true)
