@@ -206,6 +206,10 @@ else
 	fail "guard wrote no 'herdr-app not on PATH; exiting' line to the temporary root"
 fi
 
+# 5a. The three shims onto the pi repo (#198, #200, #201): a missing tool is one line and exit 127,
+#     and a tool that is there gets the caller's arguments, stdout and exit status unchanged. The
+#     tools live in ~/.pi now, so the shim is the only thing left here that can break.
+expect_script "delegate, guard and space forward to ~/.pi/bin, or say so" 0 "shims: ok" scripts/tests/test-shims.sh
 # 5. The temporary root is honoured, not read through to the real one.
 expect "delegate list, empty temp root" 0 "no workers" -- \
 	env PATH=$safe_path "$bin/delegate" list
