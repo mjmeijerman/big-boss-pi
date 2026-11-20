@@ -45,6 +45,17 @@
 #             not one) and the gate half still runs and still blocks; no pr-check target is a named
 #             skip too
 #
+#   mutation  the CI job's own scope, opt-in: `bash scripts/mutate-changed.sh`, which derives the
+#             added line ranges of agent/extensions/**/*.ts from the branch's diff and leaves
+#             stryker to break at 100 on what the branch introduced. The whole-file run is 20+
+#             minutes and was never in this gate for that reason; the changed-line run is the
+#             scope CI already pays for, and a receipt makes the second one free. Not in the
+#             default set: a publish that does not ask for it is as fast as before, and the
+#             default run prints it as a named skip instead of leaving it out silently. The
+#             verdict is mutate-changed.sh's exit code, never a score parsed out of its output;
+#             a checkout with no scripts/mutate-changed.sh or no agent/stryker.conf.json has no
+#             mutation scope and says so instead of passing
+#
 # The checks run side by side and each suite inside them writes its own log: they read files, they
 # build throwaway roots, none of them shares state with another — so the wall clock is the slowest
 # check rather than the sum of them, and the output is still one line per check and one line per
@@ -56,8 +67,9 @@
 # Output is plain and meant to be pasted: one line per check, verdict, name, elapsed, detail; the
 # detail under a failing check; then a summary. No colour, no progress bars.
 #
-#   bin/preflight --list                      the six check names, nothing run
+#   bin/preflight --list                      the seven check names, nothing run
 #   bin/preflight --only semgrep feat/x       one check, on that branch
+#   bin/preflight --only mutation feat/x      the CI job's changed-line stryker run, here
 #   bin/preflight --slug w1                   the branch and body of worker w1
 #   bin/preflight --fresh --slug w1           run everything, ignore every receipt
 #
@@ -253,7 +265,7 @@ pf_receipt_write() {
 
 # --- the checks, in the order they run ---------------------------------------------------------
 
-preflight_ids=(behind syntax suites semgrep scrub body)
+preflight_ids=(behind syntax suites semgrep scrub body mutation)
 preflight_names=(
 	"behind (did a touched path also move on trunk?)"
 	"syntax (bash -n, node --check, shellcheck)"
@@ -261,7 +273,12 @@ preflight_names=(
 	"semgrep (the changed files)"
 	"scrub (env -i, the runner does not have your PATH)"
 	"body (docs budget and the body gate)"
+	"mutation (stryker on the changed extensions lines)"
 )
+# `preflight_ids` is also the default set, and it contains `mutation`: the default run selects it
+# but pf_applies refuses it unless the caller asked (`--only mutation`), so a publish pays nothing
+# for it while still seeing it named in the output. An opt-in check that is simply absent is a
+# check nobody remembers exists.
 
 name_of() {
 	local i
@@ -310,6 +327,10 @@ pf_collect() {
 	# one stray .sh in the diff takes the whole run off the fast path.
 	PF_DOCS_ONLY=1
 	PF_DOCS_COUNT=0
+	# The mutation check's scope, counted here so its skip line can say which of the three reasons
+	# it has — and so a diff of test files only (which mutate-changed.sh refuses rather than passes)
+	# is a skip, not a FAIL.
+	PF_MUTATION_FILES=0
 	while IFS= read -r f; do
 		[ -n "$f" ] || continue
 		PF_CHANGED+=("$f")
@@ -326,6 +347,11 @@ pf_collect() {
 		case $f in
 		scripts/tests/* | tests/* | *test-*.sh | *.test.mjs | *.test.js | *_test.py) PF_TESTS+=("$f") ;;
 		esac
+		case $f in
+		agent/extensions/?*.ts | agent/extensions/*/?*.ts | agent/extensions/*/*/?*.ts)
+			case $f in *__tests__* | *.test.ts) ;; *) PF_MUTATION_FILES=$((PF_MUTATION_FILES + 1)) ;; esac
+			;;
+		esac
 	done < <(git -C "$cwd" diff --name-only --diff-filter=ACMR "${mb}..${branch}" 2>/dev/null)
 	# An empty diff is not a prose diff: nothing changed at all is a different line.
 	[ "$PF_DOCS_COUNT" -gt 0 ] || PF_DOCS_ONLY=0
@@ -340,6 +366,14 @@ pf_applies() {
 	suites) [ "$PF_SHAPE" != none ] && [ "${#PF_CODE[@]}" -gt 0 ] ;;
 	body) return 0 ;;
 	behind) return 0 ;;
+	# Opt-in, and then only where the diff holds a mutant host and the checkout holds a way to run
+	# one. Everything else is a skip with a reason, never a pass: a mutation gate that passes because
+	# it could not run is one thing worse than no mutation gate.
+	mutation)
+		[ "${PF_MUTATION_REQUESTED:-0}" = 1 ] || return 1
+		[ "${PF_MUTATION_FILES:-0}" -gt 0 ] || return 1
+		pf_mutation_scope
+		;;
 	*) return 1 ;;
 	esac
 }
@@ -370,8 +404,25 @@ pf_skip_reason() {
 			printf 'docs-only diff: no code file changed, so the %s suite has nothing new to prove' "$PF_SHAPE_NAME"
 		fi
 		;;
+	mutation)
+		if [ "${PF_MUTATION_REQUESTED:-0}" != 1 ]; then
+			printf 'not requested (--only mutation) — the CI job mutates the changed lines and breaks at 100'
+		elif [ "${PF_MUTATION_FILES:-0}" -eq 0 ]; then
+			printf 'no changed agent/extensions/**/*.ts (a docs or shell-only diff introduces no mutant)'
+		else
+			printf 'no mutation scope in this checkout (needs scripts/mutate-changed.sh and agent/stryker.conf.json)'
+		fi
+		;;
 	*) printf 'does not apply' ;;
 	esac
+}
+
+# pf_mutation_scope <cwd> — the two files the mutation check needs: the range rule and the stryker
+# config it feeds. Both or neither: a script with no config runs stryker against stryker's defaults
+# over the whole tree, which is the 20-minute run this check exists to avoid.
+pf_mutation_scope() {
+	local cwd=${1:-$PF_CWD}
+	[ -f "$cwd/scripts/mutate-changed.sh" ] && [ -f "$cwd/agent/stryker.conf.json" ]
 }
 
 # pf_repo_shape <cwd> — "pi" (scripts/tests/*.test.mjs or a Makefile scripts-test target), "boss"
@@ -1013,6 +1064,40 @@ pf_check_body() {
 	return $rc
 }
 
+# --- check: union on the changed extensions lines (opt-in) ----------------------------------
+
+# The seventh check, and the only slow one, so it costs nothing unless asked for. The scope is not
+# invented here: `scripts/mutate-changed.sh` derives the added line ranges of
+# agent/extensions/**/*.ts from the branch's diff and runs stryker on exactly those, which is what
+# the CI job `mutation on changed files (stryker)` does. The verdict is that script's exit code,
+# never a score parsed out of its output: stryker's clear-text reporter is a display, and a gate
+# that reads its prose goes green on a run whose break threshold was never consulted.
+#
+# The whole-file run is the 20+ minutes that kept mutation out of this gate. This one is minutes,
+# and a receipt keyed on the tree makes the publish's second run free — which is the whole reason a
+# minutes-long check is tolerable inside a pre-publish gate.
+pf_check_mutation() {
+	local out rc conf=$PF_CWD/agent/stryker.conf.json
+	out=$(cd "$PF_CWD" && bash scripts/mutate-changed.sh 2>&1)
+	rc=$?
+	printf '%s\n' "$out"
+	if [ "$rc" -ne 0 ]; then
+		printf 'mutate-changed.sh exited %s: a mutant the changed lines introduced survived, and the CI job breaks at 100\n' "$rc"
+		return 1
+	fi
+	printf 'mutate-changed.sh exited 0: the script passed, and its exit code is the verdict here\n'
+	# The exit code is the verdict and nothing here parses a score — which is only worth anything
+	# when the script can fail. It cannot where the config's break is null (pi's is, on purpose:
+	# the whole-file weekly run has no break, and the pull-request job writes its own derived
+	# config with break 100 and calls stryker itself). So a pass here says "the script passed",
+	# and when the config cannot break, this line says so instead of letting the pass read as
+	# "no survivor". Measured on a 33-line diff: 7 survivors, exit 0.
+	if ! grep -qE '"break"[[:space:]]*:[[:space:]]*100([[:space:]]*[,}]|$)' "$conf" 2>/dev/null; then
+		printf 'note: %s does not break at 100, so this pass means the script passed, not that every mutant died — the CI job writes its own break-100 config and calls stryker itself; give scripts/mutate-changed.sh a break to make it a gate\n' "${conf#$PF_CWD/}"
+	fi
+	return 0
+}
+
 # --- dispatch ----------------------------------------------------------------------------------
 
 usage() {
@@ -1068,6 +1153,9 @@ preflight_main() {
 	local cwd="" slug="" branch="" selected=() id out rc fails=0 ran=0 start end ms part fresh=0
 	local -a parts=()
 	local total_start total_end
+	# The one opt-in check: set when `--only` really names it, so the default run prints its skip
+	# line without paying for the run.
+	PF_MUTATION_REQUESTED=0
 	while [ "$#" -gt 0 ]; do
 		case $1 in
 		--cwd)
@@ -1095,6 +1183,7 @@ preflight_main() {
 				[ -n "$part" ] || continue
 				id=$(resolve "$part") || die "no such check: $part (bin/preflight --list names them)"
 				selected+=("$id")
+				[ "$id" != mutation ] || PF_MUTATION_REQUESTED=1
 			done
 			shift 2
 			;;
@@ -1104,6 +1193,7 @@ preflight_main() {
 				[ -n "$part" ] || continue
 				id=$(resolve "$part") || die "no such check: $part (bin/preflight --list names them)"
 				selected+=("$id")
+				[ "$id" != mutation ] || PF_MUTATION_REQUESTED=1
 			done
 			shift
 			;;
