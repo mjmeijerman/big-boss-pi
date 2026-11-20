@@ -1,0 +1,8 @@
+#!/bin/sh
+# space moved to the pi repo (~/.pi/bin/space); this shim stays for scripts that call it by this path.
+tool="$HOME/.pi/bin/space"
+if [ ! -x "$tool" ]; then
+	printf 'bin/space: %s is missing — the tool lives in the pi repo (~/.pi/bin/space); install it there\n' "$tool" >&2
+	exit 127
+fi
+exec "$tool" "$@"
