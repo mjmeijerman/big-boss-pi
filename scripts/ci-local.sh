@@ -13,16 +13,25 @@
 #   bash scripts/ci-local.sh --only lint        one job (repeatable, or comma-separated)
 #   bash scripts/ci-local.sh --fresh            ignore every receipt, empty the ledger
 #   bash scripts/ci-local.sh --list             the four job names, nothing run
+#   bash scripts/ci-local.sh --jobs 2           at most two jobs at a time (default: one per
+#                                               selected job, capped at 4; --jobs 1 is serial)
+#
+# The jobs are independent — none reads another's output — so more than one runs at a time. Their
+# output is buffered per job and printed in the order the jobs are listed, never in the order they
+# finish, so a transcript reads the same as the serial one. Wall clock per job and for the whole
+# run is printed, which is how the win is seen and a slow job is named.
 #
 # The `offline` job is the expensive one: it runs the repo's own test scripts. Those go through
 # bin/receipts.sh, the ledger `bin/preflight` writes, so a script already answered on this tree is
 # read instead of run — in either direction, since `preflight`'s `suites` check reads what this
 # wrote. The job's line carries the split, and so does the summary:
 #
-#   pass offline behaviour (no ollama, no herdr-app)    offline behaviour: ok (20 cached, 2 ran)
-#   ci-local: 4/4 passed at commit abc1234 (main); offline: 20 cached, 2 ran
+#   pass offline behaviour (no ollama, no herdr-app)   83s  offline behaviour: ok (20 cached, 2 ran)
+#   ci-local: 4/4 passed at commit abc1234 (main) in 83700ms, slowest: offline 83s; offline: 20 cached, 2 ran
 #
 # --fresh bypasses the ledger and empties it, so the next run cannot reuse what this one refused to.
+# A `--jobs` that is 0 or not a number is a usage error (exit 2), never a silent serialise, and a
+# bare `--only <one job>` stays the serial path: no temp dir, no buffered transcript.
 #
 # No colour, no progress bars: the output is meant to be pasted into a report.
 set -uo pipefail
@@ -125,6 +134,7 @@ job_docs() {
 
 # --- dispatch ---------------------------------------------------------------------------------
 
+
 job_ids=(syntax lint offline docs)
 job_names=(
 	"syntax (bash -n, node --check)"
@@ -153,17 +163,27 @@ resolve() {
 }
 
 usage() {
-	printf 'usage: bash scripts/ci-local.sh [--only JOB]... [--fresh] [--list]\n' >&2
+	printf 'usage: bash scripts/ci-local.sh [--only JOB]... [--jobs N] [--fresh] [--list]\n' >&2
 	printf 'jobs: %s\n' "${job_ids[*]}" >&2
 	exit 2
 }
 
 selected=()
+jobs_cap=""
 while [ $# -gt 0 ]; do
 	case $1 in
 	--list)
 		for n in "${job_names[@]}"; do printf '%s\n' "$n"; done
 		exit 0
+		;;
+	--jobs)
+		[ $# -ge 2 ] || usage
+		jobs_cap=$2
+		shift 2
+		;;
+	--jobs=*)
+		jobs_cap=${1#--jobs=}
+		shift
 		;;
 	--only)
 		[ $# -ge 2 ] || usage
@@ -200,36 +220,107 @@ if [ ${#selected[@]} -eq 0 ]; then
 	selected=("${job_ids[@]}")
 fi
 
-fails=0
-ran=0
-for id in "${selected[@]}"; do
-	ran=$((ran + 1))
-	out=$(job_"$id" 2>&1)
-	rc=$?
-	# What the ledger answered and what it did not, read off ci-offline's own last line — the job
-	# runs in a subshell here, so the split is parsed here and the summary repeats it: a warm run
-	# must not read as a full one.
+# One job at a time unless asked otherwise; never more slots than there are jobs to run, never
+# more than four, and a bad --jobs is a usage error rather than a silent serialise.
+case $jobs_cap in
+'' ) [ "${#selected[@]}" -gt 4 ] && jobs_cap=4 || jobs_cap=${#selected[@]} ;;
+0 | *[!0-9]*) printf 'ci-local: --jobs wants a positive number, not %s\n' "$jobs_cap" >&2; usage ;;
+*) : ;;
+esac
+[ "$jobs_cap" -gt 4 ] && jobs_cap=4
+[ "$jobs_cap" -gt "${#selected[@]}" ] && jobs_cap=${#selected[@]}
+[ "$jobs_cap" -lt 1 ] && jobs_cap=1
+
+# start <id> — run one job in the background, its transcript and "<rc> <ms>" into $tmp. Nothing is
+# printed until every job has finished, so two jobs can never interleave a line of output.
+start() {
+	(
+		local s e r
+		s=$(date +%s%N)
+		job_"$1" >"$tmp/$1.out" 2>&1
+		r=$?
+		e=$(date +%s%N)
+		printf '%s %s\n' "$r" "$(((e - s) / 1000000))" >"$tmp/$1.status"
+	) &
+}
+
+# emit <id> <rc> <ms> <transcript> — one line per check: verdict, job name, its wall clock, then the
+# detail that makes it useful. A failure keeps its whole transcript under the line, indented. The
+# split the ledger answered is parsed here too, off ci-offline's own last line, so both dispatch
+# paths report it: a warm run must not read as a full one.
+emit() {
+	local id=$1 rc=$2 ms=$3 out=$4
 	case $id in
 	offline) offline_split=$(printf '%s' "$out" | sed -nE 's/.*\(([0-9]+ cached, [0-9]+ ran)\).*/\1/p') ;;
 	esac
 	if [ "$rc" = 0 ]; then
-		verdict=pass
-		detail=$out
+		printf '%-4s %-45s %4ss  %s\n' pass "$(name_of "$id")" "$((ms / 1000))" "$out"
 	else
-		verdict=FAIL
 		fails=$((fails + 1))
-		detail="see below"
-	fi
-	# One line per check: verdict, job name, then the detail that makes it useful.
-	if [ "$verdict" = pass ]; then
-		printf '%-4s %-45s %s\n' "$verdict" "$(name_of "$id")" "$detail"
-	else
-		printf '%-4s %-45s %s\n' "$verdict" "$(name_of "$id")" "exit $rc"
+		printf '%-4s %-45s %4ss  %s\n' FAIL "$(name_of "$id")" "$((ms / 1000))" "exit $rc"
 		printf '%s\n' "$out" | sed 's/^/  /'
 	fi
-done
+	time_pairs+=("$ms $id")
+}
+
+fails=0
+ran=0
+time_pairs=()
+wall_start=$(date +%s%N)
+if [ "$jobs_cap" -le 1 ]; then
+	# Serial, exactly as before: one job at a time, its output printed before the next starts. No
+	# temp dir: this is the path a small box or `--only` takes, and it needs nothing a bare PATH
+	# cannot offer.
+	for id in "${selected[@]}"; do
+		ran=$((ran + 1))
+		s=$(date +%s%N)
+		out=$(job_"$id" 2>&1)
+		rc=$?
+		e=$(date +%s%N)
+		emit "$id" "$rc" "$(((e - s) / 1000000))" "$out"
+	done
+else
+	# Every job started together, at most $jobs_cap at a time; a finished job frees its slot.
+	tmp=$(mktemp -d) || {
+		printf 'ci-local: cannot create a temp dir for the job transcripts\n' >&2
+		exit 1
+	}
+	trap 'rm -rf "$tmp"' EXIT
+	pids=()
+	for id in "${selected[@]}"; do
+		ran=$((ran + 1))
+		while [ ${#pids[@]} -ge "$jobs_cap" ]; do
+			wait "${pids[0]}" 2>/dev/null || true
+			pids=("${pids[@]:1}")
+		done
+		start "$id"
+		pids+=($!)
+	done
+	for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
+	# Printed in the order the jobs are listed, never in the order they finished.
+	for id in "${selected[@]}"; do
+		rc=1
+		ms=0
+		[ -f "$tmp/$id.status" ] && read -r rc ms <"$tmp/$id.status"
+		out=""
+		[ -f "$tmp/$id.out" ] && out=$(cat "$tmp/$id.out")
+		emit "$id" "$rc" "$ms" "$out"
+	done
+fi
+wall_end=$(date +%s%N)
+wall_ms=$(((wall_end - wall_start) / 1000000))
 
 sha=$(git rev-parse --short HEAD 2>/dev/null || printf 'unknown')
 branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || printf 'unknown')
-printf '\n%s\n' "ci-local: $((ran - fails))/$ran passed at commit $sha ($branch)${offline_split:+; offline: $offline_split}"
+slowest=""
+for pair in "${time_pairs[@]}"; do
+	[ -z "$slowest" ] && slowest=$pair
+	[ "${pair%% *}" -gt "${slowest%% *}" ] && slowest=$pair
+done
+line="ci-local: $((ran - fails))/$ran passed at commit $sha ($branch) in ${wall_ms}ms"
+[ -n "$slowest" ] && line="$line, slowest: ${slowest#* } $(( ${slowest%% *} / 1000 ))s"
+# The ledger's answer, when the offline job ran: appended last so "2 ran in 12345ms" can never be
+# read as one clause.
+line="$line${offline_split:+; offline: $offline_split}"
+printf '\n%s\n' "$line"
 [ "$fails" = 0 ]

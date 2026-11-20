@@ -348,11 +348,20 @@ GitHub Actions cannot start a job (billing, an outage), they otherwise happen on
 types them by hand. `bash scripts/ci-local.sh` is that hand: it runs the same four jobs, with the
 same file lists and the same commands, against this checkout; it prints one `pass` / `FAIL` line
 per job, showing the offending file and its own error output when one fails; it exits non-zero
-when any of them fails; and its last line names the commit it ran against. `--only lint` re-runs
+when any of them fails; and its last line names the commit it ran against, the wall clock of the
+run and the slowest job. The four jobs share no output, so a full run starts them together and
+prints each job's buffered transcript in job order, with its own wall clock; `--jobs N` caps how
+many run at once, and `--jobs 1` is the old serial run. The `offline` job answers from the receipt
+ledger `bin/receipts.sh` keeps, and both its line and the summary say how much was reused
+(`offline: 20 cached, 2 ran`); `--fresh` ignores that ledger and empties it for one run. `--only lint`
+re-runs
 one job after a one-line fix, `--list` names the four. It mirrors `.github/workflows/ci.yml` and
 is the copy that must be updated when that workflow's file lists change — do not keep a second
 copy elsewhere. `bash scripts/tests/test-ci-local.sh` proves it exits non-zero on a planted
-failure and zero on a clean tree; `ci-offline.sh` runs that suite, so CI covers it too.
+failure and zero on a clean tree; `bash scripts/tests/test-ci-local-parallel.sh` proves two jobs
+run side by side, print in job order, that a failing one does not lose another's transcript, and
+that `--fresh --jobs 2` reports the split and the wall clock in the same run.
+`ci-offline.sh` runs the first of those suites, so CI covers it too.
 
 ## Why the space cannot be closed
 
