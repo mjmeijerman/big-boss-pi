@@ -37,6 +37,10 @@
 #      --fresh re-runs; a cached FAIL still blocks with the transcript that failed; a check a fast
 #      path skipped leaves no receipt behind.
 #
+#   M. a TypeScript diff is type-checked when the checkout can, and otherwise passes with a named
+#      skip the summary counts — never by feeding a .ts file to bash -n, and never green on the
+#      strength of a skip while another file in the same run really failed.
+#
 #   bash scripts/tests/test-preflight.sh      exit 0 = every case held
 set -uo pipefail
 
@@ -1062,6 +1066,89 @@ elif [ "$(receipt_files)" != 0 ]; then
 	fail "behind wrote $(receipt_files) receipt(s): its answer is about origin, not this tree"
 else
 	pass "behind is answered fresh on every run and leaves no receipt to reuse"
+fi
+
+# --- M. a TypeScript diff: the compiler, or a named skip — never bash -n -------------------------
+
+# M1. A .ts-only diff in a checkout with no type checker passes with a named skip line, counts the
+# file as skipped in the summary, and never reaches bash -n. This is the pi shape: `bin/preflight`
+# fed `agent/extensions/*.ts` to bash -n and failed every TS diff with
+# "line 60: syntax error near unexpected token `('", so a green TS branch could never publish.
+reset_case ts-no-checker
+mkdir -p "$REPO/agent"
+printf 'export function cwdIsGuarded(cwd: string): boolean {\n\treturn cwd !== "";\n}\n' >"$REPO/agent/tool.ts"
+commit_branch "feat(agent): a typescript file"
+run "$pf" --only syntax --cwd "$REPO" feat/w1
+if [ "$RC" != 0 ]; then
+	fail "a clean .ts file failed the syntax check: exit $RC — $OUT"
+elif ! said "TypeScript in agent/tool.ts: no type check in this checkout"; then
+	fail "a .ts file with no type checker did not name the skip — $OUT"
+elif said "syntax error near unexpected token"; then
+	fail "the .ts file was still fed to bash -n — $OUT"
+elif ! said "TypeScript: 0 file(s) type-checked, 1 skipped"; then
+	fail "the summary does not count the .ts file as skipped — $OUT"
+elif ! printf '%s\n' "$OUT" | grep -q '^pass  syntax'; then
+	fail "a TS-only diff did not pass the syntax check — $OUT"
+else
+	pass "a .ts-only diff passes with a named skip that the summary counts, and no bash -n"
+fi
+
+# M2. A .ts file with a genuine type error fails when the checkout can type-check, and the verdict is
+# the compiler's. The fixture ships the compiler: this machine has no typescript installed, so the
+# fixture's `tsc` reads the project and reports the one deliberate error the way tsc would. Preflight
+# owns the plumbing — it runs the checkout's checker over the project and reports its answer.
+reset_case ts-typeerror
+mkdir -p "$REPO/node_modules/.bin" "$REPO/src"
+cat >"$REPO/node_modules/.bin/tsc" <<'STUB'
+#!/usr/bin/env node
+const fs = require("fs"), path = require("path");
+const bad = [];
+(function walk(d) {
+	for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+		const p = path.join(d, e.name);
+		if (e.isDirectory()) {
+			if (e.name !== "node_modules" && e.name !== ".git") walk(p);
+		} else if (p.endsWith(".ts") && /:\s*number\s*=\s*"/.test(fs.readFileSync(p, "utf8"))) {
+			bad.push(path.relative(process.cwd(), p));
+		}
+	}
+})(process.cwd());
+for (const p of bad) console.log(`${p}(1,7): error TS2322: Type 'string' is not assignable to type 'number'.`);
+process.exit(bad.length ? 2 : 0);
+STUB
+chmod +x "$REPO/node_modules/.bin/tsc"
+printf '{ "compilerOptions": { "strict": true } }\n' >"$REPO/tsconfig.json"
+printf 'export const n: number = "not a number";\n' >"$REPO/src/bad.ts"
+commit_branch "feat(src): a typescript type error"
+run "$pf" --only syntax --cwd "$REPO" feat/w1
+if [ "$RC" = 0 ]; then
+	fail "a type error passed a checkout that can type-check — $OUT"
+elif ! said "FAIL" || ! said "TypeScript"; then
+	fail "the failing check is not reported as the TypeScript verdict — $OUT"
+elif ! said "src/bad.ts"; then
+	fail "the compiler's diagnostic is not shown — $OUT"
+elif said "syntax error near unexpected token"; then
+	fail "the .ts file was fed to bash -n instead of the compiler — $OUT"
+else
+	pass "a .ts type error fails on the checkout's own compiler, not on bash -n"
+fi
+
+# M3. A skip never turns a run green: a .ts whose type check cannot run beside a .sh with a real
+# syntax error is still a FAIL, and the failing file is the shell one.
+reset_case ts-skip-beside-sh
+mkdir -p "$REPO/agent" "$REPO/scripts"
+printf 'export const ok: string = "fine";\n' >"$REPO/agent/tool.ts"
+printf '#!/usr/bin/env bash\nif [ 1 = 1 ]; then\nprintf "unclosed if\\n"\n' >"$REPO/scripts/broken.sh"
+commit_branch "feat: a clean .ts beside a broken .sh"
+run "$pf" --only syntax --cwd "$REPO" feat/w1
+if [ "$RC" = 0 ]; then
+	fail "a skip next to a real failure went green — $OUT"
+elif ! said "scripts/broken.sh"; then
+	fail "the failing shell file is not named — $OUT"
+elif ! said "TypeScript in agent/tool.ts: no type check in this checkout"; then
+	fail "the .ts skip line is missing from the same run — $OUT"
+else
+	pass "a TS skip beside a real shell failure still fails, and names both"
 fi
 
 unset SUITE_LOG
