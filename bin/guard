@@ -1,8 +1,14 @@
 #!/bin/sh
-# guard moved to the pi repo (~/.pi/bin/guard); this shim stays for scripts that call it by this path.
+# guard moved to the pi repo (~/.pi/bin/guard); this shim stays for scripts that call it by this
+# path. Executed, it hands over; sourced (bin/preflight and bin/publish read guard's helpers), it
+# hands over its functions the same way -- the real file only dispatches when it is executed.
 tool="$HOME/.pi/bin/guard"
 if [ ! -x "$tool" ]; then
 	printf 'bin/guard: %s is missing — the tool lives in the pi repo (~/.pi/bin/guard); install it there\n' "$tool" >&2
 	exit 127
 fi
-exec "$tool" "$@"
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ "${BASH_SOURCE[0]}" != "$0" ]; then
+	. "$tool"
+else
+	exec "$tool" "$@"
+fi

@@ -1,8 +1,14 @@
 #!/bin/sh
-# delegate moved to the pi repo (~/.pi/bin/delegate); this shim stays for scripts that call it by this path.
+# delegate moved to the pi repo (~/.pi/bin/delegate); this shim stays for scripts that call it by this
+# path. Executed, it hands over; sourced (bin/preflight and bin/publish read delegate's helpers), it
+# hands over its functions the same way -- the real file only dispatches when it is executed.
 tool="$HOME/.pi/bin/delegate"
 if [ ! -x "$tool" ]; then
 	printf 'bin/delegate: %s is missing — the tool lives in the pi repo (~/.pi/bin/delegate); install it there\n' "$tool" >&2
 	exit 127
 fi
-exec "$tool" "$@"
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ "${BASH_SOURCE[0]}" != "$0" ]; then
+	. "$tool"
+else
+	exec "$tool" "$@"
+fi
