@@ -28,11 +28,11 @@ started here.
 | The rules every agent here loads | `$PI_BOSS_ROOT/AGENTS.md` | Pi loads `AGENTS.md` from the working directory and every parent, on every start, with no project trust needed. New or reloaded agents therefore start with the same knowledge |
 | Decision model | `bin/jev` → `~/.local/bin/jev` | TypeSafe's Jev on api.typesafe.ai, one typed request with a calibrated probability per question; decides mode, route, thinking effort and permissions (a spawn no longer asks it a worker count: one space, one worker) |
 | Local worker | `bin/local-run` | runs a local task on the ollama model (`bin/local-model.mjs`), headless: prompt in, answer on stdout, no space and no spec, no network; records one line in `state/usage.jsonl` |
-| Spaces | `bin/space` → shim onto `~/.pi/bin/space` | `new`/`list`/`show`/`forget` over `~/.pi/state/spaces/<slug>/space.json`; `delegate` reads the space from the folder it runs in and refuses in a folder no space claims |
-| Delegation | `bin/delegate` → shim onto `~/.pi/bin/delegate` | one jev call for mode, route and thinking effort, one worker as a tab in this space, the spec, where the report lands, and every decision in the space's `decisions.jsonl`; `delegate finish` runs preflight, publish, wipe and close in that order |
+| Spaces | `~/.pi/bin/space` (also `bin/space` from an install of the pi repo) | `new`/`list`/`show`/`forget` over `~/.pi/state/spaces/<slug>/space.json`; `delegate` reads the space from the folder it runs in and refuses in a folder no space claims |
+| Delegation | `~/.pi/bin/delegate` (the `bin/delegate` here is the pre-space copy the offline suite runs) | one jev call for mode, route and thinking effort, one worker as a tab in this space, the spec, where the report lands, and every decision in the space's `decisions.jsonl`; `delegate finish` runs preflight, publish, wipe and close in that order |
 | Worker modes | `bin/pi-bare`, `bin/pi-sandboxed`, `bin/pi-nonet` | `delegate` picks one from Jev's answer. All three find pi the same way, at runtime (`bin/pi-resolve.sh`: `$PI_BIN`, `PATH`, `$PNPM_HOME`, `$HOME`, `%APPDATA%`), so none of them carries a home directory; on native Windows the two sandboxed modes refuse with the WSL2 line instead of running bare |
 | Preflight | `bin/preflight` | the checks CI would run, on this branch, here: that the branch's base is not behind a just-fetched `origin/<trunk>` (a branch cut before a pull request merged arrives `CONFLICTING`; the check names the count, the colliding paths and the rebase, and an unreachable origin is a named pass), `bash -n`/`node --check` on the changed files, the repo's own suite, semgrep over the changed files, the changed tests under a scrubbed `env -i`, and the body gate on the exact body `bin/publish` would send. `delegate finish` runs it before the publish, and no push happens past a failing check |
-| Spaces and the guard | `bin/guard` → shim onto `~/.pi/bin/guard`, started by `systemd/big-boss-pi-guard.service` | one pass every 20 seconds over every recorded space: a vanished space is rebuilt from its record (its own name, project folder and Boss tab name), the Boss tab is resumed from its own session entry, and nothing is ever closed, renamed or moved. A worker's tab is not the guard's business — `delegate wait --forever` restarts a dead worker, and a finished one stays closed. It reports a space whose project folder is gone and names `bin/space forget <slug>`; it never touches a space named `pi-master` |
+| Spaces and the guard | `~/.pi/bin/guard`, started by `systemd/big-boss-pi-guard.service` | one pass every 20 seconds over every recorded space: a vanished space is rebuilt from its record (its own name, project folder and Boss tab name), the Boss tab is resumed from its own session entry, and nothing is ever closed, renamed or moved. A worker's tab is not the guard's business — `delegate wait --forever` restarts a dead worker, and a finished one stays closed. It reports a space whose project folder is gone and names `bin/space forget <slug>`; it never touches a space named `pi-master` |
 | Delegation-only enforcement | `~/.pi/agent/extensions/big-boss-pi-guard.ts` | blocks the `write` and `edit` tools, and shell writes into the directory (`echo x > …`, `rm/mv/cp/tee/sed -i`), when the session's cwd is under this workspace **or** under `~/pi-master`; no-ops everywhere else, including for a worker session (`PI_WORKER=1`) |
 | Rollback helper | `bin/finish-rename.sh` | closes the old `pi-master` space on request and prints how to delete the old tree. Runs nothing by default |
 
@@ -44,9 +44,6 @@ still accepted as a deprecated fallback.
 
 `bin/publish`, `bin/jev` and `bin/local-run` are bash programs, so they resolve bash at runtime
 (`bin/shell-resolve.sh`) and re-exec themselves under it — a shebang is not a promise on Windows.
-`bin/delegate`, `bin/guard` and `bin/space` are `/bin/sh` shims: they exec the same-named tool in
-`~/.pi/bin` and exit 127 with one line naming it when it is not installed, so a moved tool never
-looks like a broken one. `PI_GIT_BASH=/path/to/bash.exe` sets it explicitly, ahead of a `bash` on `PATH`;
 with none found they print `no bash found — set PI_GIT_BASH=/path/to/bash.exe` and exit 127.
 
 ## Routing: decide before you work
@@ -391,8 +388,9 @@ seconds over every recorded space and puts back only what the record says:
 - a forgotten space, and a space in Herdr with no record, are left alone: recreating what nobody
   recorded is how a program starts making spaces for people.
 
-The service is `systemd/big-boss-pi-guard.service`; its `ExecStart` is the shim
-`%h/big-boss-pi/bin/guard`, which execs `~/.pi/bin/guard`. `--once` runs exactly one pass (`--dry-run`
+The service is `systemd/big-boss-pi-guard.service`. Its `ExecStart` still points at
+`%h/big-boss-pi/bin/guard`, the pre-space copy; the space-aware supervisor is `~/.pi/bin/guard`, and the
+service moves when the offline suite no longer needs this repo's copy. `--once` runs exactly one pass (`--dry-run`
 prints the plan and calls no `herdr-app` at all) and `--space <slug>` limits a pass to one space. The
 suite that drives it against a stub `herdr-app` is the pi repo's
 `scripts/tests/test-guard-supervisor.sh`.
@@ -432,7 +430,7 @@ running session), and `bin/space new` also writes this project's own block betwe
 re-run replaces it instead of growing a second copy. Rules you add here do not leak into other spaces
 — they are context files of this directory only.
 
-To change how delegation works, edit `~/.pi/bin/delegate` — a fix behind the shim is a fix that
+To change how delegation works, edit `~/.pi/bin/delegate` — a fix in a copy here is a fix that
 disappears. To change what Jev weighs, edit the `POLICY` string in `bin/jev.mjs`. Both are plain
 shell/JS, no build step.
 
