@@ -1939,8 +1939,11 @@ cmd_wait() {
 	done
 	local report=$REPORTS/$slug.md
 	# A worker whose terminal is gone will never write that report: waiting the timeout out is the
-	# bug this state exists to name, so it is said once and now, not after ten minutes.
-	if ! report_written "$report" && [ "$(worker_state "$slug")" = gone ]; then
+	# bug this state exists to name, so it is said once and now, not after ten minutes. The file is
+	# what decides: `spawn` writes a skeleton before the space exists, so an unfilled skeleton is a
+	# worker that started and stopped (`report_written` false), not one that never wrote at all
+	# (`-e` false). Only the second sends the reader to "spawn the task again".
+	if [ ! -e "$report" ] && [ "$(worker_state "$slug")" = gone ]; then
 		die "$slug is gone: its recorded herdr terminal $(delegation_field "$slug" terminal) is no longer listed and it never wrote $report — waiting cannot make it report. Check the space, then spawn the task again or write the report by hand"
 	fi
 	command -v timeout >/dev/null 2>&1 || die "timeout not found"
