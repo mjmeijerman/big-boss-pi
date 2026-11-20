@@ -317,8 +317,17 @@ commit named, rather than forced.
 
 It refuses, naming the reason, when the slug is unknown, the report is missing or has no
 Evidence block (the same check `delegate close` uses), the report has no `Review tier:` line or
-names a tier that is not High, Medium or Low, the branch carries no `Agent-Slug:` trailer, `gh`
-is not on PATH, or the tree is not a git repo.
+names a tier that is not High, Medium or Low, the branch carries no `Agent-Slug:` trailer, the
+branch is not the one the delegation record names and the trailer did not find it either (both
+names are printed, and nothing is pushed), `gh` is not on PATH, or the tree is not a git repo.
+
+The pull request's state is read back, never assumed from the command's own output. The last line
+of a publish is `published <slug>: #<n> now at <sha> (<state>, <mergeable>)` — `gh pr view --json
+headRefOid,state,mergeable` — and a head sha that is still the old one after a few seconds of
+re-read fails the publish, naming both shas, because a push GitHub does not show is not a publish.
+A branch origin already holds at the worker's head prints `nothing new to push: #<n> is already at
+<sha>` instead and still refreshes the body, and `delegate finish` then ends with `already
+published` rather than `published`: a verdict over a branch that did not move is not a publish.
 
 ## Review gate
 

@@ -2358,12 +2358,21 @@ cmd_finish() {
 	fi
 
 	say "finish: $slug — 2/4 publish"
-	if ! "$pub" "$slug" ${lookup_cwd:+--cwd "$lookup_cwd"}; then
+	# publish's own last line is the verdict, and a verdict over a branch that did not move is not a
+	# publish: `nothing new to push` means the work was already on origin, so the last line says
+	# `already published` instead of claiming this run pushed something. The output is captured and
+	# replayed unchanged, so nothing publish said is lost — only read.
+	local pub_out="" publish_word=published
+	if ! pub_out=$("$pub" "$slug" ${lookup_cwd:+--cwd "$lookup_cwd"}); then
 		printf '%s: finish stopped at step 2 of 4 (publish) for %s: nothing was wiped, nothing was closed, and the space is still open.\n' "$prog" "$slug" >&2
 		printf 'Fix: the refusal above names what the report is missing. Once it is fixed, run this again:\n' >&2
 		printf '  %s finish %s\n' "$BIN/delegate" "$slug" >&2
 		return 1
 	fi
+	printf '%s\n' "$pub_out"
+	case $pub_out in
+	*"nothing new to push: "*) publish_word="already published" ;;
+	esac
 
 	if wipe_recorded "$slug"; then
 		say "finish: $slug — 3/4 wipe: already recorded, keeping that line"
@@ -2386,7 +2395,7 @@ cmd_finish() {
 		printf '  %s finish %s\n' "$BIN/delegate" "$slug" >&2
 		return 1
 	fi
-	say "finish: $slug — preflighted, published, wiped, closed"
+	say "finish: $slug — preflighted, $publish_word, wiped, closed"
 }
 
 # cmd_sweep -- close every worker whose report exists and does not need a user decision.
