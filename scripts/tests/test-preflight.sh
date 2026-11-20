@@ -20,7 +20,11 @@
 #   G. a pi-shaped checkout — no root AGENTS.md but a `pr-check` target — skips the docs budget by
 #      name, keeps the body gate blocking, and exits nonzero only for a real body problem;
 #   H. a checkout with neither a root AGENTS.md nor a body gate passes with two named skips;
-#   F. `--skip-preflight "<reason>"` publishes and records the reason in state/decisions.jsonl.
+#   F. `--skip-preflight "<reason>"` publishes and records the reason in state/decisions.jsonl;
+#   I. the suites run each exactly once and side by side: an unrecognised scripts-test target is run
+#      whole and exactly once, the two globs are run directly (the node suite never twice, which is
+#      what the old shape did), every discovered suite is reported with its own time, the cap holds,
+#      a failing suite fails the gate with its name, and a prose-only diff names both fast paths.
 #
 #   bash scripts/tests/test-preflight.sh      exit 0 = every case held
 set -uo pipefail
@@ -500,6 +504,160 @@ elif gh_saw '^gh pr (create|edit) ' || [ -n "$(origin_head)" ]; then
 	fail "a pull request or a push happened for a report with no preflight run"
 else
 	pass "a report whose Evidence block names no bin/preflight run is refused, with what to paste"
+fi
+
+# --- I. the suites: once each, side by side, and every one of them reported --------------------
+
+# I1. A superset whose recipe this check does not recognise is run as it is, exactly once. Guessing
+# that every scripts-test is the two globs is how a gate quietly stops doing something the target
+# does; running both the target and the globs is the double run this replaces.
+reset_case superset-once
+mkdir -p "$REPO/scripts/tests"
+printf '#!/usr/bin/env bash\n# a changed script, and a clean one\nprintf "ok\\n"\n' >"$REPO/scripts/tool.sh"
+printf '#!/usr/bin/env bash\nprintf "one: ok\\n"\n' >"$REPO/scripts/tests/one.test.sh"
+cat >"$REPO/Makefile" <<'MAKE'
+scripts-test:
+	@printf 'run\n' >> "$(CURDIR)/superset.log"
+	@bash "$(CURDIR)/scripts/tests/one.test.sh"
+MAKE
+commit_branch "test(scripts): a superset recipe nobody can guess at"
+run "$pf" --only suites --cwd "$REPO" feat/w1
+runs=$(grep -c . "$REPO/superset.log" 2>/dev/null || printf 0)
+if [ "$RC" != 0 ]; then
+	fail "a superset the check cannot recognise did not pass: exit $RC — $OUT"
+elif [ "$runs" != 1 ]; then
+	fail "the superset target ran $runs time(s), wanted exactly one — $OUT"
+elif ! said "make scripts-test"; then
+	fail "the run does not name the superset it ran — $OUT"
+else
+	pass "an unrecognised scripts-test target is run whole, exactly once, and named"
+fi
+
+# I2. The two globs: every discovered suite reported, every one of them run once, and the run
+# shaped by the cap rather than by the number of suites. Each suite leaves its own start and end
+# behind, so "ran once" and "ran side by side" are read from what happened, not from the output.
+reset_case suites-parallel
+mkdir -p "$REPO/scripts/tests"
+printf '#!/usr/bin/env bash\nprintf "ok\\n"\n' >"$REPO/scripts/tool.sh"
+cat >"$REPO/scripts/tests/mark.test.mjs" <<'TEST'
+import { appendFileSync } from "node:fs";
+import { test } from "node:test";
+test("mark", () => {
+	appendFileSync(`${process.env.SUITE_MARK}/mjs`, "x\n");
+});
+TEST
+cat >"$REPO/Makefile" <<'MAKE'
+scripts-test:
+	@echo "== scripts-test: node --test scripts/tests/*.test.mjs"
+	@node --test scripts/tests/*.test.mjs
+	@for t in scripts/tests/*.test.sh; do \
+		[ -e "$$t" ] || continue; \
+		echo "== scripts-test: bash $$t"; \
+		bash "$$t" || { status=$$?; echo "== scripts-test: FAILED $$t (exit $$status)" >&2; exit $$status; }; \
+	done
+	@echo "== scripts-test: every suite passed"
+MAKE
+for n in a b c d e; do
+	{
+		printf '#!/usr/bin/env bash\n'
+		printf 'start=$(date +%%s%%N)\n'
+		printf 'sleep 1\n'
+		printf 'end=$(date +%%s%%N)\n'
+		printf 'printf "%%s %%s\\n" "$start" "$end" >>"$SUITE_MARK/%s"\n' "$n"
+	} >"$REPO/scripts/tests/test-$n.test.sh"
+done
+mkdir -p "$CASE/marks"
+commit_branch "test(scripts): five bash suites and a node suite behind one Makefile"
+run env SUITE_MARK="$CASE/marks" "$pf" --only suites --cwd "$REPO" feat/w1
+shape=$(SUITE_MARK="$CASE/marks" node -e '
+	const fs = require("fs");
+	const dir = process.env.SUITE_MARK;
+	const marks = fs.readdirSync(dir);
+	const spans = marks.filter((m) => m !== "mjs").map((m) =>
+		fs.readFileSync(`${dir}/${m}`, "utf8").trim().split(" ").map(Number));
+	const twice = marks.filter((m) => fs.readFileSync(`${dir}/${m}`, "utf8").trim().split("\n").length !== 1);
+	const points = spans.flatMap(([s, e]) => [[s, 1], [e, -1]]).sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+	let now = 0;
+	let peak = 0;
+	for (const [, d] of points) { now += d; peak = Math.max(peak, now); }
+	process.stdout.write(`${marks.length} ${twice.length} ${peak}`);' 2>&1)
+if [ "$RC" != 0 ]; then
+	fail "the two globs did not pass: exit $RC — $OUT"
+elif ! said "6 suite(s) discovered, 6 ran once each"; then
+	fail "the run does not report six suites discovered and six run — $OUT"
+elif [ "${shape%% *}" != 6 ]; then
+	fail "six suites were reported but ${shape%% *} left a mark ($shape)"
+elif [ "$(printf '%s' "$shape" | awk '{ print $2 }')" != 0 ]; then
+	fail "a suite ran twice: $(printf '%s' "$shape" | awk '{ print $2 }') of them did ($shape)"
+elif [ "$(printf '%s' "$shape" | awk '{ print $3 }')" -lt 2 ]; then
+	fail "no two suites overlapped, so nothing ran side by side ($shape)"
+elif [ "$(printf '%s' "$shape" | awk '{ print $3 }')" -gt 4 ]; then
+	fail "$(printf '%s' "$shape" | awk '{ print $3 }') suites ran at once, past the cap of 4 ($shape)"
+else
+	missing=""
+	for n in a b c d e; do
+		said "bash scripts/tests/test-$n.test.sh" || missing="$missing test-$n"
+	done
+	if [ -n "$missing" ]; then
+		fail "the run does not report every suite it ran:$missing — $OUT"
+	else
+		pass "six suites discovered, six ran once each, at most four at a time, one line each"
+	fi
+fi
+
+# I3. A failing suite fails the gate and is named, with its own output under it — a parallel run
+# that reports "something failed" would be slower to read than the serial one it replaced.
+reset_case suites-fail
+mkdir -p "$REPO/scripts/tests"
+printf '#!/usr/bin/env bash\nprintf "ok\\n"\n' >"$REPO/scripts/tool.sh"
+printf '#!/usr/bin/env bash\nprintf "good: ok\\n"\n' >"$REPO/scripts/tests/test-good.test.sh"
+printf '#!/usr/bin/env bash\nprintf "bad: the thing did not hold\\n" >&2\nexit 3\n' >"$REPO/scripts/tests/test-bad.test.sh"
+cat >"$REPO/scripts/tests/pass.test.mjs" <<'TEST'
+import { test } from "node:test";
+test("pass", () => {});
+TEST
+cat >"$REPO/Makefile" <<'MAKE'
+scripts-test:
+	@node --test scripts/tests/*.test.mjs
+	@for t in scripts/tests/*.test.sh; do \
+		bash "$$t" || exit $$?; \
+	done
+MAKE
+commit_branch "test(scripts): one suite that fails, one that does not"
+run "$pf" --only suites --cwd "$REPO" feat/w1
+if [ "$RC" = 0 ]; then
+	fail "a failing suite passed the gate — $OUT"
+elif ! said "test-bad.test.sh"; then
+	fail "the failing suite is not named — $OUT"
+elif ! said "bad: the thing did not hold"; then
+	fail "the failing suite's own output is not shown — $OUT"
+elif ! said "FAILED (exit 3)"; then
+	fail "the failure does not carry the suite's exit code — $OUT"
+elif ! said "test-good.test.sh"; then
+	fail "the suites that passed are not reported beside the failing one — $OUT"
+else
+	pass "a failing suite fails the gate with its name, its exit code and its own output"
+fi
+
+# I4. A prose-only diff: nothing compiles, nothing lints, nothing has a test to scrub, and each of
+# those says so in its own line instead of the generic one.
+reset_case docs-skips
+mkdir -p "$REPO/docs"
+printf 'the trunk\n\nOne more paragraph of documentation.\n' >"$REPO/README.md"
+printf 'notes\n' >"$REPO/docs/notes.md"
+commit_branch "docs: a paragraph and a note"
+run "$pf" --only syntax,scrub --cwd "$REPO" feat/w1
+skips=$(printf '%s\n' "$OUT" | grep -cE '^skip ')
+if [ "$RC" != 0 ]; then
+	fail "a prose-only diff failed on its fast path: exit $RC — $OUT"
+elif [ "$skips" != 2 ]; then
+	fail "a prose-only diff produced $skips skip line(s), wanted one for each check — $OUT"
+elif ! said "docs-only diff: no changed code file"; then
+	fail "the syntax skip does not name the diff as prose — $OUT"
+elif ! said "docs-only diff: no changed test file"; then
+	fail "the scrub skip does not name the diff as prose — $OUT"
+else
+	pass "a prose-only diff skips syntax and scrub, each with its own named line"
 fi
 
 # --- summary -----------------------------------------------------------------------------------
