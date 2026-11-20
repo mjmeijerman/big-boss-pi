@@ -83,8 +83,21 @@
 # called exactly as before, so a gate that would choke on it keeps working. Naming the branch is
 # another way to see the diff, never a way to skip it: an empty diff still refuses.
 #
-# What it never does: merge, push trunk, force-push, or touch the worker's files. Pushing a
-# branch is not landing it — the merge stays the person's.
+# What it never does: merge, push trunk, force-push without proof, or touch the worker's files.
+# Pushing a branch is not landing it — the merge stays the person's.
+#
+# A rewritten branch is the shape the `behind` check creates: preflight tells a worker to rebase onto
+# origin/trunk, the rebase gives every commit a new sha, and origin still holds the branch's old tip.
+# A plain push then fails `non-fast-forward` and the work is stranded behind a command that refuses
+# to move (mjmeijerman/pi#69: rebased, 5/5 preflight green, publish refused, a person force-pushed by
+# hand). So a push git rejects `non-fast-forward` is decided rather than reported, and the decision
+# is never "force": `--force-with-lease=<branch>:<the exactly read remote sha>` is passed only when origin's
+# tip is this branch's own previous head (the branch reflog recorded it here, so a commit somebody
+# else pushed and this tree fetched is not in it) *and* every commit origin carries that the local
+# branch does not is the same change under a new sha (`git cherry` marks a rewritten commit `-`; a
+# `+` commit — a rebase that resolved a conflict changes the patch — is accepted when the local
+# branch has a commit with the same subject). Anything else is a refusal that names the commits a
+# push would delete. Neither `--force` nor a blanket `--force-with-lease` is ever passed.
 #
 # Trunk is read the way `delegate close` reads it: origin's HEAD, else origin/trunk|main|master.
 # A tree with none of those falls back to `main` with a printed note, so a fresh clone with no
@@ -133,6 +146,91 @@ remote_head() { # <cwd> <branch> — the sha origin holds (empty: none); nonzero
 	local out
 	out=$(git -C "$1" ls-remote origin "refs/heads/$2" 2>/dev/null) || return 3
 	printf '%s' "$out" | awk 'NR==1 { print $1 }'
+	return 0
+}
+
+# own_tip <cwd> <branch> <sha> — was <sha> ever this branch's head in this repo? A rebase, an amend
+# and a reset write the old tip into the branch's own reflog; a fetch of somebody else's push does
+# not, which is exactly the difference between "my rewrite" and "their commit". A publish that
+# recorded the head it pushed is the same evidence for a repo whose reflog has been pruned; the
+# field is optional, so a delegation record without it changes nothing.
+own_tip() {
+	git -C "$1" reflog show --format=%H "refs/heads/$2" 2>/dev/null | grep -qxF -- "$3" && return 0
+	[ -n "$no_entry" ] && return 1
+	[ "$(field head 2>/dev/null || true)" = "$3" ] && return 0
+	[ "$(field pushed 2>/dev/null || true)" = "$3" ] && return 0
+	return 1
+}
+
+# rewritten_only <cwd> <local> <remote> — every commit origin has and the local branch does not is
+# the same change under another sha. `git cherry` is that question answered by git: `-` means the
+# patch is already in the local history under another sha, `+` means it is not. A `+` commit is not
+# given up on — a rebase that resolved a conflict changes the patch — so it is looked up by subject
+# in the local branch, and a subject that is not there is work a push would delete.
+rewritten_only() {
+	local cwd=$1 local_sha=$2 remote_sha=$3 out mark sha subject missing=0
+	out=$(git -C "$cwd" cherry "$local_sha" "$remote_sha" 2>/dev/null) || return 1
+	[ -n "$out" ] || return 1
+	while read -r mark sha; do
+		[ "$mark" = '+' ] || continue
+		subject=$(git -C "$cwd" log -1 --format=%s "$sha" 2>/dev/null || true)
+		if [ -z "$subject" ] || ! git -C "$cwd" log --format=%s "$local_sha" 2>/dev/null | grep -qxF -- "$subject"; then
+			missing=1
+		fi
+	done <<<"$out"
+	[ "$missing" = 0 ]
+}
+
+# A rejected push is decided here, not failed blindly and never forced blindly. A `non-fast-forward`
+# rejection means one of two things, and only these proofs tell them apart:
+#
+#   * this tree rewrote the branch — the shape `bin/preflight`'s `behind` check creates when it asks
+#     for `git rebase origin/trunk`: every local commit is new, origin still holds the old tip
+#     (mjmeijerman/pi#69: rebased, 5/5 preflight green, publish refused, a person force-pushed by
+#     hand). The retry is `--force-with-lease=<branch>:<origin's sha>`, never a bare force;
+#   * somebody else pushed a commit this branch does not carry, and a force would delete it.
+#
+# own_tip (origin's tip is a head this branch's own reflog recorded, so a fetched foreign push is not
+# one) and rewritten_only (every commit origin has is the same change under a new sha) are both
+# required; either missing is a refusal that names what a push would replace.
+rewrite_refusal=""
+rewrite_lease() { # <cwd> <branch> <local sha> — true when the rejection is this tree's rewrite
+	local cwd=$1 branch=$2 local_sha=$3 remote_sha lost_range lost
+	if ! remote_sha=$(remote_head "$cwd" "$branch"); then
+		rewrite_refusal="the push was rejected and origin's head for $branch could not be read (git ls-remote failed), so a rewrite cannot be proved"
+		return 1
+	fi
+	if [ -z "$remote_sha" ]; then
+		rewrite_refusal="the push was rejected and origin lists no $branch, so the rejection was not a rewritten branch"
+		return 1
+	fi
+	# Name what a push would replace before judging it: somebody else's commit is normally the one
+	# this tree never fetched, so the branch's remote-tracking ref is brought up to date here —
+	# quietly, only on this path, and never before the push was refused. A tree with no network keeps
+	# the sha and gets the command that shows the commits.
+	lost_range=$local_sha..$remote_sha
+	if git -C "$cwd" fetch --quiet origin "+refs/heads/$branch:refs/remotes/origin/$branch" 2>/dev/null &&
+		git -C "$cwd" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null; then
+		lost_range=$local_sha..refs/remotes/origin/$branch
+	fi
+	lost=$(git -C "$cwd" log --format='  %h %s' "$lost_range" 2>/dev/null || true)
+	[ -n "$lost" ] || lost="  (git cannot name them here: origin/$branch is $remote_sha, the branch is $local_sha — git fetch origin $branch && git log --oneline $local_sha..origin/$branch)"
+	if git -C "$cwd" merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+		rewrite_refusal="the push was rejected but origin/$branch at ${remote_sha:0:7} is already in this branch's history, so the rejection was not a rewrite (a hook, auth or network refusal)"
+		return 1
+	fi
+	if ! own_tip "$cwd" "$branch" "$remote_sha"; then
+		rewrite_refusal="the push was rejected and origin/$branch is at $remote_sha, a head this branch never had, so it is not this tree's rewrite — forcing would replace:
+$lost"
+		return 1
+	fi
+	if ! rewritten_only "$cwd" "$local_sha" "$remote_sha"; then
+		rewrite_refusal="the push was rejected and origin/$branch carries commit(s) this branch does not have and did not rewrite — forcing would delete:
+$lost"
+		return 1
+	fi
+	lease="--force-with-lease=$branch:$remote_sha"
+	lease_from=$remote_sha
 	return 0
 }
 
@@ -561,8 +659,8 @@ if [ -n "$pr_line" ]; then
 	esac
 fi
 
-# 8. Push the branch only. Never a force, never trunk — and never on the push's own word: the sha
-# being pushed is read first, origin is asked for the branch's head afterwards, and a mismatch is
+# 8. Push the branch only. Never trunk, never a blind force — and never on the push's own word: the
+# sha being pushed is read first, origin is asked for the branch's head afterwards, and a mismatch is
 # a refusal, not a warning. A push that cannot be confirmed must not end in a PR URL.
 # An open PR makes the push the update rather than the upload, and a branch origin already holds
 # at exactly the commit the tree is at has nothing to send: finishing twice must not push a second
@@ -584,9 +682,20 @@ if [ -n "$open_pr" ]; then
 else
 	note "pushing $branch to origin"
 fi
+lease=""
+lease_from=""
 if [ -n "$push_needed" ]; then
 	if ! git -C "$cwd" push -u origin "$branch"; then
-		die "git push failed, so no pull request was opened"
+		# The rejection is either the rebase this command's own `behind` check asks for, or somebody
+		# else's commit. rewrite_lease decides, and a decision it cannot prove is a refusal.
+		if ! rewrite_lease "$cwd" "$branch" "$pushed"; then
+			die "$rewrite_refusal
+Nothing was pushed. Rebase onto origin/$branch so their commit is carried, or publish the branch this work became."
+		fi
+		note "origin/$branch is at ${lease_from:0:7}, which this branch rewrote; re-pushing ${pushed:0:7} under a lease that expects ${lease_from:0:7}"
+		if ! git -C "$cwd" push -u "$lease" origin "$branch"; then
+			die "the leased re-push of $branch failed: origin did not stay at ${lease_from:0:7}, or the push was rejected — nothing was published"
+		fi
 	fi
 	if ! there=$(remote_head "$cwd" "$branch"); then
 		die "$branch was pushed but its head could not be read back from origin (git ls-remote failed), so the push is unconfirmed — nothing was published"
@@ -596,6 +705,9 @@ if [ -n "$push_needed" ]; then
 	fi
 	if [ "$there" != "$pushed" ]; then
 		die "the push reported success but origin/$branch is at ${there:0:7}, not ${pushed:0:7} (the commit just pushed), so nothing was published — the remote is not where this publish thinks it is"
+	fi
+	if [ -n "$lease" ]; then
+		note "forced the rewrite of origin/$branch deliberately: $lease_from was the previous head, $pushed is the rewritten one, and ${lease#--force-with-lease=} was the lease"
 	fi
 	note "origin/$branch is at ${there:0:7}, the commit just pushed"
 fi

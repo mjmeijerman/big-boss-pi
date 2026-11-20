@@ -192,6 +192,12 @@ expect "close --nothing: reason, evidence, and no sha" 0 "nothing: ok" -- \
 #     on a fresh clone.
 expect "publish: refusals, body gates and the push it reports" 0 "test-publish: ok" -- \
 	bash "$root/scripts/tests/test-publish.sh"
+# 5l2. The push a rebase breaks: a branch whose own history was rewritten (the shape `preflight`'s
+#     `behind` check asks for) is re-pushed under a lease that names the sha it expects, and a
+#     branch origin holds somebody else's commit on is refused with that commit named. Real pushes
+#     into a throwaway bare origin and a logged git argv, so the flags are read from the log.
+expect "publish: a rewritten branch is leased, a foreign commit refuses" 0 "publish force: ok" -- \
+	bash "$root/scripts/test-publish-force.sh"
 # 5m. Which sha a close reads, when a report names more than one. A report quotes another branch's
 #     commit as evidence, and the reader used to take the first one it found and refuse over a sha
 #     the worker does not own. Its own script because the answer depends on three commits in one
