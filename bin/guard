@@ -52,6 +52,13 @@ fi
 # becoming a spawn loop, every repair is logged with the path it took (resumed terminal tN vs
 # opened a new pi), and the person's space and tab are put back afterwards.
 #
+# The resume line is only for a terminal that shows a shell prompt. `hc` answers `unattached` for a
+# live terminal whose foreground has no argv yet, and a pi that is still starting looks exactly
+# like a recovered shell in that reading — so `wait_attached` reports only states it actually saw,
+# and `resume_via_entry` refuses to type when the last look says no prompt, or says the tab already
+# runs pi (by `herdr-app ls`, or by an argv that carries this very session). A tab left alone for
+# either reason is not reopened: it is a pi, not a dead tab.
+#
 # This guard only ever looks for, creates, selects and repairs the space named big-boss-pi.
 # A space named pi-master belongs to the old workspace: it is never touched from here.
 #
@@ -502,12 +509,40 @@ terminal_runs_pi() {
 	return 0
 }
 
+# pi_there <terminal> <session path> — what a fresh look says about pi in that terminal, one word:
+#   pi       a pi program is in the foreground;
+#   session  a shell there already carries this very session in its argv;
+#   (nothing) neither, so the terminal is a shell a resume line could go into.
+# Asked immediately before a send, never earlier: between the wait and the keystroke is exactly the
+# window a just-started pi needs to publish its argv.
+pi_there() {
+	local facts
+	facts=$(hc_json "$1") || return 1
+	[ -n "$facts" ] || return 1
+	printf '%s' "$facts" | SESSION_ARG=$2 node -e '
+		const PI=new Set(["pi","pi-bare","pi-sandboxed","pi-nonet"]);
+		let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+			let j={};try{j=JSON.parse(d)}catch{return}
+			const fg=j.foreground||{};
+			const argv=Array.isArray(fg.argv)?fg.argv:[];
+			const all=argv.concat(Array.isArray(j.argv)?j.argv:[]);
+			const base=w=>String(w).split(/[\\/]/).pop().toLowerCase().replace(/\.exe$/,"");
+			// One word only: `sh -lc "exec …/pi-bare"` is a shell running a line, not a pi.
+			const isPi=w=>{const s=String(w);if(/\s/.test(s))return false;const b=base(s);return PI.has(b)||(b==="cli.js"&&/[\\/]pi[\\/]/.test(s))};
+			if(argv.length&&isPi(argv[0]))return process.stdout.write("pi");
+			if(argv.some(isPi))return process.stdout.write("pi");
+			const session=process.env.SESSION_ARG||"";
+			if(session&&all.join(" ").includes(session))return process.stdout.write("session");
+		})'
+}
+
 # wait_attached <terminal> — the terminal herdr-core keeps takes a moment to get its shell, and a
 # live terminal whose foreground has no argv yet is *not attached*, not busy: today's lost resume
-# was exactly that reading. Wait for an answer within the bound, and a terminal that still has no
-# foreground after the bound is treated as the recovered shell it is.
+# was exactly that reading. Wait for an answer within the bound, and answer only what was seen: a
+# terminal still showing no foreground after the bound comes back as `unattached`, so the caller
+# decides what that means instead of this loop guessing. Nothing here upgrades a state.
 wait_attached() {
-	local terminal=$1 tries=${PI_BOSS_ATTACH_TRIES:-4} gap=${PI_BOSS_ATTACH_GAP:-1} state i
+	local terminal=$1 tries=${PI_BOSS_ATTACH_TRIES:-4} gap=${PI_BOSS_ATTACH_GAP:-1} state='' i
 	for ((i = 0; i < tries; i++)); do
 		state=$(terminal_state "$terminal")
 		case $state in
@@ -516,7 +551,8 @@ wait_attached() {
 		esac
 		[ "$i" -lt $((tries - 1)) ] && sleep "$gap"
 	done
-	printf 'attached'
+	# No pass at all is no observation, so it is not a licence to type either.
+	printf '%s' "${state:-unknown}"
 }
 
 # resumed_this_boot <terminal> / mark_resumed <terminal> — the guard's own "typed once" ledger.
@@ -544,7 +580,9 @@ tab_has_pi() { herdr-app ls 2>/dev/null | tab_holds_pi "$1" "$2"; }
 # terminal: `hc send` the same exec line into the recovered shell, then wait for pi. Used when
 # herdr-resume.mjs declined, and when herdr-app has no terminal for the tab but hc knows the one
 # the entry recorded. Returns 0 when pi is running in the tab afterwards, 2 when this boot already
-# restored that session (nothing to do, and typing again would be a second pi), 1 otherwise.
+# restored that session (nothing to do, and typing again would be a second pi), 3 when the terminal
+# must not be typed into at all (no shell prompt yet, or pi is already there — nothing is opened or
+# closed for that), 1 otherwise.
 resume_via_entry() {
 	local entry=$1 space=$2 tab=$3 name=$4 terminal session argv line state i
 	terminal=$(entry_field "$entry" terminal)
@@ -559,6 +597,7 @@ resume_via_entry() {
 		log "terminal \`$terminal\` in tab $name ($tab) was already resumed in this boot; not typing a second time"
 		return 2
 	fi
+	local there
 	state=$(wait_attached "$terminal")
 	case $state in
 	busy:*)
@@ -569,7 +608,27 @@ resume_via_entry() {
 		log "could not resume terminal \`$terminal\` in tab $name ($tab): hc does not know that terminal"
 		return 1
 		;;
+	unattached)
+		# A live terminal with no foreground argv is a pi that has not published its argv yet as
+		# often as it is a shell that has not attached. Typing here put a resume line into a running
+		# pi once; the tab is left for the next poll instead, and a genuinely dead terminal reads
+		# `unknown`, which still takes the reopen path.
+		log "terminal \`$terminal\` in tab $name ($tab) has no shell prompt yet (foreground has no program); not typing into it, a pi that is still starting looks the same"
+		return 3
+		;;
 	esac
+	# Last instant before the send: the tab must not already hold pi, and the shell there must not
+	# already carry this session. Asked again here, not one poll earlier, because this is the moment
+	# the line goes in.
+	if tab_has_pi "$space" "$tab"; then
+		log "tab $name ($tab) already has pi running (session $session); nothing to resume"
+		return 3
+	fi
+	there=$(pi_there "$terminal" "$session")
+	if [ "$there" = pi ] || [ "$there" = session ]; then
+		log "tab $name ($tab) already has pi running (session $session); nothing to resume"
+		return 3
+	fi
 	command -v hc >/dev/null 2>&1 || { log "could not resume terminal \`$terminal\` in tab $name ($tab): hc is not on PATH"; return 1; }
 	line=$(exec_line "$argv" "$session")
 	if ! hc send "$terminal" "$line" >/dev/null 2>&1; then
@@ -690,9 +749,20 @@ repair_tab() {
 			log "tab $name ($tab) already had its session resumed in this boot; leaving it alone"
 			return 2
 			;;
+		3)
+			# No shell prompt to type into, or pi is already there: the refusal is logged, and the
+			# tab is left exactly as it is. Reopening it here would kill the pi it may be holding.
+			return 2
+			;;
 		esac
 		log "could not resume terminal \`$entry_terminal\` in tab $name ($tab); opening a new pi instead: $(printf '%s' "$resumed" | tail -n 2 | tr '\n' ' ')"
 	else
+		# A live pi the app has not reported yet is still a live pi: closing its tab or opening a
+		# second one over it is the same mistake as typing into it.
+		if tab_has_pi "$space" "$tab" || [ "$(pi_there "$terminal" "")" = pi ]; then
+			log "tab $name ($tab) already has pi running in terminal \`${terminal:-unknown}\`; nothing to repair"
+			return 2
+		fi
 		# The tab never held pi. It is the guard's to repair only if the person has not made it their
 		# own: an interactive shell without a recovered launch argv is the person's tab, and a pi
 		# typed there would take it away. Rate-limited like a repair, so the line is one a minute.
