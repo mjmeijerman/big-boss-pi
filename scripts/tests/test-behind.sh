@@ -20,8 +20,12 @@
 #   D. origin unreachable: PASS, with the line that says behind-ness was not checked;
 #   E. trunk is `master` and origin/HEAD says so: `origin/master` is what it compares against, even
 #      with an `origin/main` sitting at the branch's own level as a decoy;
-#   F. behind but no path collides, so a rebase would be trivial: still refused, and HEAD is left
-#      exactly where it was — the gate does not rebase.
+#   F. behind but no path collides, because the branch touched nothing: PASS, with the line that
+#      says it merges without a rebase — GitHub merges it, and the extra commits are history — and
+#      HEAD is left exactly where it was;
+#   G. behind, the branch touched a path, and trunk moved a different one: PASS, and the trunk-only
+#      path is not reported as a collision. This is the case that cost five rebase workers in one
+#      day: a worker changes bin/delegate while trunk moves AGENTS.md.
 #
 #   bash scripts/tests/test-behind.sh      exit 0 = every case held
 set -uo pipefail
@@ -192,27 +196,45 @@ else
 	pass "with origin/HEAD on master the check compares against origin/master, not a hardcoded main"
 fi
 
-# --- F. behind, but a rebase would be trivial: still refused, HEAD untouched --------------------
+# --- F. behind, and nothing this branch touched moved: PASS, named, HEAD untouched ----------------
 
-reset_case trivial
+reset_case clean
 trunk_commit README.md "a trunk-only line"
 before=$(head_sha)
 before_count=$(git -C "$REPO" rev-list --count HEAD)
 check_behind
-if [ "$RC" = 0 ]; then
-	fail "a branch behind trunk passed because the rebase would have been clean — $OUT"
-elif ! said "1 commit(s) behind origin/main"; then
-	fail "the count is not named — $OUT"
-elif ! said "no path this branch touched moved on trunk"; then
-	fail "the clean-rebase case is not said out loud — $OUT"
-elif ! said "Fix: git -C $REPO rebase origin/main"; then
-	fail "the remedy is not printed — $OUT"
+if [ "$RC" != 0 ]; then
+	fail "a branch behind trunk with no touched path moved was refused — GitHub merges it: $OUT"
+elif ! said "1 commit(s) behind origin/main, no touched path moved: this branch merges without a rebase"; then
+	fail "the passing line does not say it is behind, and why that is a merge and not a rebase — $OUT"
+elif said "Fix: git -C $REPO rebase"; then
+	fail "a passing behind branch still prints the rebase remedy — $OUT"
 elif [ "$(head_sha)" != "$before" ] || [ "$(git -C "$REPO" rev-list --count HEAD)" != "$before_count" ]; then
 	fail "the gate rebased the branch itself, which is exactly what it must not do"
 elif [ -n "$(git -C "$REPO" status --porcelain)" ]; then
 	fail "the gate left the worktree dirty: $(git -C "$REPO" status --porcelain)"
 else
-	pass "a behind branch is refused even when its rebase is trivial, and the tree is left alone"
+	pass "a behind branch with no touched path moved passes, by name, and the tree is left alone"
+fi
+
+# --- G. behind, the branch touched one path, trunk moved another: PASS ----------------------------
+#
+# The measured case: five branches needed a rebase worker in one day because trunk moved after they
+# were cut, and not one of them collided. PATH_PER_WORKER changed bin/delegate while trunk moved
+# AGENTS.md, which is a clean merge and a wasted round trip.
+
+reset_case other-path
+branch_commit NOTES.md "the branch's own line"
+trunk_commit README.md "a trunk-only line"
+check_behind
+if [ "$RC" != 0 ]; then
+	fail "a branch behind a trunk that moved a path it never touched was refused: $OUT"
+elif ! said "no touched path moved: this branch merges without a rebase"; then
+	fail "the passing line is not the named one — $OUT"
+elif said "README.md"; then
+	fail "a trunk-only path this branch never touched was reported as a collision — $OUT"
+else
+	pass "trunk moving a path this branch never touched is a pass, not a collision"
 fi
 
 # --- summary -----------------------------------------------------------------------------------
