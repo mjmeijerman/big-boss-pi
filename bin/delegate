@@ -21,6 +21,8 @@ fi
 #   delegate list
 #   delegate close <slug> [--merged PR-URL-OR-NUMBER]
 #   delegate close <slug> --nothing "<why nothing landed>"   (a worker whose change never landed)
+#   delegate close <slug> --rewritten <sha> "<why the tip is another worker's, rewritten>"
+#                  (a worker whose only commit is another worker's branch, rebased)
 #   delegate finish <slug> [--cwd DIR] [--skip "<reason>"]   (publish, wipe, close — the whole tail)
 #   delegate ask "<question>" [--json]
 #   delegate stats [--since DURATION] [--json]
@@ -146,6 +148,16 @@ fi
 # the report. The row keeps both shas — the report's and the landed one — for a human to check
 # instead of a bare yes. A commit whose parent has not been fetched is refused as "fetch first",
 # never read as `+`.
+#
+# The third exit, `--rewritten <sha> "<why>"`, is for a worker whose work *is* a rebase: it
+# rewrote another worker's branch onto trunk, so the tip carries that worker's Agent-Slug trailer
+# and nothing else — a rebase rewrites a commit without changing whose trailer it is. Both other
+# paths refuse it, and the space stays open for something that is not the worker's fault. It is
+# accepted only when the sha resolves in the worker's tree, is not in origin/<trunk>, carries an
+# Agent-Slug that is not this slug, is the tip of the branch that trailer names, and replaces a
+# commit on that branch's reflog with the same subject and author — a rewrite of somebody's
+# commit, never an invented one. One row in state/decisions.jsonl carries the sha, the branch and
+# the commit it replaces, and the reason is printed like --nothing's.
 #
 # Every spawn asks Jev, unconditionally, for the count, the mode, the route (local or remote) and
 # the thinking effort — in one call (`jev plan`), because four questions about the same task are
@@ -748,6 +760,28 @@ commit_carries_slug() {
 			if (v == slug) { found = 1; exit }
 		}
 		END { exit(found ? 0 : 1) }'
+}
+
+# rewritten_predecessor <cwd> <branch> <full-sha> -- the commit on that branch's reflog that the
+# current tip replaces: same subject, same author, a different commit. Empty when the reflog holds
+# no such commit, which is what "and nothing shows it was rewritten" reads as.
+#
+# Why the reflog: a rebase rewrites a commit and keeps its message, so subject and author are the
+# only identity the old commit shares with the new one, and the branch's reflog is the one place the
+# old sha is still recorded. Fetching every object is not needed and would be a network call on a
+# close. A reflog that expired reads exactly like an invented commit, and the refusal says so —
+# a rewrite nobody can show is a rewrite the record must not claim.
+rewritten_predecessor() {
+	local cwd=${1:-} branch=${2:-} full=${3:-} c sig want have
+	[ -n "$cwd" ] && [ -d "$cwd" ] && [ -n "$branch" ] && [ -n "$full" ] || return 0
+	want=$(git -C "$cwd" log -1 --format='%s%x00%an%x00%ae' "$full" 2>/dev/null) || return 0
+	[ -n "$want" ] || return 0
+	for c in $(git -C "$cwd" reflog show --format=%H "$branch" 2>/dev/null); do
+		[ "$c" = "$full" ] && continue
+		have=$(git -C "$cwd" log -1 --format='%s%x00%an%x00%ae' "$c" 2>/dev/null) || continue
+		if [ "$have" = "$want" ]; then printf '%s\n' "$c"; return 0; fi
+	done
+	return 0
 }
 
 # report_provenance_note <report> <slug> <cwd> <chosen> -- every sha the reader looked at and why
@@ -2177,8 +2211,8 @@ space_close() {
 }
 
 cmd_close() {
-	local slug=${1:-} merged="" nothing="" nothing_given=""
-	[ "$#" -ge 1 ] || die 'usage: delegate close <slug> [--merged <pr-url-or-number>] [--nothing "<why nothing landed>"]'
+	local slug=${1:-} merged="" nothing="" nothing_given="" rewritten="" rewritten_reason="" rewritten_given=""
+	[ "$#" -ge 1 ] || die 'usage: delegate close <slug> [--merged <pr-url-or-number>] [--nothing "<why nothing landed>"] [--rewritten <sha> "<why the tip is another worker commit, rewritten>"]'
 	slug=$1; shift
 	while [ "$#" -gt 0 ]; do
 		case $1 in
@@ -2187,18 +2221,34 @@ cmd_close() {
 			nothing=${2:-}; nothing_given=1
 			if [ "$#" -ge 2 ]; then shift 2; else shift 1; fi
 			;;
+		--rewritten)
+			rewritten=${2:-}; rewritten_reason=${3:-}; rewritten_given=1
+			if [ "$#" -ge 3 ]; then shift 3; else shift "$#"; fi
+			;;
 		--*) die "unknown option $1" ;;
-		*) die "close takes one slug: '$1' — usage: delegate close <slug> [--merged <pr-url-or-number>] [--nothing \"<why nothing landed>\"]" ;;
+		*) die "close takes one slug: '$1' — usage: delegate close <slug> [--merged <pr-url-or-number>] [--nothing \"<why nothing landed>\"] [--rewritten <sha> \"<why>\"]" ;;
 		esac
 	done
-	[ -n "$slug" ] || die 'usage: delegate close <slug> [--merged <pr-url-or-number>] [--nothing "<why nothing landed>"]'
+	[ -n "$slug" ] || die 'usage: delegate close <slug> [--merged <pr-url-or-number>] [--nothing "<why nothing landed>"] [--rewritten <sha> "<why>"]'
 	# --nothing and --merged answer the same question ("where did the work go?") with opposite
-	# findings, so asking both is a mistake, not a combination.
+	# findings, so asking both is a mistake, not a combination. --rewritten answers it a third way
+	# and names a sha, so it excludes both: one answer, one flag.
 	if [ -n "$nothing_given" ] && [ -n "$merged" ]; then
 		die "--nothing and --merged cannot be combined: --nothing says no commit landed, --merged names the PR that carried one"
 	fi
+	if [ -n "$rewritten_given" ]; then
+		if [ -n "$nothing_given" ]; then
+			die "--rewritten and --nothing cannot be combined: --rewritten names the commit that landed, rewritten, and --nothing says none did"
+		fi
+		if [ -n "$merged" ]; then
+			die "--rewritten and --merged cannot be combined: --merged says the change landed in trunk, and --rewritten says it is a local rewrite of another worker's branch"
+		fi
+	fi
 	if [ -n "$nothing_given" ] && [ -z "$nothing" ]; then
 		die "--nothing needs a reason: delegate close $slug --nothing \"<why this worker landed no commit>\""
+	fi
+	if [ -n "$rewritten_given" ] && [ -z "$rewritten" ]; then
+		die "--rewritten needs a sha: delegate close $slug --rewritten <sha> \"<why this worker only landed another worker's commit, rewritten>\""
 	fi
 	[ -f "$DELEGATIONS" ] || die "no such worker: $slug"
 	local space cwd branch meta report
@@ -2293,13 +2343,89 @@ cmd_close() {
 		fi
 	fi
 
+	# --rewritten (a worker whose work WAS the rebase): the tip of another worker's branch carries
+	# that worker's Agent-Slug trailer, because a rebase rewrites a commit without changing whose
+	# trailer it is. Plain close refuses it as "not this worker"; --nothing refuses it for naming a
+	# commit at all; the change did land, on a branch this worker was sent to rebase. Narrow on
+	# purpose, and every way out of it names the one check that failed. The record carries the sha,
+	# the branch and the commit it replaces, so "rewritten" is checkable rather than declared.
+	if [ -n "$rewritten_given" ]; then
+		if [ ! -s "$report" ]; then
+			printf '%s: refusing to close %s with --rewritten: %s does not exist, so there is no report that says what was rewritten.\n' "$prog" "$slug" "$report" >&2
+			return 1
+		fi
+		if [ "${#rewritten_reason}" -lt 20 ]; then
+			printf '%s: refusing to close %s with --rewritten: the reason is %d characters, and a rewrite close needs 20 or more — "%s" does not tell the next reader what was rewritten.\n' \
+				"$prog" "$slug" "${#rewritten_reason}" "$rewritten_reason" >&2
+			printf 'Fix: say whose branch was rebased and onto what, in one sentence:\n' >&2
+			printf '  %s close %s --rewritten %s "rebased <other-worker> onto trunk; the tip is that worker commit, rewritten"\n' "$BIN/delegate" "$slug" "$rewritten" >&2
+			return 1
+		fi
+		local full trunk trailer tipbranch pred why
+		if [ -z "$cwd" ] || [ ! -d "$cwd" ] || ! git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
+			printf '%s: refusing to close %s with --rewritten: %s is not a git repository, so %s cannot be checked.\n' "$prog" "$slug" "${cwd:-$slug}" "$rewritten" >&2
+			return 1
+		fi
+		full=$(git -C "$cwd" rev-parse --verify --quiet "$rewritten^{commit}" 2>/dev/null) || full=""
+		if [ -z "$full" ]; then
+			printf '%s: refusing to close %s with --rewritten: %s does not resolve in %s, so nobody can check what was rewritten.\n' "$prog" "$slug" "$rewritten" "$cwd" >&2
+			printf 'Fix: name the commit the branch actually points at, then close again:\n' >&2
+			printf '  git -C %q log -1 --format=%%H\n' "$cwd" >&2
+			return 1
+		fi
+		trunk=$(fresh_trunk_branch "$cwd")
+		if [ -z "$trunk" ]; then
+			printf '%s: refusing to close %s with --rewritten: %s has no origin/trunk, origin/main or origin/master, so there is no trunk to check %s against.\n' "$prog" "$slug" "$cwd" "$full" >&2
+			printf 'Fix: fetch the remote first, then close again:\n' >&2
+			printf '  git -C %q fetch origin\n' "$cwd" >&2
+			return 1
+		fi
+		if git -C "$cwd" merge-base --is-ancestor "$full" "refs/remotes/origin/$trunk" 2>/dev/null; then
+			printf '%s: refusing to close %s with --rewritten: %s is in origin/%s, so it landed rather than being rewritten here — close it on the usual path, or with --merged when its trailer is missing only because trunk already holds it.\n' "$prog" "$slug" "$full" "$trunk" >&2
+			return 1
+		fi
+		trailer=$(commit_message "$cwd" "$full" 2>/dev/null | awk -F':[ \t]*' '/^Agent-Slug:/ { v = $2; sub(/[ \t\r]+$/, "", v); print v; exit }')
+		if [ -z "$trailer" ]; then
+			printf '%s: refusing to close %s with --rewritten: %s carries no Agent-Slug trailer, so there is no other worker whose commit this could be — --merged is the path for a commit that landed with no trailer.\n' "$prog" "$slug" "$full" >&2
+			return 1
+		fi
+		if [ "$trailer" = "$slug" ]; then
+			printf '%s: refusing to close %s with --rewritten: %s carries Agent-Slug: %s, this worker own trailer, so it is this worker commit and nothing was rewritten. Close it the normal way.\n' "$prog" "$slug" "$full" "$slug" >&2
+			printf 'Fix:\n' >&2
+			printf '  %s close %s\n' "$BIN/delegate" "$slug" >&2
+			return 1
+		fi
+		tipbranch=$(git -C "$cwd" for-each-ref --points-at "$full" --format='%(refname:short)' refs/heads/ 2>/dev/null | grep -xF "$trailer" || true)
+		if [ -z "$tipbranch" ]; then
+			printf '%s: refusing to close %s with --rewritten: %s is not the tip of %s, the branch its Agent-Slug: %s trailer names (tips here: %s), so it is not another worker branch rewritten — a commit taken from the middle of a branch is not a rewrite of it.\n' \
+				"$prog" "$slug" "$full" "$trailer" "$trailer" "$(git -C "$cwd" for-each-ref --points-at "$full" --format='%(refname:short)' refs/heads/ 2>/dev/null | paste -sd' ' - || true)" >&2
+			return 1
+		fi
+		pred=$(rewritten_predecessor "$cwd" "$trailer" "$full")
+		if [ -z "$pred" ]; then
+			printf '%s: refusing to close %s with --rewritten: %s has no predecessor on %s with the same subject and author, so nothing shows it was rewritten rather than invented (a reflog that expired reads the same).\n' \
+				"$prog" "$slug" "$full" "$trailer" >&2
+			printf 'Fix: name the commit that the rebase rewrote, if the branch reflog still holds it:\n' >&2
+			printf '  git -C %q reflog show %s\n' "$cwd" "$trailer" >&2
+			return 1
+		fi
+		# Recorded below, after the wipe gate, with the --nothing row: a row for a worker whose
+		# close then failed would say a rewrite was accepted that never closed. The values are
+		# local to this function, so they are still here when the close reaches that point.
+		rewritten_full=$full
+		rewritten_branch=$trailer
+		rewritten_pred=$pred
+		rewritten_trunk=$trunk
+		rewritten_why="commit $full is the tip of $trailer, carries Agent-Slug: $trailer (not this worker), is not in origin/$trunk, and replaces $(git -C "$cwd" rev-parse --short "$pred" 2>/dev/null || printf '%s' "$pred") on that branch with the same subject and author: this worker rewrote that branch rather than inventing a commit. Why: $rewritten_reason"
+	fi
+
 	# Provenance (Radar blip 79): a report names the commit it stands for, and that commit names the
 # worker in an Agent-Slug trailer. Refused in the same voice as the evidence block: name what is
 # missing, print the exact command that fixes it, leave the space open. Nothing is checked when
 # the worker's cwd is not a git repo — there is no commit to resolve a sha against, and a guard
 # that refuses every report on a plain folder is a guard nobody keeps. A --nothing close has no
 # commit to check by definition, and its own block above has already asked for the rest.
-if [ -z "$nothing_given" ] && [ -n "$cwd" ] && [ -d "$cwd" ] && git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
+if [ -z "$nothing_given" ] && [ -z "$rewritten_given" ] && [ -n "$cwd" ] && [ -d "$cwd" ] && git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
 	local sha msg
 	sha=$(report_commit_sha "$report" "$slug" "$cwd")
 	if [ -z "$sha" ]; then
@@ -2357,6 +2483,12 @@ fi
 	if [ -n "$nothing_given" ]; then
 		printf '%s: closing %s with --nothing: %s\n' "$prog" "$slug" "$nothing" >&2
 		record_decision nothing "$slug" accepted "$nothing" false "$slug"
+	fi
+
+	if [ -n "$rewritten_given" ]; then
+		printf '%s: closing %s with --rewritten: %s\n' "$prog" "$slug" "$rewritten_why" >&2
+		record_decision provenance "$slug" rewritten "$rewritten_why" false "$slug" "" \
+			"$(printf '{"sha":"%s","branch":"%s","replaces":"%s","trunk":"origin/%s"}' "$rewritten_full" "$rewritten_branch" "$rewritten_pred" "$rewritten_trunk")"
 	fi
 
 	# A close that cannot confirm the space is gone is not a close: the delegation entry is what
