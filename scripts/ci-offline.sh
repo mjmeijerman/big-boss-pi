@@ -289,6 +289,13 @@ expect_script "publish: the verdict is read back from the pull request" 0 "publi
 #     the worker does not own. Its own script because the answer depends on three commits in one
 #     throwaway repo and on the trailer each of them carries.
 expect_script "close reads the sha that belongs to this worker" 0 "close-provenance: ok" scripts/tests/test-close-provenance.sh
+# 5m2. The third close exit: a worker whose work IS a rebase of another worker's branch. Its only
+#      commit is that worker's commit rewritten, so it carries that worker's Agent-Slug trailer and
+#      both other paths refuse it. The row records the sha, the branch and the commit it replaces;
+#      a sha with this worker's own trailer, one that does not resolve, and one that is not its
+#      branch's tip are each refused by name; --nothing keeps its no-commit-at-all rule. A real
+#      rebase into a bare origin, so "not in trunk" is git's answer rather than a stub's.
+expect_script "close --rewritten: a rebased branch's tip, and its three refusals" 0 "close-rewritten: ok" scripts/tests/test-close-rewritten.sh
 # 5n. The gate before the publish (bin/preflight): a syntax error, a semgrep finding and a test that
 #     needs the developer's PATH each stop `delegate finish` before the push; a docs-only diff takes
 #     the fast path and still refuses a bad tier; --skip-preflight publishes and records its reason.
