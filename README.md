@@ -257,6 +257,15 @@ the `git rebase origin/<trunk>` to run. It never rebases for you, and an origin 
 named pass ("could not reach origin; behind-ness unchecked"), because a gate that blocks on a
 flaky network gets bypassed.
 
+The same tree is checked twice per publish — the worker runs the gate to paste its Evidence block,
+`delegate finish` runs it again before the push — so each verdict is recorded in `state/preflight/`
+under the hash of everything it came from: the tree, the branch, the checkout, the check set, and
+`bin/preflight`'s own hash. A second run on the same inputs prints the verdict, says it is cached,
+and runs nothing (the summary counts them: `5/5 passed (3 cached, 2 ran)`); `--fresh` ignores every
+receipt and `PI_PREFLIGHT_CACHE_TTL` (default six hours, `0` disables) expires them. A cached FAIL
+still blocks and still shows the transcript that failed, `behind` is never cached because its answer
+is about origin rather than this tree, and a check a fast path skipped leaves no receipt to reuse.
+
 They stay four gates. The publish is the same `bin/publish` (found on PATH, else next to
 `bin/delegate`) with its Evidence and `Review tier:` checks; the wipe is the same `delegate wipe`
 and now also refuses a report with no `## Thrown away` block, because a recorded step with no

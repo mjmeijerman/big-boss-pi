@@ -31,6 +31,11 @@
 #   K. a branch cut before a pull request merged refuses the publish: the `behind` check's FAIL,
 #      the rebase line, no push, the report still there and the space still open. #68's shape —
 #      spawned 19:27:52Z, #67 merged 19:32:04Z, arrived CONFLICTING with AGENTS.md and README.md.
+#   L. the receipts: a second run on an unchanged tree reuses every verdict and runs no check (the
+#      stub suite is invoked once across both runs and the second run is much faster); a tracked
+#      file edited, a changed check set, a changed bin/preflight and an expired TTL each invalidate;
+#      --fresh re-runs; a cached FAIL still blocks with the transcript that failed; a check a fast
+#      path skipped leaves no receipt behind.
 #
 #   bash scripts/tests/test-preflight.sh      exit 0 = every case held
 set -uo pipefail
@@ -855,6 +860,211 @@ elif grep -q 'space.close' "$work/herdr-calls" 2>/dev/null; then
 else
 	pass "a branch behind a colliding trunk is refused with the rebase: no push, report and space kept"
 fi
+
+# --- L. the receipts: a second run on an unchanged tree is free ---------------------------------
+
+# The shape every publish has: the worker runs the gate to paste the Evidence block, `delegate
+# finish` runs it again before it pushes, on a tree nobody touched in between. Both verdicts are
+# wanted; the work is not. What is asserted here is read from a stub suite that appends a line to a
+# log outside the tree, so "the check did not run" is a fact about a process, not about a message.
+receipt_repo() {
+	mkdir -p "$REPO/scripts/tests"
+	printf '#!/usr/bin/env bash\nprintf "ok\\n"\n' >"$REPO/scripts/tool.sh"
+	cat >"$REPO/scripts/tests/smoke.test.mjs" <<'TEST'
+import { test } from "node:test";
+test("smoke", () => {});
+TEST
+	printf '#!/usr/bin/env bash\nsleep 1\n[ -z "${SUITE_LOG:-}" ] || printf "ran\\n" >>"$SUITE_LOG"\n' >"$REPO/scripts/tests/test-log.test.sh"
+	: >"$CASE/suite.log"
+	export SUITE_LOG=$CASE/suite.log
+	commit_branch "test(scripts): a suite that leaves a line behind"
+}
+
+reset_cache() { rm -rf "$PI_BOSS_ROOT/state/preflight"; }
+suite_runs() { wc -l <"$CASE/suite.log" 2>/dev/null | tr -d ' '; }
+receipt_files() { ls "$PI_BOSS_ROOT/state/preflight"/*.json 2>/dev/null | wc -l | tr -d ' '; }
+receipt_says() { grep -lF -- "\"check\": \"$1\"" "$PI_BOSS_ROOT/state/preflight"/*.json 2>/dev/null | head -n 1; }
+LAST_MS=0
+time_run() { # run a command, keep both streams, keep the wall clock in LAST_MS
+	local s e
+	s=$(date +%s%N)
+	run "$@"
+	e=$(date +%s%N)
+	LAST_MS=$(((e - s) / 1000000))
+}
+
+# L1. The second run on the same tree: every verdict reused, no check launched, much faster.
+reset_case receipts
+reset_cache
+receipt_repo
+: >"$CASE/suite.log"
+time_run env SUITE_LOG="$CASE/suite.log" "$pf" --only suites --cwd "$REPO" feat/w1
+first_ms=$LAST_MS
+runs_first=$(suite_runs)
+time_run env SUITE_LOG="$CASE/suite.log" "$pf" --only suites --cwd "$REPO" feat/w1
+second_ms=$LAST_MS
+runs_total=$(suite_runs)
+if [ "$RC" != 0 ]; then
+	fail "the second run on an unchanged tree did not pass: exit $RC — $OUT"
+elif [ "$runs_first" != 1 ]; then
+	fail "the first run invoked the suite $runs_first time(s), wanted once"
+elif [ "$runs_total" != 1 ]; then
+	fail "the suite ran $runs_total time(s) across two runs: the second run did the work again"
+elif ! said "pass (cached"; then
+	fail "the second run does not say the verdict was cached — $OUT"
+elif ! said "(1 cached, 0 ran)"; then
+	fail "the summary does not count the cached and the run checks — $OUT"
+elif [ "$second_ms" -ge $((first_ms / 2)) ] || [ "$first_ms" -lt 1000 ]; then
+	fail "the second run was not well under the first (${first_ms}ms then ${second_ms}ms, one suite sleeping 1s)"
+elif [ -z "$(receipt_says suites)" ]; then
+	fail "no receipt was written for the suites check — $(receipt_files) file(s)"
+else
+	pass "a second run on the same tree reuses the verdict, runs nothing, and takes ${second_ms}ms against ${first_ms}ms"
+fi
+
+# L2. An edit to a tracked file — unstaged, so no commit moved — invalidates it.
+printf '#!/usr/bin/env bash\nprintf "ok"\n# an edit nobody committed\n' >"$REPO/scripts/tool.sh"
+: >"$CASE/suite.log"
+run env SUITE_LOG="$CASE/suite.log" "$pf" --only suites --cwd "$REPO" feat/w1
+if [ "$RC" != 0 ]; then
+	fail "an unstaged edit made the run fail: exit $RC — $OUT"
+elif [ "$(suite_runs)" != 1 ]; then
+	fail "an unstaged edit to a tracked file reused the old verdict ($(suite_runs) suite run(s)) — $OUT"
+elif said "pass (cached"; then
+	fail "a dirty tree read as the tree the verdict came from — $OUT"
+else
+	pass "an unstaged edit to a tracked file invalidates the receipt"
+fi
+
+# L3. A changed check set invalidates: the same tree under a different set is a different run.
+: >"$CASE/suite.log"
+run env SUITE_LOG="$CASE/suite.log" "$pf" --only suites,syntax --cwd "$REPO" feat/w1
+if [ "$RC" != 0 ]; then
+	fail "a two-check run failed: exit $RC — $OUT"
+elif [ "$(suite_runs)" != 1 ] || said "pass (cached"; then
+	fail "a different check set reused the old receipt ($(suite_runs) suite run(s)) — $OUT"
+else
+	pass "a changed check set invalidates the receipt"
+fi
+
+# L4. A changed bin/preflight is a changed gate: the verdict an older gate reached is not its.
+mkdir -p "$CASE/pf2"
+cp -a "$root/bin" "$CASE/pf2/bin"
+printf '\n# a gate that changed after the verdict\n' >>"$CASE/pf2/bin/preflight"
+chmod +x "$CASE/pf2/bin/preflight"
+: >"$CASE/suite.log"
+run env SUITE_LOG="$CASE/suite.log" "$CASE/pf2/bin/preflight" --only suites,syntax --cwd "$REPO" feat/w1
+if [ "$RC" != 0 ]; then
+	fail "a copied gate did not run: exit $RC — $OUT"
+elif [ "$(suite_runs)" != 1 ] || said "pass (cached"; then
+	fail "an edited bin/preflight reused a verdict the older gate reached ($(suite_runs) suite run(s)) — $OUT"
+else
+	pass "a changed bin/preflight invalidates every receipt"
+fi
+
+# L5. --fresh ignores every receipt and runs everything, and says so.
+: >"$CASE/suite.log"
+run env SUITE_LOG="$CASE/suite.log" "$pf" --only suites,syntax --cwd "$REPO" feat/w1
+cached_runs=$(suite_runs)
+run env SUITE_LOG="$CASE/suite.log" "$pf" --fresh --only suites,syntax --cwd "$REPO" feat/w1
+if [ "$RC" != 0 ]; then
+	fail "--fresh made the run fail: exit $RC — $OUT"
+elif [ "$cached_runs" != 0 ]; then
+	fail "the run before --fresh re-ran the suite ($cached_runs) instead of reusing the receipt"
+elif [ "$(suite_runs)" != 1 ]; then
+	fail "--fresh did not run the check ($(suite_runs) suite run(s)) — $OUT"
+elif ! said "--fresh: every receipt is ignored"; then
+	fail "--fresh does not say what it does — $OUT"
+else
+	pass "--fresh ignores every receipt and runs everything"
+fi
+
+# L6. A cached FAIL still blocks, and still shows the transcript that failed.
+reset_case receipts-fail
+reset_cache
+receipt_repo
+printf '#!/usr/bin/env bash\nprintf "bad: the thing did not hold\\n" >&2\nexit 3\n' >"$REPO/scripts/tests/test-bad.test.sh"
+commit_branch "test(scripts): a suite that fails"
+: >"$CASE/suite.log"
+run env SUITE_LOG="$CASE/suite.log" "$pf" --only suites --cwd "$REPO" feat/w1
+first_rc=$RC
+: >"$CASE/suite.log"
+run env SUITE_LOG="$CASE/suite.log" "$pf" --only suites --cwd "$REPO" feat/w1
+if [ "$first_rc" = 0 ]; then
+	fail "a failing suite passed the gate, so this case proves nothing — $OUT"
+elif [ "$RC" = 0 ]; then
+	fail "a cached FAIL passed the gate — $OUT"
+elif [ "$(suite_runs)" != 0 ]; then
+	fail "the failing suite ran again instead of reading its receipt"
+elif ! said "FAIL"; then
+	fail "the cached verdict is not shown as a FAIL — $OUT"
+elif ! said "bad: the thing did not hold"; then
+	fail "the cached FAIL does not show the transcript that failed — $OUT"
+elif ! said "exit 1 (cached"; then
+	fail "the cached FAIL does not say it was cached — $OUT"
+else
+	pass "a cached FAIL still blocks, still shows its transcript, and still names itself as cached"
+fi
+
+# L7. A receipt older than PI_PREFLIGHT_CACHE_TTL is ignored: a pass is never a pass by staleness.
+reset_case receipts-ttl
+reset_cache
+receipt_repo
+: >"$CASE/suite.log"
+run env SUITE_LOG="$CASE/suite.log" "$pf" --only suites --cwd "$REPO" feat/w1
+cached_runs=$(suite_runs)
+sleep 2
+: >"$CASE/suite.log"
+run env SUITE_LOG="$CASE/suite.log" PI_PREFLIGHT_CACHE_TTL=1s "$pf" --only suites --cwd "$REPO" feat/w1
+if [ "$RC" != 0 ]; then
+	fail "an expired-receipt run failed: exit $RC — $OUT"
+elif [ "$cached_runs" != 1 ]; then
+	fail "the fresh run before the TTL case did not run the suite ($cached_runs)"
+elif [ "$(suite_runs)" != 1 ]; then
+	fail "a receipt past its TTL was reused ($(suite_runs) suite run(s)) — $OUT"
+else
+	pass "a receipt older than PI_PREFLIGHT_CACHE_TTL is ignored and the check runs"
+fi
+# L8. A check a fast path skipped leaves no receipt behind: a skip is not a verdict to
+# reuse, and a cache that stored one would make the next docs-only run look like it ran something.
+reset_case receipts-skip
+reset_cache
+printf 'the trunk\n\nOne more paragraph of documentation.\n' >"$REPO/README.md"
+commit_branch "docs: one more paragraph"
+run "$pf" --only syntax,scrub --cwd "$REPO" feat/w1
+if [ "$RC" != 0 ]; then
+	fail "a run whose checks were all skipped failed: exit $RC — $OUT"
+elif [ "$(printf '%s\n' "$OUT" | grep -cE '^skip ')" != 2 ]; then
+	fail "the two checks were not both skipped on a docs-only diff — $OUT"
+elif [ "$(receipt_files)" != 0 ]; then
+	fail "a check skipped by a fast path wrote a receipt anyway ($(receipt_files) file(s))"
+else
+	pass "a check skipped by a fast path writes no receipt"
+fi
+
+# L9. `behind` is answered fresh every time and leaves no receipt: its answer is about origin,
+# which moves without this tree moving, so a remembered pass is the CONFLICTING publish it exists
+# to stop.
+reset_case receipts-behind
+reset_cache
+receipt_repo
+run "$pf" --only behind --cwd "$REPO" feat/w1
+first_rc=$RC
+first_out=$OUT
+run "$pf" --only behind --cwd "$REPO" feat/w1
+if [ "$first_rc" != 0 ] || [ "$RC" != 0 ]; then
+	fail "behind did not pass on a branch level with its origin: exit $first_rc then $RC — $OUT"
+elif ! printf '%s\n' "$first_out" | grep -q 'level with trunk or ahead'; then
+	fail "behind did not say what it found on a level branch — $first_out"
+elif said "pass (cached"; then
+	fail "a behind verdict was reused on the second run — $OUT"
+elif [ "$(receipt_files)" != 0 ]; then
+	fail "behind wrote $(receipt_files) receipt(s): its answer is about origin, not this tree"
+else
+	pass "behind is answered fresh on every run and leaves no receipt to reuse"
+fi
+
+unset SUITE_LOG
 
 # --- summary -----------------------------------------------------------------------------------
 

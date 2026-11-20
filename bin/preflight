@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # preflight — the checks CI would run, run here first, on the branch about to be published.
 #
-#   bin/preflight [--cwd DIR] [--slug SLUG] [--only NAME]... [--list] [BRANCH]
+#   bin/preflight [--cwd DIR] [--slug SLUG] [--only NAME]... [--list] [--fresh] [BRANCH]
 #
 # Why it exists: every red CI round in this workspace was a round trip — a rebase, a second worker,
 # ten minutes of waiting — over something a machine here answers in seconds. `new RegExp(variable)`
@@ -53,6 +53,22 @@
 #   bin/preflight --list                      the six check names, nothing run
 #   bin/preflight --only semgrep feat/x       one check, on that branch
 #   bin/preflight --slug w1                   the branch and body of worker w1
+#   bin/preflight --fresh --slug w1           run everything, ignore every receipt
+#
+# The same tree is checked twice per publish — the worker checks it to paste the Evidence block, then
+# `delegate finish` checks it again before it pushes — and neither run is redundant: the second is
+# the verdict at the moment of the push, not a memory of one. So the work is recorded rather than
+# repeated, once per check, in a receipt under state/preflight/ keyed by the check's whole input
+# (the tree, the branch, the checkout, the check set, this file's own hash, the check's name). A
+# second run on the same inputs prints the verdict and the transcript and runs nothing:
+#
+#   pass  suites (the repo's own tests)           12s  pass (cached 4m from the run at 2026-11-20T09:58:11Z)
+#
+# A cached FAIL still blocks and still shows the transcript that failed. --fresh ignores every
+# receipt, PI_PREFLIGHT_CACHE_TTL (default 6h, 0 disables) expires them, and a check a fast path
+# skipped writes none: a skip is not a verdict to reuse. `behind` is never cached either: its answer
+# is about origin, which moves without this tree moving, and a remembered pass there is exactly the
+# CONFLICTING publish it exists to stop. It is one quiet fetch, so it runs every time.
 #
 # Exit 0 only when every check that applied passed. A failing check prints the exact command that
 # reproduces it, because that command is the next thing a person types.
@@ -96,6 +112,138 @@ cleanup() {
 trap cleanup EXIT
 
 want_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# --- receipts: the second run on an unchanged tree is free --------------------------------------
+#
+# A receipt is never a pass by staleness, so its key is the whole input the verdict came from:
+#   the tree        HEAD plus `git status --porcelain`, so an unstaged edit invalidates it
+#   the place       the checkout and the branch, so a rebase or another worktree cannot reuse it
+#   the check set   the checks that applied, so a run of a different set cannot reuse it
+#   the gate        sha256 of this file, so a changed bin/preflight never reuses an old verdict
+#   the check       its own name
+# The body check adds the two inputs its verdict really comes from and no tree hash can see: the
+# report the body is built from (reports/<slug>.md, outside the checkout) and the environment the
+# target repo's own gate reads. Both are cheap to hash, and they stop the one staleness that could
+# publish a body nobody would send.
+PF_CACHE_DIR=$ROOT/state/preflight
+PF_CACHE_VERSION=""
+
+pf_sha() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+
+pf_gate_version() { # this file's own bytes, which are part of every verdict it produced
+	sha256sum "${BASH_SOURCE[0]}" 2>/dev/null | cut -d' ' -f1
+}
+
+pf_tree_hash() { # <cwd> — HEAD and the working tree, so a dirty tree is its own tree
+	local cwd=$1 head st
+	head=$(git -C "$cwd" rev-parse HEAD 2>/dev/null || printf 'no-head')
+	st=$(git -C "$cwd" status --porcelain 2>/dev/null | LC_ALL=C sort)
+	pf_sha "$head"$'\n'"$st"
+}
+
+# PI_PREFLIGHT_CACHE_TTL: seconds, or Ns/Nm/Nh. Default six hours; 0 disables the cache.
+pf_ttl_seconds() {
+	local v=${PI_PREFLIGHT_CACHE_TTL:-6h} n unit=1
+	case $v in *[!0-9smhSMH]*) printf '21600'; return 0 ;; esac
+	case $v in
+	*[hH]) n=${v%[hH]} unit=3600 ;;
+	*[mM]) n=${v%[mM]} unit=60 ;;
+	*[sS]) n=${v%[sS]} ;;
+	*) n=$v ;;
+	esac
+	case $n in '' | *[!0-9]*) n=21600 unit=1 ;; esac
+	printf '%s' "$((n * unit))"
+}
+
+pf_age_human() { # <seconds> — "8s", "4m", "3h", "2d"
+	local s=$1
+	if [ "$s" -lt 90 ]; then printf '%ss' "$s"
+	elif [ "$s" -lt 5400 ]; then printf '%sm' "$((s / 60))"
+	elif [ "$s" -lt 172800 ]; then printf '%sh' "$((s / 3600))"
+	else printf '%sd' "$((s / 86400))"; fi
+}
+
+# pf_report_path — the report this slug's body is built from. It lives outside the checkout, which
+# is why the body check's receipt key cannot rely on the tree hash alone.
+pf_report_path() {
+	local p=""
+	[ -n "${PF_SLUG:-}" ] || return 0
+	if [ -f "$DELEGATIONS" ]; then
+		p=$(node -e '
+			const fs = require("fs");
+			let j = {};
+			try { j = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch { process.exit(0); }
+			process.stdout.write(String((j[process.argv[2]] || {}).report || ""));' "$DELEGATIONS" "$PF_SLUG" 2>/dev/null || true)
+	fi
+	[ -n "$p" ] || p=$ROOT/reports/$PF_SLUG.md
+	printf '%s' "$p"
+}
+
+# pf_fresh_always <id> — a check whose answer the tree hash cannot see is never reused. The tree
+# hash holds HEAD and the working tree; origin/trunk is not in it, and a branch that was level ten
+# minutes ago can be behind now — the one failure the behind check exists for. A remembered pass
+# would be a pass by staleness, which is the thing a cache must never produce.
+pf_fresh_always() {
+	case $1 in behind) return 0 ;; esac
+	return 1
+}
+
+pf_receipt_key() { # <id> — every input that made this check's verdict, as one hash
+	local id=$1 extra="" report
+	if [ "$id" = body ]; then
+		report=$(pf_report_path)
+		if [ -n "$report" ] && [ -f "$report" ]; then
+			extra="report=$(sha256sum "$report" 2>/dev/null | cut -d' ' -f1)"
+		else
+			extra='report=none'
+		fi
+		extra="$extra"$'\n'"env=$(env | LC_ALL=C sort | sha256sum | cut -d' ' -f1)"
+	fi
+	pf_sha "$PF_CACHE_VERSION"$'\n'"${PF_CWD:-}"$'\n'"${PF_BRANCH:-}"$'\n'"${PF_RAN_FP:-}"$'\n'"${PF_TREE:-}"$'\n'"$id"$'\n'"$extra"
+}
+
+# pf_receipt_read <id> <out-file> — prints "exit elapsed_ms ts" and writes the stored transcript to
+# <out-file>; nonzero when there is no receipt for this key. Nothing is returned from a receipt the
+# caller has not first checked for age: freshness is the caller's decision, never the reader's.
+pf_receipt_read() {
+	local id=$1 file=$2 key
+	key=$(pf_receipt_key "$id")
+	[ -n "$key" ] && [ -f "$PF_CACHE_DIR/$key.json" ] || return 1
+	node -e '
+		const fs = require("fs");
+		const [path, into] = process.argv.slice(1);
+		let j;
+		try { j = JSON.parse(fs.readFileSync(path, "utf8")); } catch { process.exit(1); }
+		if (typeof j.exit !== "number" || typeof j.ts !== "number") process.exit(1);
+		fs.writeFileSync(into, String(j.output == null ? "" : j.output));
+		process.stdout.write(`${j.exit} ${j.elapsed_ms || 0} ${j.ts}`);' "$PF_CACHE_DIR/$key.json" "$file"
+}
+
+# pf_receipt_write <id> <exit> <elapsed_ms> <out-file> — record a verdict that was actually reached.
+pf_receipt_write() {
+	local id=$1 rc=$2 ms=$3 file=$4 key tmp
+	[ -f "$file" ] || return 0
+	key=$(pf_receipt_key "$id")
+	[ -n "$key" ] || return 0
+	mkdir -p "$PF_CACHE_DIR" 2>/dev/null || return 0
+	tmp=$PF_CACHE_DIR/.$key.$$.tmp
+	node -e '
+		const fs = require("fs");
+		const [dest, tmp, check, rc, ms, out, tree, version] = process.argv.slice(1);
+		const rec = {
+			check,
+			exit: Number(rc),
+			elapsed_ms: Number(ms),
+			ts: Math.floor(Date.now() / 1000),
+			at: new Date().toISOString(),
+			tree: tree,
+			version: version,
+			output: fs.readFileSync(out, "utf8"),
+		};
+		fs.writeFileSync(tmp, JSON.stringify(rec, null, 1) + "\n");
+		fs.renameSync(tmp, dest);' "$PF_CACHE_DIR/$key.json" "$tmp" "$id" "$rc" "$ms" "$file" "${PF_TREE:-}" "${PF_CACHE_VERSION:-}" 2>/dev/null || rm -f "$tmp"
+	return 0
+}
 
 # --- the checks, in the order they run ---------------------------------------------------------
 
@@ -803,7 +951,7 @@ pf_check_body() {
 # --- dispatch ----------------------------------------------------------------------------------
 
 usage() {
-	printf 'usage: %s [--cwd DIR] [--slug SLUG] [--only NAME]... [--list] [BRANCH]\n' "$prog" >&2
+	printf 'usage: %s [--cwd DIR] [--slug SLUG] [--only NAME]... [--list] [--fresh] [BRANCH]\n' "$prog" >&2
 	printf 'checks: %s\n' "${preflight_ids[*]}" >&2
 	exit 2
 }
@@ -846,7 +994,7 @@ pf_branch_for_slug() {
 }
 
 preflight_main() {
-	local cwd="" slug="" branch="" selected=() id out rc fails=0 ran=0 start end ms part
+	local cwd="" slug="" branch="" selected=() id out rc fails=0 ran=0 start end ms part fresh=0
 	local -a parts=()
 	local total_start total_end
 	while [ "$#" -gt 0 ]; do
@@ -892,6 +1040,7 @@ preflight_main() {
 			for id in "${preflight_ids[@]}"; do say "$id	$(name_of "$id")"; done
 			return 0
 			;;
+		--fresh) fresh=1; shift ;;
 		-h | --help | help) usage ;;
 		-*) die "unknown option $1" ;;
 		*)
@@ -951,6 +1100,7 @@ preflight_main() {
 	else
 		say "  ${PF_NOTE:-no merge base}, ${#PF_CHANGED[@]} file(s) changed, shape: $PF_SHAPE_NAME"
 	fi
+	[ "$fresh" = 0 ] || say "  --fresh: every receipt is ignored, every check runs"
 	say ""
 
 	# Which checks have something to look at, and the list as one string to test membership in.
@@ -964,6 +1114,39 @@ preflight_main() {
 	done
 	ran=${#run_ids[@]}
 
+	# The receipts: every input of every verdict once, then one lookup per check. A check whose key
+	# has a fresh receipt is not launched at all — its stored transcript takes the place of its
+	# output and its stored exit takes the place of its status, so the report below reads the same
+	# two files either way and cannot tell a cached verdict from a fresh one by accident.
+	PF_CACHE_VERSION=$(pf_gate_version)
+	PF_RAN_FP=$(pf_sha "$(printf '%s\n' "${run_ids[@]}")")
+	PF_TREE=$(pf_tree_hash "$cwd")
+	local ttl now_i age stamp crc cms cts cached=0 ran_now=0 now_list=" "
+	local -a run_now=()
+	local -A cached_age=() cached_rc=() cached_ms=() cached_ts=()
+	ttl=$(pf_ttl_seconds)
+	for id in "${run_ids[@]}"; do
+		if [ "$fresh" = 0 ] && [ "$ttl" -gt 0 ] && [ -n "$PF_CACHE_VERSION" ] && ! pf_fresh_always "$id" &&
+			stamp=$(pf_receipt_read "$id" "$PREFLIGHT_TMP/$id.out" 2>/dev/null) && [ -n "$stamp" ]; then
+			read -r crc cms cts <<<"$stamp"
+			now_i=$(date +%s)
+			age=$((now_i - cts))
+			# A receipt from the future is a clock that moved: treat it as no receipt at all.
+			if [ "$age" -ge 0 ] && [ "$age" -le "$ttl" ]; then
+				cached_age[$id]=$age
+				cached_rc[$id]=$crc
+				cached_ms[$id]=$cms
+				cached_ts[$id]=$cts
+				printf '%s %s\n' "$crc" "$cms" >"$PREFLIGHT_TMP/$id.status"
+				cached=$((cached + 1))
+				continue
+			fi
+		fi
+		run_now+=("$id")
+		now_list="$now_list$id "
+	done
+	ran_now=${#run_now[@]}
+
 	# The checks are independent — semgrep reads changed files, the suites build throwaway roots,
 	# the body check builds a body in the temporary directory — so they run side by side and the
 	# wall clock is the slowest of them instead of the sum. Each writes its own log; the report
@@ -974,8 +1157,7 @@ preflight_main() {
 	# fails there" stays a statement about one suite at a time, and never skipped, since it is the
 	# check that catches a test reaching for the developer's tools.
 	total_start=$(date +%s%N)
-	for id in "${run_ids[@]}"; do
-		[ "$id" = scrub ] && continue
+	for id in "${run_now[@]}"; do
 		(
 			local s e r m
 			s=$(date +%s%N)
@@ -988,7 +1170,7 @@ preflight_main() {
 		pids+=($!)
 	done
 	for start in "${pids[@]}"; do wait "$start" 2>/dev/null || true; done
-	if case $ran_list in *" scrub "*) true ;; *) false ;; esac; then
+	if case $now_list in *" scrub "*) true ;; *) false ;; esac; then
 		(
 			local s e r m
 			s=$(date +%s%N)
@@ -1010,6 +1192,24 @@ preflight_main() {
 		rc=1
 		ms=0
 		[ -f "$PREFLIGHT_TMP/$id.status" ] && read -r rc ms <"$PREFLIGHT_TMP/$id.status"
+		# A receipt in play says so on the same line the verdict is on, and the stored transcript is
+		# printed under it — a cached FAIL is read exactly like a fresh one, which is the point: it
+		# blocks, it shows what failed, and it is never mistaken for something that passed.
+		if [ -n "${cached_age[$id]:-}" ]; then
+			stamp=$(date -u -d "@${cached_ts[$id]:-0}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'ts %s' "${cached_ts[$id]:-0}")
+			mark="cached $(pf_age_human "${cached_age[$id]}") from the run at $stamp"
+			if [ "$rc" = 0 ]; then
+				printf 'pass  %-44s %4ss  pass (%s)\n' "$(name_of "$id")" "$((ms / 1000))" "$mark"
+				[ -s "$out" ] && sed 's/^/      /' "$out"
+			else
+				fails=$((fails + 1))
+				printf 'FAIL  %-44s %4ss  exit %s (%s)\n' "$(name_of "$id")" "$((ms / 1000))" "$rc" "$mark"
+				sed 's/^/      /' "$out" 2>/dev/null
+				printf '      reproduce: %s --fresh --only %s%s%s %s\n' "$PBIN/preflight" "$id" \
+					"${slug:+ --slug $slug}" "${cwd:+ --cwd $cwd}" "$branch"
+			fi
+			continue
+		fi
 		if [ "$rc" = 0 ]; then
 			printf 'pass  %-44s %4ss  %s\n' "$(name_of "$id")" "$((ms / 1000))" "$(head -n 1 "$out" 2>/dev/null)"
 			[ "$(wc -l <"$out" 2>/dev/null || echo 0)" -le 1 ] || sed 's/^/      /' "$out" | tail -n +2
@@ -1020,14 +1220,19 @@ preflight_main() {
 			printf '      reproduce: %s --only %s%s%s %s\n' "$PBIN/preflight" "$id" \
 				"${slug:+ --slug $slug}" "${cwd:+ --cwd $cwd}" "$branch"
 		fi
+		# A verdict that was reached is worth keeping; one whose status file never appeared is not, and
+		# neither is one whose answer can go stale without this tree moving.
+		if [ -f "$PREFLIGHT_TMP/$id.status" ] && ! pf_fresh_always "$id"; then
+			pf_receipt_write "$id" "$rc" "$ms" "$out"
+		fi
 	done
 
 	say ""
 	if [ "$fails" = 0 ]; then
-		say "preflight: $ran/$ran passed on $branch in $(( (total_end - total_start) / 1000000000 ))s"
+		say "preflight: $ran/$ran passed ($cached cached, $ran_now ran) on $branch in $(( (total_end - total_start) / 1000000000 ))s"
 		return 0
 	fi
-	say "preflight: $((ran - fails))/$ran passed, $fails FAILED on $branch in $(( (total_end - total_start) / 1000000000 ))s"
+	say "preflight: $((ran - fails))/$ran passed, $fails FAILED ($cached cached, $ran_now ran) on $branch in $(( (total_end - total_start) / 1000000000 ))s"
 	say "nothing should be published from this branch until the checks above pass — or say why the check does not apply: delegate finish <slug> --skip-preflight \"<reason>\""
 	return 1
 }
