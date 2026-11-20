@@ -366,16 +366,26 @@ waits in `state/guard-terminals` until the tab it landed in is read as the guard
 the person's terminals as parked. A parked tab whose terminal now holds an interactive shell with
 no recovered-launch `argv` (`exec …/pi-bare`, or the `--session` line) is the person's too: it is
 left alone and `state/guard.log` says `left alone: it is the person's tab`.
+
+A resume is typed only into a terminal that shows a shell prompt, checked again in the last instant
+before the keystroke: a live terminal whose foreground has no `argv` yet is a pi that is still
+starting as often as it is a shell that has not attached, so the guard types nothing and leaves the
+tab for the next poll. A tab that already runs pi — `herdr-app ls` says so, or an `argv` that
+carries the entry's own session — is never typed into, and never closed or reopened for it either.
 `PI_BOSS_SPACE` points the guard at another space name, so a repair can be tried without touching
 the real one; `PI_BOSS_RESUME_SCRIPT` and `PI_BOSS_RESUME_DIR` do the same for the resume map, and
 `PI_BOSS_ONCE=1` runs exactly one poll and exits.
 
-`bash scripts/test-guard-resume.sh` drives nineteen cases against a fake herdr-app, a fake resume
+`bash scripts/test-guard-resume.sh` drives twenty-four cases against a fake herdr-app, a fake
+resume
 map, a fake resume script and a fake `hc`: resume preferred, no entry → fresh tab, failed resume →
 fresh tab, rate limit intact, `pi-master` untouched, and the 2026-11-15 pair — terminal unknown but
 the entry found by tab id, and the resume script answering `busy (no program)` — both ended by a
 resume, not a fresh tab. It also covers newest-of-two entries, a vanished session file, an entry
-already restored in this boot, and `hc` reporting a foreground with no `argv`. And the tabs that
+already restored in this boot, and a foreground with no `argv` for one look and then a shell. And
+the terminal it must not type into: a foreground with no `argv` on every look types nothing, a tab
+already running pi on this session or another is skipped, and a live pi with no entry is left where
+it is — while a real dead tab is still resumed exactly once. And the tabs that
 are not the guard's: a terminal opened while the guard runs is never turned into a pi and survives
 a guard restart, while a parked recovered shell is still repaired, the guard's own tab is still
 reopened at most once a minute, the person's tab that does carry a resume entry is resumed, and a

@@ -21,7 +21,20 @@
 #   8. two entries for one tab -> the newest `updated_at` wins;
 #   9. entry whose session file is gone -> opened fresh, with the old log line;
 #  10. entry restored in this boot -> nothing typed a second time, tab left alone;
-#  11. fake hc reports a live terminal with no foreground argv -> the guard waits and retries.
+#  11. fake hc reports a live terminal with no foreground argv for one look, then a shell -> the
+#      guard waits and types exactly once (a slow recovered shell is still resumed);
+#
+# And the incident this suite gained its last cases from: a guard resume typed an
+# `exec … --session <path>` line into a pi that was already running, because a pi that is still
+# starting reads as `unattached` and `wait_attached` used to answer `attached` after the bound.
+# The rule now: the line goes only into a terminal that shows a shell prompt, looked at again in
+# the last instant before the send.
+#
+#  19. `unattached` on every look, then pi appears -> nothing typed at all, and the log says why;
+#  20. pi already running with the entry's own session in its argv -> skipped, not typed into;
+#  21. pi already running on a different session -> skipped too;
+#  22. a real dead tab (shell, no pi) -> resumed exactly once, as before;
+#  23. a live pi the app has not reported and no entry -> left alone, never closed or reopened.
 #
 #   bash scripts/test-guard-resume.sh      exit 0 = every case held
 #
@@ -115,11 +128,13 @@ exit 0
 STUB
 
 # The fake `hc`: it is the only way the guard can type into a terminal the app does not report.
-# `get <t> --json` answers from $FAKE/hc-fg/<t> (shell | none | pi | launch | other:<cmd>) and only
-# for a terminal listed in $FAKE/hc-known; `send` records the line, makes that terminal pi, and
-# flips the tab to pi so herdr-app reports it too. $FAKE/hc-calls counts both, so a test can see a
-# retry. `launch` is the recovered shell the guard (or herdr-resume) started: an interactive shell
-# whose argv carries the exec line, which is what tells it apart from the person's own shell.
+# `get <t> --json` answers from $FAKE/hc-json/<t> (raw JSON, verbatim), $FAKE/hc-seq/<t> (a queue of
+# states, one consumed per look; a line starting with `{` is raw JSON) or $FAKE/hc-fg/<t>
+# (shell | none | pi | launch | other:<cmd>), and only for a terminal listed in $FAKE/hc-known;
+# `send` records the line, makes that terminal pi, and flips the tab to pi so herdr-app reports it
+# too. $FAKE/hc-calls counts both, so a test can see a retry. `launch` is the recovered shell the
+# guard (or herdr-resume) started: an interactive shell whose argv carries the exec line, which is
+# what tells it apart from the person's own shell.
 cat >"$work/stub/hc" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -129,8 +144,18 @@ case ${1:-} in
 get)
 	t=${2:-}
 	grep -qx "$t" "$st/hc-known" 2>/dev/null || exit 1
-	fg=$(cat "$st/hc-fg/$t" 2>/dev/null || echo shell)
+	if [ -f "$st/hc-json/$t" ]; then
+		cat "$st/hc-json/$t"
+		exit 0
+	fi
+	if [ -f "$st/hc-seq/$t" ] && [ -s "$st/hc-seq/$t" ]; then
+		fg=$(head -n 1 "$st/hc-seq/$t")
+		tail -n +2 "$st/hc-seq/$t" >"$st/hc-seq/$t.tmp" && mv "$st/hc-seq/$t.tmp" "$st/hc-seq/$t"
+	else
+		fg=$(cat "$st/hc-fg/$t" 2>/dev/null || echo shell)
+	fi
 	case $fg in
+	'{'*) printf '%s\n' "$fg" ;;
 	none) printf '{"state":"live","foreground":{}}\n' ;;
 	shell) printf '{"state":"live","foreground":{"argv":["/bin/bash"],"pid":1},"argv":["/bin/bash"]}\n' ;;
 	pi) printf '{"state":"live","foreground":{"argv":["/opt/pnpm/bin/pi/cli.js"],"pid":2}}\n' ;;
@@ -159,7 +184,7 @@ run_guard() { # run_guard <space> [entry: yes|no] [succeed: 0|1] [seed repairs: 
 	local space=$1 entry=${2:-yes} succeed=${3:-0} seed=${4:-no}
 	case_no=$((case_no + 1))
 	fake=$work/case$case_no
-	mkdir -p "$fake/entries" "$fake/root/state" "$fake/root/bin" "$fake/root/reports" "$fake/root/specs"
+	mkdir -p "$fake/entries" "$fake/root/state" "$fake/root/bin" "$fake/root/reports" "$fake/root/specs" "$fake/hc-fg" "$fake/hc-json" "$fake/hc-seq"
 	printf 'tab1|master|1|t1|sh\n' >"$fake/tabs"
 	[ "$entry" = yes ] && {
 		: >"$fake/s1.jsonl"
@@ -241,7 +266,7 @@ fi
 setup_case() { # setup_case <tabs line>
 	case_no=$((case_no + 1))
 	fake=$work/case$case_no
-	mkdir -p "$fake/entries" "$fake/root/state" "$fake/root/bin" "$fake/root/reports" "$fake/root/specs" "$fake/hc-fg"
+	mkdir -p "$fake/entries" "$fake/root/state" "$fake/root/bin" "$fake/root/reports" "$fake/root/specs" "$fake/hc-fg" "$fake/hc-json" "$fake/hc-seq"
 	: >"$fake/hc-known"
 	printf '%s\n' "$1" >"$fake/tabs"
 }
@@ -312,11 +337,13 @@ else
 	cat "$fake/root/state/guard.log" 2>/dev/null
 fi
 
-# 7. the resume script's own verdict on that terminal: "busy (no program)". That must not end in a
-#    fresh tab — the guard types the session itself.
+# 7. the resume script's own verdict on that terminal: it said "busy (no program)" on 2026-11-15
+#    because a live foreground with no argv looked busy. The guard must not end in a fresh tab over
+#    that: the terminal shows a shell prompt, so the guard types the session itself. (A terminal
+#    that shows no prompt at all is case 19, and it is never typed into.)
 setup_case 'tab1|master|1|t1|sh'
 hc_knows t1
-printf none >"$fake/hc-fg/t1"
+printf shell >"$fake/hc-fg/t1"
 entry e2 "{\"terminal\":\"t1\",\"tab\":\"tab1\",\"session_path\":\"$(session s2.jsonl)\",\"argv\":[\"pi\"],\"updated_at\":\"2026-11-15T09:00:00.000Z\"}"
 guard_once boss 0 1
 if [ "$(grep -c 'busy (no program)' "$fake/resume-calls" || true)" -ge 1 ] &&
@@ -367,15 +394,16 @@ else
 	cat "$fake/root/state/guard.log" 2>/dev/null
 fi
 
-# 11. today's second failure: hc says live, foreground has no argv and no pid. That is "not attached
-#     yet", not busy: the guard asks again before it concludes anything.
+# 11. a slow shell is still resumed: hc answers "no foreground argv yet" for one look, then a real
+#     shell argv. The wait is what makes the difference here, so the guard types exactly once.
+#     (The first look in a pass is `terminal_runs_pi`, so the queue is none, none, shell.)
 setup_case 'tab1|master|1|tzzz|sh'
 hc_knows tX
-printf none >"$fake/hc-fg/tX"
+printf 'none\nnone\nshell\n' >"$fake/hc-seq/tX"
 entry e11 "{\"terminal\":\"tX\",\"tab\":\"tab1\",\"session_path\":\"$(session s11.jsonl)\",\"argv\":[\"pi\"],\"updated_at\":\"2026-11-15T09:00:00.000Z\"}"
 guard_once boss 0 1
 if [ "$(hc_gets)" -ge 2 ] && [ "$(hc_sends)" = 1 ] && [ "$(opened_tab)" = 0 ] && [ "$(tabs_app)" = pi ]; then
-	pass "foreground has no argv: waited ($(hc_gets) hc get calls) instead of calling it busy, then resumed"
+	pass "no foreground argv for one look, then a shell: waited ($(hc_gets) hc get calls) and typed once"
 else
 	fail "expected hc gets then one send (gets $(hc_gets), sends $(hc_sends), tab.new $(opened_tab))"
 	cat "$fake/root/state/guard.log" 2>/dev/null
@@ -501,6 +529,87 @@ if [ "${remembered:-0}" -ge 1 ] && [ "$(tab_class_of "$new_tab")" = guard ] && [
 	pass "a tab.new that ls lagged: remembered by terminal, then classified guard, not the person's"
 else
 	fail "expected the new tab to be remembered and then classified guard (remembered ${remembered:-0}, class '$(tab_class_of "$new_tab")')"
+	cat "$fake/root/state/guard.log" 2>/dev/null
+fi
+
+# 19. the incident: hc says live with no foreground argv on every look — a pi that is still
+#     starting reads exactly like that — and pi appears afterwards. Nothing is typed: no exec line,
+#     no retry, and the tab is not reopened either. This is the case `wait_attached` used to answer
+#     `attached` for after the bound, and the reason a resume line once landed inside a running pi.
+setup_case 'tab1|master|1|t1|sh'
+hc_knows t1
+printf 'none\nnone\nnone\npi\n' >"$fake/hc-seq/t1"
+entry e19 "{\"terminal\":\"t1\",\"tab\":\"tab1\",\"session_path\":\"$(session s19.jsonl)\",\"argv\":[\"pi\"],\"updated_at\":\"2026-11-15T09:00:00.000Z\"}"
+guard_once boss 0 1
+if [ "$(hc_sends)" = 0 ] && [ "$(hc_sends_any)" = 0 ] && [ "$(opened_tab)" = 0 ] && [ "$(closed_tabs)" = 0 ] &&
+	! grep -q 'exec' "$fake/hc-calls" 2>/dev/null &&
+	logged 'has no shell prompt yet (foreground has no program); not typing into it'; then
+	pass "no shell prompt on every look (a pi still starting): nothing typed, nothing reopened, the log says why"
+else
+	fail "expected no typing and no reopen (hc sends $(hc_sends_any), tab.new $(opened_tab), close $(closed_tabs))"
+	cat "$fake/root/state/guard.log" 2>/dev/null
+fi
+
+# 20. pi is already there and its argv carries this very session. Typing the exec line again would
+#     be a second pi on one conversation, so the tab is skipped and the log names the session.
+setup_case 'tab1|master|1|t1|sh'
+hc_knows t1
+s20=$(session s20.jsonl)
+printf '{"state":"live","foreground":{"argv":["sh","-lc","exec pi --session %s"],"pid":7}}\n' "$s20" >"$fake/hc-json/t1"
+entry e20 "{\"terminal\":\"t1\",\"tab\":\"tab1\",\"session_path\":\"$s20\",\"argv\":[\"pi\"],\"updated_at\":\"2026-11-15T09:00:00.000Z\"}"
+guard_once boss 0 1
+if [ "$(hc_sends_any)" = 0 ] && [ "$(opened_tab)" = 0 ] && [ "$(closed_tabs)" = 0 ] &&
+	! grep -q 'exec' "$fake/hc-calls" 2>/dev/null &&
+	logged "already has pi running (session $s20); nothing to resume"; then
+	pass "pi already running on this session: skipped, one log line, no hc send at all"
+else
+	fail "expected no hc send and no reopen (hc calls: $(grep -c . "$fake/hc-calls" 2>/dev/null || echo 0))"
+	cat "$fake/root/state/guard.log" 2>/dev/null
+fi
+
+# 21. pi running on a different session is still a live pi in that tab: never typed into, never
+#     closed or reopened over.
+setup_case 'tab1|master|1|t1|sh'
+hc_knows t1
+printf '{"state":"live","foreground":{"argv":["/opt/pnpm/bin/pi/cli.js","--session","/tmp/other.jsonl"],"pid":8}}\n' >"$fake/hc-json/t1"
+entry e21 "{\"terminal\":\"t1\",\"tab\":\"tab1\",\"session_path\":\"$(session s21.jsonl)\",\"argv\":[\"pi\"],\"updated_at\":\"2026-11-15T09:00:00.000Z\"}"
+guard_once boss 0 1
+if [ "$(hc_sends_any)" = 0 ] && [ "$(opened_tab)" = 0 ] && [ "$(closed_tabs)" = 0 ] &&
+	! grep -q 'exec' "$fake/hc-calls" 2>/dev/null; then
+	pass "pi on a different session: still skipped, nothing typed, nothing opened or closed"
+else
+	fail "expected the live pi tab untouched (hc sends $(hc_sends_any), tab.new $(opened_tab), close $(closed_tabs))"
+	cat "$fake/root/state/guard.log" 2>/dev/null
+fi
+
+# 22. the case the refusals must not eat: a real dead tab, a shell and no pi, is resumed exactly
+#     once, on its own terminal, with its own session.
+setup_case 'tab1|master|1|t1|sh'
+hc_knows t1
+printf shell >"$fake/hc-fg/t1"
+s22=$(session s22.jsonl)
+entry e22 "{\"terminal\":\"t1\",\"tab\":\"tab1\",\"session_path\":\"$s22\",\"argv\":[\"pi\"],\"updated_at\":\"2026-11-15T09:00:00.000Z\"}"
+guard_once boss 0 1
+line22=$(sent_line)
+if [ "$(hc_sends)" = 1 ] && [ "$(opened_tab)" = 0 ] && [ "$(closed_tabs)" = 0 ] &&
+	[ "$line22" = "exec pi --session $s22" ]; then
+	pass "dead tab with a shell prompt: resumed once ($line22), nothing opened or closed"
+else
+	fail "expected exactly one exec send and no reopen (sends $(hc_sends): $(sent_line))"
+	cat "$fake/root/state/guard.log" 2>/dev/null
+fi
+
+# 23. same live pi with no resume entry at all: the tab has nothing to resume, but it also has a pi,
+#     so the reopen path must walk past it instead of closing a running agent.
+setup_case 'tab1|master|1|t1|sh'
+hc_knows t1
+printf pi >"$fake/hc-fg/t1"
+guard_once boss
+if [ "$(hc_sends_any)" = 0 ] && [ "$(opened_tab)" = 0 ] && [ "$(closed_tabs)" = 0 ] &&
+	logged "already has pi running in terminal \`t1\`; nothing to repair"; then
+	pass "live pi, no entry: left alone, not closed, not reopened"
+else
+	fail "expected the live pi tab untouched (tab.new $(opened_tab), close $(closed_tabs))"
 	cat "$fake/root/state/guard.log" 2>/dev/null
 fi
 
