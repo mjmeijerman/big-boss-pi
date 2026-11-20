@@ -22,11 +22,12 @@ export PI_BOSS_ROOT=$work/root
 unset PI_MASTER_ROOT
 mkdir -p "$PI_BOSS_ROOT/reports" "$PI_BOSS_ROOT/state" "$PI_BOSS_ROOT/specs" "$work/stub"
 
-# The fakes. `publish` is the one command finish calls out to: its exit code is the case, and its
-# log is how "nothing was published" is proved. `herdr-app` records the space.close, which is the
-# only way a worker's space goes away; `herdr-app ls` is the window's own list, the one place a
-# space's name and its id sit together, so FAKE_HERDR_LS is that answer.
-printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"%s/publish-calls"\nexit "${FAKE_PUBLISH_RC:-0}"\n' "$work" \
+# The fakes. `publish` is the one command finish calls out to: its exit code is the case, its log is
+# how "nothing was published" is proved, and FAKE_PUBLISH_SAY is the verdict line it prints — finish
+# reads that line to say `published` or `already published`. `herdr-app` records the space.close,
+# which is the only way a worker's space goes away; `herdr-app ls` is the window's own list, the
+# one place a space's name and its id sit together, so FAKE_HERDR_LS is that answer.
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"%s/publish-calls"\n[ -z "${FAKE_PUBLISH_SAY:-}" ] || printf "%%s\\n" "$FAKE_PUBLISH_SAY"\nexit "${FAKE_PUBLISH_RC:-0}"\n' "$work" \
 	>"$work/stub/publish"
 # The gate step runs before publish. finish finds `preflight` on PATH first, so this stub is the
 # gate: its exit code is the case, and its log is how "finish ran the gate before it published" is
@@ -61,7 +62,7 @@ reset() {
 	: >"$work/publish-calls"
 	: >"$work/preflight-calls"
 	: >"$work/herdr-calls"
-	unset FAKE_PREFLIGHT_RC
+	unset FAKE_PREFLIGHT_RC FAKE_PUBLISH_SAY
 	: >"$PI_BOSS_ROOT/state/decisions.jsonl"
 	unset FAKE_HC_LS FAKE_HERDR_LS FAKE_HC_RC
 	printf '{"w1":{"space":"space-w1","cwd":"","branch":""}}\n' \
@@ -224,6 +225,24 @@ elif [ "$(open_workers)" != 0 ]; then
 	fail "finish left the delegation entry behind"
 else
 	pass "a successful publish wipes, records and closes in one command"
+fi
+
+# 2b. A publish that pushed nothing says so. publish's own verdict line is `nothing new to push: #N
+#     is already at <sha>` when origin already holds the worker's head, and finish must not turn that
+#     into `published`: the work was already there, and a verdict over an unmoved branch is not a
+#     publish. Everything else about the run is unchanged — the wipe and the close still happen.
+reset
+FAKE_PUBLISH_SAY="nothing new to push: #12 is already at d4c2d26" run finish w1
+if [ "$RC" != 0 ]; then
+	fail "finish over a branch origin already holds: exit $RC, wanted 0 — $OUT"
+elif ! printf '%s' "$OUT" | grep -qF 'already published, wiped, closed'; then
+	fail "finish did not say already published for a publish that pushed nothing — $OUT"
+elif printf '%s' "$OUT" | grep -qF 'preflighted, published'; then
+	fail "finish claimed a publish over a branch that did not move — $OUT"
+elif ! closed_space; then
+	fail "finish did not close the space after an already-published verdict"
+else
+	pass "a publish that pushed nothing closes the worker as already published"
 fi
 
 # 3. The wipe keeps its own gate: a report that exists but answers nothing is refused, after the

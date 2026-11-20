@@ -45,6 +45,9 @@ fi
 #     the next person sees which line to change;
 #   - a branch with no commit carrying the `Agent-Slug:` trailer (nothing ties the branch to the
 #     worker that wrote the report);
+#   - a branch other than the one the delegation record names, unless the `Agent-Slug: <slug>`
+#     trailer is what found it. Both names are printed and nothing is pushed: #188 was gated and
+#     rebuilt over a sibling branch and stayed at 1b6af4e while the commit sat on the other one;
 #   - `gh` not on PATH, and a tree that is not a git repo;
 #   - a push whose result the remote does not confirm. The sha being pushed is read before the
 #     push and origin's head for the branch is read back afterwards with `git ls-remote`; a
@@ -69,6 +72,14 @@ fi
 # the guard cannot read, keeps the old answer: it prints what origin holds for the branch and
 # refuses when that is not the branch, because nothing was pushed there and a URL on its own would
 # read as a publish.
+#
+# And the pull request is read back, not assumed. The last line of a publish is the answer to "what
+# does GitHub now say #N is?" — `published <slug>: #<n> now at <sha> (<state>, <mergeable>)`, from
+# `gh pr view --json headRefOid,state,mergeable` — and a head sha that is still the old one after a
+# few seconds of re-read fails the publish, naming both. #188 printed `published` after a push that
+# left it CONFLICTING at 1b6af4e, and nothing had ever asked. A branch origin already holds at the
+# worker's head says `nothing new to push: #<n> is already at <sha>` instead, and `delegate finish`
+# then says `already published` — a verdict over an unmoved branch is not a publish.
 #
 # What it carries from the report into the body: the Mission line (its label reduced to the bare
 # `Mission:` a body gate greps for, the text untouched), the `Now possible:` sentence when the report
@@ -160,6 +171,70 @@ remote_head() { # <cwd> <branch> — the sha origin holds (empty: none); nonzero
 	out=$(git -C "$1" ls-remote origin "refs/heads/$2" 2>/dev/null) || return 3
 	printf '%s' "$out" | awk 'NR==1 { print $1 }'
 	return 0
+}
+
+# The pull request's own state, asked of GitHub instead of assumed from what the push said. The head
+# sha, the state and whether GitHub can merge it are the three things a person checks by hand before
+# believing a publish, so they are read back in one call; a silent gh (no answer at all) is a
+# non-zero here, never an empty "fine".
+pr_view() { # <cwd> <number> — "sha<TAB>state<TAB>mergeable"; nonzero when gh cannot answer
+	local out
+	out=$(cd "$1" && gh pr view "$2" --json headRefOid,state,mergeable \
+		--jq '[.headRefOid, .state, .mergeable] | @tsv' 2>/dev/null) || return 3
+	printf '%s' "$out"
+}
+
+# read_back_pr <cwd> <number> <sha> — what GitHub says #<number> points at, asked a bounded number
+# of times. The push lands before the API serves it, so one read can still show the previous head;
+# #188 printed `published` while GitHub reported 1b6af4e and nothing ever asked. A few seconds of
+# re-read is the difference between a race and a lie. Sets pr_sha, pr_state and pr_mergeable; an
+# empty pr_sha means gh never answered. PUBLISH_READBACK_TRIES/PUBLISH_READBACK_SLEEP exist for the
+# tests, which must not spend seconds proving a re-read they already know the answer to.
+read_back_pr() {
+	local cwd=$1 n=$2 want=$3 try=0 tries=${PUBLISH_READBACK_TRIES:-3} pause=${PUBLISH_READBACK_SLEEP:-1} answer
+	pr_sha=""
+	pr_state=""
+	pr_mergeable=""
+	while :; do
+		try=$((try + 1))
+		answer=$(pr_view "$cwd" "$n" 2>/dev/null || true)
+		pr_sha=${answer%%$'\t'*}
+		pr_state=$(printf '%s\n' "$answer" | cut -f2)
+		pr_mergeable=$(printf '%s\n' "$answer" | cut -f3)
+		[ -n "$pr_sha" ] && [ "$pr_sha" != "$want" ] || break
+		[ "$try" -lt "$tries" ] || break
+		[ "$pause" = 0 ] || sleep "$pause"
+	done
+}
+
+# verify_pr <cwd> <number> <sha> — the pull request has to point at this publish's commit before
+# anything else is done in its name. Sets pr_sha, pr_state, pr_mergeable; a head sha that is still
+# another commit after the bounded re-read is a refusal naming both, because a push that did not land
+# is not a publish. gh answering nothing at all is a note and no claim about the state: the push's
+# own probe already proved the branch moved, and inventing `OPEN` would be the same lie in a nicer
+# font.
+verify_pr() {
+	local want=$3
+	read_back_pr "$1" "$2" "$want"
+	if [ -z "$pr_sha" ]; then
+		note "gh pr view gave no answer for #$2, so this verdict carries no state or mergeable value"
+	fi
+	if [ -n "$pr_sha" ] && [ "$pr_sha" != "$want" ]; then
+		die "#$2 still reports $pr_sha after the push that was meant to put $want there (read ${PUBLISH_READBACK_TRIES:-3} time(s)), so nothing was published: the pull request does not carry this work"
+	fi
+}
+
+# verdict <number> <sha> — the one line a publish always prints, and the only one it stands behind:
+# what GitHub now says the pull request points at, its state, and whether it is mergeable. A branch
+# that was already at origin's head is `nothing new to push`, never `published`: a verdict over an
+# unmoved branch is not a publish, and `delegate finish` reads that line to say `already published`.
+verdict() {
+	if [ -n "$push_needed" ]; then
+		printf 'published %s: #%s now at %s (%s, %s)\n' "$slug" "$1" "${2:0:7}" \
+			"${pr_state:-state unread}" "${pr_mergeable:-mergeable unread}"
+	else
+		printf 'nothing new to push: #%s is already at %s\n' "$1" "${2:0:7}"
+	fi
 }
 
 # own_tip <cwd> <branch> <sha> — was <sha> ever this branch's head in this repo? A rebase, an amend
@@ -508,11 +583,22 @@ fi
 # wait for a trunk value here: the trailer is the only thing that identifies its branch.
 lookup=""
 recorded=$branch
+trailer_found=""
 if [ -n "$no_entry" ]; then
 	lookup=1
 else
 	case $branch in
 	"$trunk" | trunk | main | master) lookup=1 ;;
+	*)
+		# A recorded branch that is not in this tree is not a reason to refuse: the worker's commit
+		# may have been moved onto a sibling branch (that is what a rebase onto another base leaves
+		# behind). It is a reason to ask the trailer, and only the trailer, which branch is this
+		# worker's — never to take a branch at random.
+		if ! git -C "$cwd" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null; then
+			lookup=1
+			note "state/delegations.json names $branch, which is not a local branch in $cwd — asking the 'Agent-Slug: $slug' trailer which branch carries this work"
+		fi
+		;;
 	esac
 fi
 if [ -n "$lookup" ]; then
@@ -527,6 +613,7 @@ if [ -n "$lookup" ]; then
 	case $(printf '%s' "$found" | grep -cE . || true) in
 	1)
 		branch=$found
+		trailer_found=1
 		if [ -n "$no_entry" ]; then
 			note "$slug is not in state/delegations.json (wiped and closed); publishing $branch, found by its Agent-Slug trailer in $cwd"
 		else
@@ -548,7 +635,7 @@ if [ -n "$lookup" ]; then
 			note "$report names commit $worker_sha, and that change is already in origin/$trunk — nothing to publish"
 			exit 0
 		fi
-		die "no branch in $cwd carries a commit with 'Agent-Slug: $slug', so nothing ties a branch to this worker"
+		die "$(if [ -n "$no_entry" ]; then printf 'no branch in %s carries' "$cwd"; else printf 'state/delegations.json names %s for %s, and no branch in %s carries' "$recorded" "$slug" "$cwd"; fi) a commit with 'Agent-Slug: $slug', so nothing ties this worker to a branch — nothing was pushed. Local branches: $(git -C "$cwd" for-each-ref --format='%(refname:short)' refs/heads/ | tr '\n' ' ')"
 		;;
 	*)
 		die "several branches in $cwd carry 'Agent-Slug: $slug' ($(printf '%s' "$found" | tr '\n' ' ')) — publish one by name rather than guessing"
@@ -561,6 +648,14 @@ fi
 # missing the branch, which names the wrong problem.
 if ! git -C "$cwd" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null; then
 	die "branch $branch is not a local branch in $cwd, so there is nothing to push"
+fi
+# Never a branch this worker did not commit to. Reading a sibling branch is how #188 was gated and
+# rebuilt at 1b6af4e while the rebased commit d4c2d26 sat on `guard-hidden-rebase`: every check ran,
+# the PR did not move, and the verdict said `published`. The delegation record is the authority; the
+# only way a different branch may be pushed is the report's own `Agent-Slug: <slug>` trailer, which
+# is the worker saying where its work is. Otherwise this stops and names both, before any push.
+if [ -z "$no_entry" ] && [ -n "$recorded" ] && [ "$branch" != "$recorded" ] && [ -z "$trailer_found" ]; then
+	die "state/delegations.json names $recorded for $slug, and $branch is not it and carries no commit with 'Agent-Slug: $slug', so $branch is not this worker's branch — nothing was pushed"
 fi
 slugs=$(git -C "$cwd" log --format=%B "refs/remotes/origin/$trunk..$branch" 2>/dev/null || true)
 if [ -z "$slugs" ]; then
@@ -763,10 +858,12 @@ fi
 # 8. Push the branch only. Never trunk, never a blind force — and never on the push's own word: the
 # sha being pushed is read first, origin is asked for the branch's head afterwards, and a mismatch is
 # a refusal, not a warning. A push that cannot be confirmed must not end in a PR URL.
-# An open PR makes the push the update rather than the upload, and a branch origin already holds
-# at exactly the commit the tree is at has nothing to send: finishing twice must not push a second
-# time, and the body edit is harmless when the file did not change, so the second run still
-# refreshes the description and still exits 0.
+# A branch origin already holds at exactly the commit the tree is at has nothing to send, in either
+# destination: finishing twice must not push a second time and a branch whose PR is being opened for
+# the first time has nothing to upload either. That is said in those words — `nothing new to push` —
+# because the case this replaces printed a verdict over a branch that had not moved (#188 stayed
+# CONFLICTING at 1b6af4e while `finish` said `published`). The body edit is harmless when the file
+# did not change, so the second run still refreshes the description and still exits 0.
 pushed=$(local_head "$cwd" "$branch")
 [ -n "$pushed" ] || die "git cannot read the head of $branch in $cwd, so there is nothing to prove was pushed"
 push_needed=1
@@ -776,7 +873,8 @@ if [ -n "$open_pr" ]; then
 	fi
 	if [ "$there" = "$pushed" ]; then
 		push_needed=""
-		note "origin/$branch is already at ${pushed:0:7}: nothing to push, refreshing #$open_pr's description"
+		note "origin/$branch is already at ${pushed:0:7}: nothing to push"
+		note "refreshing #$open_pr's description from reports/$slug.md"
 	else
 		note "pushing $branch to origin, into #$open_pr"
 	fi
@@ -820,9 +918,11 @@ fi
 
 # An open PR is refreshed, not duplicated: the body is built above by the same path a new PR's is,
 # so a report with no tier line was refused before this point and a body gate refused here before
-# the push. What is printed says what happened, because `published` is what made the stranded
-# commit invisible: the PR body is this command's output, and it has to be described as such.
+# the push. The order is deliberate — the pull request is asked what it points at first, and the
+# body is only touched once it answers with this publish's commit; a stale head stops the run with
+# the description untouched. What is printed says what happened, and the last line is the verdict.
 if [ -n "$open_pr" ]; then
+	verify_pr "$cwd" "$open_pr" "$pushed"
 	if ! out=$(cd "$cwd" && gh pr edit "$open_pr" --body-file "$body" 2>&1); then
 		printf '%s\n' "$out" >&2
 		die "the branch reached origin/$branch but #$open_pr's description could not be refreshed (gh pr edit failed), so the pull request does not carry this report yet"
@@ -832,6 +932,7 @@ if [ -n "$open_pr" ]; then
 	else
 		printf 'updated #%s (no new commits, body from reports/%s.md)\n' "$open_pr" "$slug"
 	fi
+	verdict "$open_pr" "$pushed"
 	printf '%s\n' "$pr_url"
 	exit 0
 fi
@@ -845,4 +946,12 @@ out=$(cd "$cwd" && gh pr create --base "$trunk" --head "$branch" --title "$title
 }
 url=$(printf '%s\n' "$out" | grep -oE 'https?://[^[:space:]]+' | tail -n 1 || true)
 [ -n "$url" ] || url=$out
+# The new pull request's number, so its head sha can be read back like an existing one's: a URL with
+# no number is not a pull request this command can verify, and verifying it is the entire point.
+new_pr=${url##*/}
+case $new_pr in
+'' | *[!0-9]*) die "gh pr create printed '$url', which carries no pull request number, so the head sha of the pull request it opened cannot be read back" ;;
+esac
+verify_pr "$cwd" "$new_pr" "$pushed"
+verdict "$new_pr" "$pushed"
 printf '%s\n' "$url"

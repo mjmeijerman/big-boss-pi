@@ -198,6 +198,13 @@ expect "publish: refusals, body gates and the push it reports" 0 "test-publish: 
 #     into a throwaway bare origin and a logged git argv, so the flags are read from the log.
 expect "publish: a rewritten branch is leased, a foreign commit refuses" 0 "publish force: ok" -- \
 	bash "$root/scripts/test-publish-force.sh"
+# 5l3. The verdict a publish prints is the pull request's answer, not its own: a push origin does not
+#     take fails naming both shas, a push GitHub has not caught up with fails too, a branch origin
+#     already holds says `nothing new to push` and never `published`, and a branch neither the
+#     delegation record nor the `Agent-Slug:` trailer names is refused before `git push` is called.
+#     Real pushes into a throwaway bare origin, a logged git argv and a stub gh, so no network.
+expect "publish: the verdict is read back from the pull request" 0 "publish verdict: ok" -- \
+	bash "$root/scripts/test-publish-verdict.sh"
 # 5m. Which sha a close reads, when a report names more than one. A report quotes another branch's
 #     commit as evidence, and the reader used to take the first one it found and refuse over a sha
 #     the worker does not own. Its own script because the answer depends on three commits in one
