@@ -16,9 +16,14 @@
 #   G. Reuse is symmetric: a receipt `scripts/ci-offline.sh` wrote answers `bin/preflight`'s suites
 #      check, which is the direction the old single-ledger cache could not do.
 #
-# Every case runs in a throwaway checkout under a temporary directory, with every test script
-# ci-offline.sh runs replaced by a stub that appends its name to $STUBLOG. What the suite proves is
-# then a line count, not a transcript, and one run costs a process instead of a suite.
+# Every case runs in one throwaway checkout under a temporary directory (D takes the one copy it
+# needs), with every test script ci-offline.sh runs replaced by a stub that appends its name to
+# $STUBLOG. What the suite proves is then a line count, not a transcript, and one run costs a
+# process instead of a suite.
+#
+# The fixture is paid for once and only the cases that need a cold gate get one: this file runs a
+# gate six times over, so a second full copy, a commit per case, or a fourth `ci-offline.sh` merely
+# to read a verdict the ledger already holds is time the case cannot spend on the box CI gives it.
 #
 #   bash scripts/tests/test-receipts.sh      exit 0 = every case held
 set -uo pipefail
@@ -27,7 +32,10 @@ root=$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/../.." && pwd)
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-unset PI_MASTER_ROOT AGENTS_MD_LIMIT PI_PREFLIGHT_CACHE_TTL PI_RECEIPT_DIR
+unset PI_MASTER_ROOT AGENTS_MD_LIMIT PI_PREFLIGHT_CACHE_TTL PI_RECEIPT_DIR PI_RECEIPT_FRESH
+# PI_RECEIPT_FRESH is the flag `--fresh` exports to the cases it starts. A case whose subject is
+# reuse must not inherit "trust nothing" from the run that asked for it, or a cold run of this job
+# reports the ledger as broken when the parent turned it off.
 export HOME=$work/home
 mkdir -p "$HOME"
 export STUBLOG=$work/stub.log
@@ -82,12 +90,23 @@ printf '%s\n' '$text'
 EOF
 	chmod +x "$fx/$rel"
 	stubs=$((stubs + 1))
-done < <(sed -nE 's/^expect_script "[^"]*" [0-9]+ "([^"]*)" ([^ ]+)$/\1\t\2/p' "$fx/scripts/ci-offline.sh")
+done < <(sed -nE 's/^expect_script "[^"]*" [0-9]+ "([^"]*)" ([^ ]+)( --budget [0-9]+)?$/\1\t\2/p' "$fx/scripts/ci-offline.sh")
 # What "every suite" means is ci-offline's own list, read from its source: a case added there is a
-# case counted here, and this suite never has to be told the number again.
+# case counted here, and this suite never has to be told the number again. A case that carries its
+# own ceiling (`--budget`) is still a case, and the ceiling is not a reason to stub it differently.
 suites=$(grep -c '^expect_script ' "$fx/scripts/ci-offline.sh")
 if [ "$stubs" != "$suites" ]; then
 	printf 'setup: %s stub(s) written, wanted %s — ci-offline.sh changed shape\n' "$stubs" "$suites" >&2
+	exit 2
+fi
+
+# A cold preflight here is one ci-local job, the offline one, because the ledger lives in that job:
+# syntax, lint and docs write no receipt, and shellcheck over a whole checkout on its own outlasts
+# the job this file is about — the wall of the case would then be lint, not reuse.
+sed -i.bak 's/^job_ids=(syntax lint offline docs)$/job_ids=(offline)/' "$fx/scripts/ci-local.sh"
+rm -f "$fx/scripts/ci-local.sh.bak"
+if ! grep -qx 'job_ids=(offline)' "$fx/scripts/ci-local.sh"; then
+	printf 'setup: ci-local.sh no longer declares job_ids on one line — this fixture cannot shape it\n' >&2
 	exit 2
 fi
 
@@ -126,7 +145,9 @@ want_rc 0 "the offline suite passes"
 want_text "offline behaviour: ok ($suites cached, 0 ran)" "the offline job answers from the ledger"
 want_runs 0 "the offline job runs no test script the suites check already ran"
 
-# C. A changed tracked file is a different tree: nothing may answer for it.
+# C. A changed tracked file is a different tree: nothing may answer for it. The reverted read is
+#    taken through preflight, which is the same ledger for 70ms where ci-offline.sh is 4s: what the
+#    step proves is that the receipts are valid again, not which gate reads them.
 printf 'an unstaged edit is a different tree\n' >>"$fx/scripts/prune-refs.sh"
 : >"$STUBLOG"
 out=$(cio)
@@ -135,7 +156,7 @@ want_rc 0 "a dirty tree still passes"
 want_runs "$suites" "an unstaged edit invalidates every receipt"
 git -C "$fx" checkout -- scripts/prune-refs.sh
 : >"$STUBLOG"
-out=$(cio)
+out=$(pf --only suites)
 rc=$?
 want_runs 0 "and reverting the edit makes the receipts valid again"
 
@@ -157,7 +178,10 @@ else
 	want_runs "$suites" "a changed gate reuses nothing, even on an unchanged tree"
 fi
 
-# E. A cached FAIL blocks, keeps its transcript, and is not run again hoping for a pass.
+# E. A cached FAIL blocks, keeps its transcript, and is not run again hoping for a pass. The fail
+#    is made by ci-offline.sh and read back through preflight: one ledger, so a receipt one gate
+#    wrote is a verdict the other honours — and a receipt that must not be re-run into a pass is
+#    exactly where a re-read is cheap and a second gate run is not.
 export STUB_FAIL=scripts/test-wipe.sh
 : >"$STUBLOG"
 out=$(cio --fresh)
@@ -165,7 +189,7 @@ rc=$?
 want_rc 1 "a failing suite still fails the gate"
 want_text "wipe checklist, refusal and skip log: exit 1, wanted 0" "the failing case is named"
 : >"$STUBLOG"
-out=$(cio)
+out=$(pf --only suites)
 rc=$?
 want_rc 1 "the cached FAIL still fails"
 want_text "cached" "the cached FAIL says it came from a receipt"

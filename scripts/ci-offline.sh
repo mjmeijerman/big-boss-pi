@@ -76,6 +76,7 @@ pass() { printf '  ok    %s\n' "$*"; }
 fail() { printf '  FAIL  %s\n' "$*"; fails=$((fails + 1)); }
 cached=0
 script_ran=0
+budget_hit=""
 
 # verdict <name> <want-code> <want-text|-> <rc> <out> [note] — the comparison every case makes,
 # shared by a case that ran and a case a receipt answered: a cached verdict is read exactly like a
@@ -102,15 +103,25 @@ expect() {
 	verdict "$name" "$want" "$text" "$rc" "$out"
 }
 
-# expect_script <name> <want-code> <want-text|-> <repo-relative script> [args...] — a case that
-# runs one of this repo's own test scripts, through the ledger bin/preflight writes. The key is the
-# tree, the script and the gates (bin/receipts.sh), so a script that already answered on this tree
-# is not run again — and the reuse is symmetric: bin/preflight's `suites` check reads what this
-# writes, and this reads what the suites wrote. A cached FAIL is still a FAIL, printed with the
-# transcript that failed; --fresh bypasses the ledger and empties it.
+# expect_script <name> <want-code> <want-text|-> <repo-relative script> [--budget SECONDS] [args...]
+# — a case that runs one of this repo's own test scripts, through the ledger bin/preflight writes.
+# The key is the tree, the script and the gates (bin/receipts.sh), so a script that already answered
+# on this tree is not run again — and the reuse is symmetric: bin/preflight's `suites` check reads
+# what this writes, and this reads what the suites wrote. A cached FAIL is still a FAIL, printed
+# with the transcript that failed; --fresh bypasses the ledger and empties it.
+#
+# --budget is a per-case ceiling for the one case whose own work is a gate, not a suite: 120s is a
+# hang detector for a script that runs in 21s, and a case that runs six gates over six trees needs a
+# ceiling that names why it is wider instead of widening every other case's hang to five minutes.
+# The case that hits it is named in the summary, and the verdict is the same loud exit 124 as ever.
 expect_script() {
 	local name=$1 want=$2 text=$3 rel=$4
 	shift 4
+	local budget=120
+	if [ "${1:-}" = --budget ]; then
+		budget=${2:-120}
+		shift 2
+	fi
 	local key file out rc ms s e
 	key="script:$rel${*:+ $*}"
 	file=$work/transcript
@@ -124,10 +135,13 @@ expect_script() {
 	# A script case runs a whole suite, and the slowest of them (test-preflight.sh) runs this gate
 	# itself, so its budget is wider than a single process's: the cap stops a hang, it is not a
 	# timed contest, and a run that shares the machine with three other suites must not lose it.
-	out=$(timeout 120 bash "$root/$rel" "$@" 2>&1) && rc=0 || rc=$?
+	out=$(timeout "$budget" bash "$root/$rel" "$@" 2>&1) && rc=0 || rc=$?
 	e=$(date +%s%N)
 	ms=$(((e - s) / 1000000))
 	script_ran=$((script_ran + 1))
+	# A hang is a verdict like any other, and a case allowed a wider ceiling says so by name: a
+	# slow box must not turn "this gate needs 200s" into a wall nobody can read off the summary.
+	[ "$rc" != 124 ] || budget_hit+="${budget_hit:+; }$name (${budget}s ceiling)"
 	printf '%s' "$out" >"$file"
 	receipt_write "$key" "$rc" "$ms" "$file"
 	verdict "$name" "$want" "$text" "$rc" "$out"
@@ -284,7 +298,10 @@ expect_script "preflight: the checks CI would run, before the push" 0 "preflight
 # script and the gates' own bytes, with a cached FAIL still blocking. It builds its own throwaway
 # checkouts and stubs every script in this list, so it costs fixtures, not suites — and so it does
 # not recurse into itself.
-expect_script "receipts: one ledger, two gates, no re-run" 0 "receipts: ok" scripts/tests/test-receipts.sh
+# Six gates over six trees in one case — two cold preflights, a copy, a dirty tree, two --fresh
+# runs — so a two-core runner needs more than the 120s a suite that runs once is given. The ceiling
+# is for this case alone, and hitting it is still exit 124 in the verdict and in the summary line.
+expect_script "receipts: one ledger, two gates, no re-run" 0 "receipts: ok" scripts/tests/test-receipts.sh --budget 300
 # 5o. No tracked file carries an absolute home directory (the one bug that gave a Windows machine
 #     five symptoms), and the three worker wrappers find pi the same way on every platform: $PI_BIN,
 #     PATH, $PNPM_HOME, $HOME, %APPDATA% — with bin/pi-sandboxed refusing on native Windows instead
@@ -621,5 +638,6 @@ expect_script "acceptance mode, flag, generated spec and recorded mode" 0 "accep
 #    script because every case needs a real bare origin to push into and a gh that records its argv.
 expect_script "an open PR gets the push and the refreshed body" 0 "open PR update: ok" scripts/test-open-pr-update.sh
 
-printf '\n%s\n' "$([ "$fails" = 0 ] && echo "offline behaviour: ok ($cached cached, $script_ran ran)" || echo "offline behaviour: $fails failure(s) ($cached cached, $script_ran ran)")"
+summary=$([ "$fails" = 0 ] && echo "offline behaviour: ok ($cached cached, $script_ran ran)" || echo "offline behaviour: $fails failure(s) ($cached cached, $script_ran ran)")
+printf '\n%s%s\n' "$summary" "${budget_hit:+, budget hit: $budget_hit}"
 [ "$fails" = 0 ]
