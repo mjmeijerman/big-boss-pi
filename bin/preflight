@@ -13,6 +13,12 @@
 # change is seconds and an engine change is thorough. A check that does not apply is printed as
 # `skip` with the reason — never as a pass:
 #
+#   behind    the branch's base against a just-fetched origin/<trunk>: a branch cut before a pull
+#             request merged publishes a CONFLICTING one (#68 was spawned at 19:27:52Z, #67 merged at
+#             19:32:04Z, AGENTS.md and README.md colliding). Names how far behind, which of the
+#             branch's own touched paths also moved, and the rebase — it never rebases for you, and
+#             an unreachable origin is a named pass, because a gate that blocks on a flaky network
+#             gets bypassed
 #   syntax    bash -n on the changed shell files, node --check on the changed .mjs/.js
 #   suites    the repo's own tests, each exactly once: in a pi checkout the node suite and every
 #             scripts/tests/*.test.sh — the globs `make scripts-test` runs, run directly, so the
@@ -44,7 +50,7 @@
 # Output is plain and meant to be pasted: one line per check, verdict, name, elapsed, detail; the
 # detail under a failing check; then a summary. No colour, no progress bars.
 #
-#   bin/preflight --list                      the five check names, nothing run
+#   bin/preflight --list                      the six check names, nothing run
 #   bin/preflight --only semgrep feat/x       one check, on that branch
 #   bin/preflight --slug w1                   the branch and body of worker w1
 #
@@ -93,8 +99,9 @@ want_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 # --- the checks, in the order they run ---------------------------------------------------------
 
-preflight_ids=(syntax suites semgrep scrub body)
+preflight_ids=(behind syntax suites semgrep scrub body)
 preflight_names=(
+	"behind (is this branch cut from a stale trunk?)"
 	"syntax (bash -n, node --check, shellcheck)"
 	"suites (the repo's own tests)"
 	"semgrep (the changed files)"
@@ -178,6 +185,7 @@ pf_applies() {
 	scrub) [ "${#PF_TESTS[@]}" -gt 0 ] ;;
 	suites) [ "$PF_SHAPE" != none ] && [ "${#PF_CODE[@]}" -gt 0 ] ;;
 	body) return 0 ;;
+	behind) return 0 ;;
 	*) return 1 ;;
 	esac
 }
@@ -230,6 +238,69 @@ pf_repo_shape() {
 		return 0
 	fi
 	printf 'none'
+}
+
+# --- check: behind -----------------------------------------------------------------------------
+
+# The one check no local test can find: a branch that started before a pull request merged. A
+# worker cuts its branch from trunk and works; the trunk moves while it works; the branch arrives
+# `CONFLICTING`, or worse, green against a diff nobody reviewed. Nothing else here can see it —
+# syntax, semgrep, scrub and the body gate all pass on a stale base.
+#
+# One question, asked after a quiet bounded fetch: is origin/<trunk> already an ancestor of HEAD?
+# When it is not, the branch is behind or diverged, and the publish is the person's minutes. So it
+# names the two facts that person needs — how far behind, and which of this branch's own touched
+# paths also moved on trunk since the merge base — and the exact remedy, in that worktree.
+#
+# It never rebases. A rebase can conflict, and a gate that rewrites history is worse than one that
+# refuses: an automatic rebase turns a visible refusal into a half-resolved tree. And an
+# unreachable origin is a named PASS, because a gate that blocks on a flaky network is a gate
+# people learn to skip — the line says what was not checked, so "pass" never reads as "level".
+pf_check_behind() {
+	local cwd=$PF_CWD trunk=$PF_TRUNK ref fetch_out n p f mb cmd=()
+	local moved=() touched=() collide=()
+	ref="refs/remotes/origin/$trunk"
+	if want_cmd timeout; then cmd=(timeout 25 git -C "$cwd" fetch --quiet origin); else cmd=(git -C "$cwd" fetch --quiet origin); fi
+	if ! fetch_out=$(env GIT_TERMINAL_PROMPT=0 "${cmd[@]}" 2>&1); then
+		printf 'could not reach origin; behind-ness unchecked (%s)\n' "$(printf '%s\n' "$fetch_out" | head -n 1 | cut -c1-120)"
+		return 0
+	fi
+	if ! git -C "$cwd" rev-parse --verify --quiet "$ref" >/dev/null 2>&1; then
+		printf 'no %s after the fetch; behind-ness unchecked\n' "$ref"
+		return 0
+	fi
+	if git -C "$cwd" merge-base --is-ancestor "$ref" "$PF_BRANCH" 2>/dev/null; then
+		printf 'origin/%s is in %s: level with trunk or ahead of it\n' "$trunk" "$PF_BRANCH"
+		return 0
+	fi
+	n=$(git -C "$cwd" rev-list --count "$PF_BRANCH..$ref" 2>/dev/null) || n=?
+	# Both sides of the merge base, read after the fetch so the base is the trunk as it is now: the
+	# branch's own paths, trunk's paths, and the intersection is the collision list. A path this
+	# branch never touched cannot conflict, and listing trunk's whole diff would bury the ones that
+	# can. PF_CHANGED is not reused because it was collected before this fetch.
+	mb=$(git -C "$cwd" merge-base "$ref" "$PF_BRANCH" 2>/dev/null) || mb=""
+	[ -n "$mb" ] || mb=$ref
+	mapfile -t touched < <(git -C "$cwd" diff --name-only "$mb..$PF_BRANCH" 2>/dev/null)
+	mapfile -t moved < <(git -C "$cwd" diff --name-only "$mb..$ref" 2>/dev/null)
+	for p in "${moved[@]}"; do
+		[ -n "$p" ] || continue
+		for f in "${touched[@]}"; do
+			if [ "$f" = "$p" ]; then
+				collide+=("$p")
+				break
+			fi
+		done
+	done
+	printf '%s is %s commit(s) behind origin/%s; %d of the %d touched path(s) also moved on trunk\n' \
+		"$PF_BRANCH" "$n" "$trunk" "${#collide[@]}" "${#touched[@]}"
+	if [ "${#collide[@]}" -gt 0 ]; then
+		printf 'the collisions, by path:\n'
+		printf '  %s\n' "${collide[@]}"
+	else
+		printf 'no path this branch touched moved on trunk, so this rebase would be clean — it is still yours to run, not the gate\x27s\n'
+	fi
+	printf 'Fix: git -C %s rebase origin/%s\n' "$cwd" "$trunk"
+	return 1
 }
 
 # --- check: syntax -----------------------------------------------------------------------------

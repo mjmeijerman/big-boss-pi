@@ -101,9 +101,9 @@ then close once it is answered. Every other report is relayed and its space clos
    slug, never a task dropped into the finished one.
 8. Every change lands as a pull request: the worker commits on its branch and stops (no push, no
    `gh pr create`, no attempt). **You** publish with `delegate finish SLUG`, which refuses a
-   report with no Evidence block, no `Review tier:` line or no `bin/preflight` run, so workers
-   stay sandboxed. Publish before the wipe and the close: closing drops the delegation entry the
-   command reads. Only the human merges; no PR, unfinished.
+   report with no Evidence block, no `Review tier:` line or no passing `bin/preflight` (behind
+   trunk fails it), so workers stay sandboxed. Publish before the wipe and the close: closing
+   drops the delegation entry the command reads. Only the human merges; no PR, unfinished.
 9. Never start work the user did not ask for. A question is a question: answer it, spawn nothing,
    edit nothing. When in doubt ask `jev` first; the user only when Jev is unsure or says no.
 10. Review sets the pace, not generation: at most one pull request per human sits in review at a
