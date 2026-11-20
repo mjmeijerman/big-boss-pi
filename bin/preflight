@@ -24,10 +24,14 @@
 #   scrub     the changed test files under `env -i PATH=<empty stub>:/usr/bin:/bin HOME=<tmp>` —
 #             the runner does not have your PATH, and this is the check that catches it (pi#66)
 #   body      the AGENTS.md docs budget and the target repo's own body gate, run on the body
-#             `bin/publish` would actually send, so a wrong tier cannot reach GitHub. Shape-aware:
-#             a checkout with no root AGENTS.md has no budget to measure, so that half is skipped by
-#             name (a pi checkout keeps its instructions at agent/AGENTS.md, which is not one) and
-#             the gate half still runs and still blocks; no pr-check target is a named skip too
+#             `bin/publish` would actually send, so a wrong tier cannot reach GitHub. The gate runs
+#             in the checkout that holds the branch being gated, never the one the caller stands in:
+#             a repo whose `pr-check` refuses a checkout that is not on the branch (pi's does) is
+#             right to refuse, and pointing it at trunk's checkout made every worker publish fail.
+#             Shape-aware: a checkout with no root AGENTS.md has no budget to measure, so that half
+#             is skipped by name (a pi checkout keeps its instructions at agent/AGENTS.md, which is
+#             not one) and the gate half still runs and still blocks; no pr-check target is a named
+#             skip too
 #
 # The checks run side by side and each suite inside them writes its own log: they read files, they
 # build throwaway roots, none of them shares state with another — so the wall clock is the slowest
@@ -73,7 +77,16 @@ say() { printf '%s\n' "$*"; }
 die() { printf '%s: error: %s\n' "$prog" "$*" >&2; exit 2; }
 
 PREFLIGHT_TMP=""
-cleanup() { [ -z "$PREFLIGHT_TMP" ] || rm -rf "$PREFLIGHT_TMP"; }
+# The throwaway checkout the body gate sometimes needs (a branch no checkout holds): recorded here
+# so the EXIT trap removes it too, never only on the path that returned normally.
+PF_GATE_TMP=""
+PF_GATE_REPO=""
+PF_GATE_SELECTED=""
+PF_GATE_DIR=""
+cleanup() {
+	pf_gate_checkout_cleanup
+	[ -z "$PREFLIGHT_TMP" ] || rm -rf "$PREFLIGHT_TMP"
+}
 trap cleanup EXIT
 
 want_cmd() { command -v "$1" >/dev/null 2>&1; }
@@ -539,59 +552,154 @@ pf_docs_budget() {
 	return 0
 }
 
-# run_body_gate <cwd> <branch> <body-file> — the target repo's own body gate, and the one
-# definition of it: bin/publish sources this file and calls it, so the gate the preflight runs is
-# the gate a publish runs. `make pr-check BODY=<file>` when the repo has that target,
-# `scripts/pr-gate.sh --body <file>` when it has that script, else a named skip. The branch is
-# named to the gate exactly when the checkout is not on it, and only when the target is shown to
-# expand it: a gate that diffs trunk against trunk sees no changed files and refuses every publish.
-# Sets BODY_GATE to the gate that ran (empty when none did) and returns nonzero when it refused.
-# publish has its own note (it prefixes "publish:"); standalone there is nobody to ask.
 pf_gate_note() {
 	if declare -F note >/dev/null 2>&1; then note "$@"; else printf '%s: %s\n' "${prog:-preflight}" "$*" >&2; fi
 }
 
-run_body_gate() {
-	local cwd=$1 branch=$2 body=$3 head_branch gate_branch probe gate_flag
-	BODY_GATE=""
-	head_branch=$(git -C "$cwd" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
-	gate_branch=""
-	[ "$head_branch" = "$branch" ] || gate_branch=$branch
-	if ! pf_has_body_gate "$cwd"; then
-		pf_gate_note "body gate skipped: $cwd has no 'make pr-check' target and no scripts/pr-gate.sh"
+# pf_branch_checkout <repo> <branch> — the checkout that holds <branch>, read from the repo's own
+# worktree list (`git worktree list --porcelain`: one block per checkout, its path and its branch).
+# Prints nothing and returns nonzero when no checkout holds the branch — it exists only as a ref.
+pf_branch_checkout() {
+	local repo=$1 branch=$2 line path
+	path=""
+	while IFS= read -r line; do
+		case $line in
+		worktree\ *) path=${line#worktree } ;;
+		branch\ refs/heads/*)
+			if [ "${line#branch refs/heads/}" = "$branch" ] && [ -n "$path" ] && [ -d "$path" ]; then
+				printf '%s\n' "$path"
+				return 0
+			fi
+			;;
+		esac
+	done < <(git -C "$repo" worktree list --porcelain 2>/dev/null)
+	return 1
+}
+
+# pf_throwaway_checkout <repo> <branch> — a detached worktree of the commit <branch> points at, for
+# a branch no checkout holds. Detached on purpose: the commit is what the gate reads, so a checkout
+# of the same commit under another name would be the same tree with a misleading label. The path is
+# recorded in PF_GATE_TMP (and its repo in PF_GATE_REPO) so pf_gate_checkout_cleanup removes it on
+# every path out, a refused gate included.
+pf_throwaway_checkout() {
+	local repo=$1 branch=$2 dir commit
+	commit=$(git -C "$repo" rev-parse --verify --quiet "$branch^{commit}" 2>/dev/null) || return 1
+	dir=$(mktemp -d "${TMPDIR:-/tmp}/preflight-gate.XXXXXX") || return 1
+	rmdir "$dir" 2>/dev/null || rm -rf "$dir"
+	if ! git -C "$repo" worktree add --detach --quiet "$dir" "$commit" >/dev/null 2>&1; then
+		rm -rf "$dir"
+		return 1
+	fi
+	# The checkout is only worth gating in when it really is the branch's commit. A `git` that says
+	# it made one and made nothing would otherwise hand the gate an empty tree, the gate would find
+	# no Makefile, and a publish would go out with no body gate at all — the failure that looks like
+	# a pass. Verified, or the caller's own checkout is used with the branch named to it, as before.
+	if [ "$(git -C "$dir" rev-parse --verify --quiet HEAD 2>/dev/null || true)" != "$commit" ]; then
+		git -C "$repo" worktree remove "$dir" >/dev/null 2>&1 || true
+		rm -rf "$dir"
+		return 1
+	fi
+	# Set here, not printed: a caller that read the path out of `$(...)` would set these in a
+	# subshell, and the cleanup would have nothing to remove — the leak this line exists to stop.
+	PF_GATE_TMP=$dir
+	PF_GATE_REPO=$repo
+	return 0
+}
+
+# pf_gate_checkout_cleanup — remove the throwaway checkout, if one was made. Called before every
+# return out of run_body_gate and from the EXIT trap, because a worktree left behind holds a ref in
+# the repo it borrowed from and the next `git worktree add` of it would refuse.
+pf_gate_checkout_cleanup() {
+	[ -n "${PF_GATE_TMP:-}" ] || return 0
+	git -C "${PF_GATE_REPO:-$PWD}" worktree remove "$PF_GATE_TMP" >/dev/null 2>&1 || true
+	rm -rf "$PF_GATE_TMP"
+	git -C "${PF_GATE_REPO:-$PWD}" worktree prune >/dev/null 2>&1 || true
+	PF_GATE_TMP=""
+	PF_GATE_REPO=""
+}
+
+# pf_gate_checkout <repo> <branch> — the directory the body gate must run in. The checkout that
+# holds the branch, when one does; a throwaway detached worktree of that commit when none does; the
+# caller's own checkout only when there is no branch to look for. Nothing else is honest: a repo
+# whose `pr-check` refuses a checkout that is not on the branch it gates is right to refuse, and
+# running it in trunk's checkout is a gate pointed at the wrong tree (three publishes in a row).
+pf_gate_checkout() {
+	local repo=$1 branch=$2 dir
+	PF_GATE_SELECTED=$repo
+	PF_GATE_TMP=""
+	PF_GATE_REPO=""
+	[ -n "$branch" ] || return 0
+	if dir=$(pf_branch_checkout "$repo" "$branch"); then
+		PF_GATE_SELECTED=$dir
 		return 0
 	fi
-	if [ -f "$cwd/Makefile" ] && grep -qE '^pr-check[[:space:]]*:' "$cwd/Makefile"; then
+	if pf_throwaway_checkout "$repo" "$branch"; then
+		PF_GATE_SELECTED=$PF_GATE_TMP
+		pf_gate_note "no checkout holds $branch, so the gate runs in a throwaway worktree of it ($PF_GATE_TMP)"
+	fi
+	return 0
+}
+
+# run_body_gate <cwd> <branch> <body-file> — the target repo's own body gate, and the one
+# definition of it: bin/publish sources this file and calls it, so the gate the preflight runs is
+# the gate a publish runs. `make pr-check BODY=<file>` when the repo has that target,
+# `scripts/pr-gate.sh --body <file>` when it has that script, else a named skip. It runs in the
+# checkout that holds <branch> (pf_gate_checkout), and every line it prints names that directory, so
+# a reader can see the gate was pointed at the right tree. There the checkout is on the branch, so
+# no BRANCH= is needed; in the throwaway detached checkout the branch is named to the gate exactly
+# when the target is shown to expand it: a gate that diffs trunk against trunk sees no changed files
+# and refuses every publish. Sets BODY_GATE to the gate that ran (empty when none did) and returns
+# nonzero when it refused. publish has its own note (it prefixes "publish:"); standalone there is
+# nobody to ask.
+run_body_gate() {
+	local cwd=$1 branch=$2 body=$3 dir head_branch gate_branch probe gate_flag rc=0
+	BODY_GATE=""
+	pf_gate_checkout "$cwd" "$branch"
+	dir=$PF_GATE_SELECTED
+	if ! pf_has_body_gate "$dir"; then
+		pf_gate_note "body gate skipped: $dir has no 'make pr-check' target and no scripts/pr-gate.sh"
+		pf_gate_checkout_cleanup
+		return 0
+	fi
+	head_branch=$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+	gate_branch=""
+	[ "$head_branch" = "$branch" ] || gate_branch=$branch
+	if [ -f "$dir/Makefile" ] && grep -qE '^pr-check[[:space:]]*:' "$dir/Makefile"; then
 		BODY_GATE="make pr-check"
 		local gate_args=( BODY="$body" )
 		if [ -n "$gate_branch" ] &&
-			probe=$(make -C "$cwd" --no-print-directory -n pr-check BODY=/dev/null BRANCH=__publish_probe__ 2>/dev/null) &&
+			probe=$(make -C "$dir" --no-print-directory -n pr-check BODY=/dev/null BRANCH=__publish_probe__ 2>/dev/null) &&
 			printf '%s\n' "$probe" | grep -q '__publish_probe__'; then
 			gate_args+=( "BRANCH=$branch" )
-			pf_gate_note "body gate: make -C $cwd pr-check BRANCH=$branch (its recipe expands BRANCH)"
+			pf_gate_note "body gate: make -C $dir pr-check BRANCH=$branch (its recipe expands BRANCH)"
 			pf_gate_note "the checkout is on ${head_branch:-a detached HEAD}, not $branch"
 		else
-			pf_gate_note "body gate: make -C $cwd pr-check"
+			pf_gate_note "body gate: make -C $dir pr-check"
 		fi
-		make -C "$cwd" --no-print-directory pr-check "${gate_args[@]}" || return 1
-		return 0
+		make -C "$dir" --no-print-directory pr-check "${gate_args[@]}" || rc=1
+		PF_GATE_DIR=$dir
+		pf_gate_checkout_cleanup
+		return $rc
 	fi
-	if [ -x "$cwd/scripts/pr-gate.sh" ]; then
+	if [ -x "$dir/scripts/pr-gate.sh" ]; then
 		BODY_GATE="scripts/pr-gate.sh"
 		gate_flag=""
-		if [ -n "$gate_branch" ] && grep -qE -- '--branch[)=|[:space:]]' "$cwd/scripts/pr-gate.sh"; then
+		if [ -n "$gate_branch" ] && grep -qE -- '--branch[)=|[:space:]]' "$dir/scripts/pr-gate.sh"; then
 			gate_flag=1
 		fi
 		if [ -n "$gate_flag" ]; then
-			pf_gate_note "body gate: $cwd/scripts/pr-gate.sh --body --branch $branch"
-			( cd "$cwd" && ./scripts/pr-gate.sh --body "$body" --branch "$branch" ) || return 1
+			pf_gate_note "body gate: $dir/scripts/pr-gate.sh --body --branch $branch"
+			( cd "$dir" && ./scripts/pr-gate.sh --body "$body" --branch "$branch" ) || rc=1
 		else
-			pf_gate_note "body gate: $cwd/scripts/pr-gate.sh --body"
-			( cd "$cwd" && ./scripts/pr-gate.sh --body "$body" ) || return 1
+			pf_gate_note "body gate: $dir/scripts/pr-gate.sh --body"
+			( cd "$dir" && ./scripts/pr-gate.sh --body "$body" ) || rc=1
 		fi
-		return 0
+		PF_GATE_DIR=$dir
+		pf_gate_checkout_cleanup
+		return $rc
 	fi
-	pf_gate_note "body gate skipped: $cwd has no 'make pr-check' target and no scripts/pr-gate.sh"
+	pf_gate_note "body gate skipped: $dir has no 'make pr-check' target and no scripts/pr-gate.sh"
+	pf_gate_checkout_cleanup
 	return 0
 }
 
@@ -611,7 +719,8 @@ pf_check_body() {
 		printf 'the body gate %srefused the body bin/publish would send\n' "${BODY_GATE:+($BODY_GATE) }"
 		rc=1
 	else
-		printf 'body gate: %s passed on the body bin/publish would send (%s)\n' "${BODY_GATE:-none in this repo}" "$body"
+		printf 'body gate: %s passed on the body bin/publish would send (%s) in %s\n' \
+			"${BODY_GATE:-none in this repo}" "$body" "${PF_GATE_DIR:-$PF_CWD}"
 	fi
 	# ...then the budget, which is a rule of the checkouts that have one. It can fail on its own (an
 	# AGENTS.md over budget) and that failure stands; a checkout with no root AGENTS.md says so by
