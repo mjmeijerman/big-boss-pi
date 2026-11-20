@@ -1,23 +1,38 @@
 # big-boss-pi
 
-The delegation hub. Every request goes through the big-boss-pi Herdr space; agents there ask
-Jev how many workers a task needs and in which mode, spawn them in their own spaces, and report
-back. They do not do project work themselves.
+The delegation hub. Every request goes through the Herdr space that owns the project; the boss
+there asks Jev the route and the mode, spawns **one** worker as a tab in its own space, reads the
+report, publishes it as a pull request and hands it over to be merged. The boss does not do project
+work itself, and a worker never publishes.
 
 This workspace replaced `pi-master`. The old tree at `~/pi-master` is the rollback
 copy: read-only during the transition, deleted only when the user says so.
+
+## A space is a project
+
+A space is one project, and it outlives its terminals: the record at
+`~/.pi/state/spaces/<slug>/space.json` keeps the name, the project folder and the sessions the tabs
+had, so a later worker reopens the tab and reads where the work goes. `bin/space new|list|show|forget`
+makes and reads them, and the `durable` mod (`alt-shift-d`) is the same three views: New, Forget,
+List. Work for another project is handed back to the person with the space that owns it, never
+started here.
+
+```
+~/.pi/bin/space new --name harness --project ~/big-boss-pi
+```
 
 ## What is wired where
 
 | piece | path | why there |
 |---|---|---|
 | The rules every agent here loads | `$PI_BOSS_ROOT/AGENTS.md` | Pi loads `AGENTS.md` from the working directory and every parent, on every start, with no project trust needed. New or reloaded agents therefore start with the same knowledge |
-| Decision model | `bin/jev` → `~/.local/bin/jev` | TypeSafe's Jev on api.typesafe.ai, one typed request with a calibrated probability per question; decides worker count, mode, route, thinking effort, and permissions |
+| Decision model | `bin/jev` → `~/.local/bin/jev` | TypeSafe's Jev on api.typesafe.ai, one typed request with a calibrated probability per question; decides mode, route, thinking effort and permissions (a spawn no longer asks it a worker count: one space, one worker) |
 | Local worker | `bin/local-run` | runs a local task on the ollama model (`bin/local-model.mjs`), headless: prompt in, answer on stdout, no space and no spec, no network; records one line in `state/usage.jsonl` |
-| Delegation | `bin/delegate` → `~/.local/bin/delegate` | one jev call for mode, count, route and thinking effort, one Herdr space per worker jev asked for, the spec, where the report lands, and every decision in `state/decisions.jsonl`; `delegate sweep` closes the workers that finished |
+| Spaces | `bin/space` → shim onto `~/.pi/bin/space` | `new`/`list`/`show`/`forget` over `~/.pi/state/spaces/<slug>/space.json`; `delegate` reads the space from the folder it runs in and refuses in a folder no space claims |
+| Delegation | `bin/delegate` → shim onto `~/.pi/bin/delegate` | one jev call for mode, route and thinking effort, one worker as a tab in this space, the spec, where the report lands, and every decision in the space's `decisions.jsonl`; `delegate finish` runs preflight, publish, wipe and close in that order |
 | Worker modes | `bin/pi-bare`, `bin/pi-sandboxed`, `bin/pi-nonet` | `delegate` picks one from Jev's answer. All three find pi the same way, at runtime (`bin/pi-resolve.sh`: `$PI_BIN`, `PATH`, `$PNPM_HOME`, `$HOME`, `%APPDATA%`), so none of them carries a home directory; on native Windows the two sandboxed modes refuse with the WSL2 line instead of running bare |
 | Preflight | `bin/preflight` | the checks CI would run, on this branch, here: that the branch's base is not behind a just-fetched `origin/<trunk>` (a branch cut before a pull request merged arrives `CONFLICTING`; the check names the count, the colliding paths and the rebase, and an unreachable origin is a named pass), `bash -n`/`node --check` on the changed files, the repo's own suite, semgrep over the changed files, the changed tests under a scrubbed `env -i`, and the body gate on the exact body `bin/publish` would send. `delegate finish` runs it before the publish, and no push happens past a failing check |
-| Never-closable space | `bin/guard` → `~/.local/bin/big-boss-pi-guard` + `~/.config/systemd/user/big-boss-pi-guard.service` | polls `herdr-app ls`; recreates the `big-boss-pi` space if it disappears, selects it once when Herdr starts, resumes a tab whose terminal is no longer pi from its resume entry — found by terminal id **or** by the tab id the entry recorded, newest `updated_at` first, session file required — first through `~/.pi/scripts/herdr-resume.sh` and then, when that declines, with its own `hc send` on the entry's terminal, and reopens it with an absolute argv only when there is no usable entry or the resume did not start pi, at most once a minute per tab and logged in `state/guard.log` with the path it took. Only tabs it is allowed to repair: the parked tabs it saw when it started, and the ones it opened itself — a tab the person opens while it runs is theirs, kept in `state/tab-classes` so a restart does not take it either. It never touches a space named `pi-master` |
+| Spaces and the guard | `bin/guard` → shim onto `~/.pi/bin/guard`, started by `systemd/big-boss-pi-guard.service` | one pass every 20 seconds over every recorded space: a vanished space is rebuilt from its record (its own name, project folder and Boss tab name), the Boss tab is resumed from its own session entry, and nothing is ever closed, renamed or moved. A worker's tab is not the guard's business — `delegate wait --forever` restarts a dead worker, and a finished one stays closed. It reports a space whose project folder is gone and names `bin/space forget <slug>`; it never touches a space named `pi-master` |
 | Delegation-only enforcement | `~/.pi/agent/extensions/big-boss-pi-guard.ts` | blocks the `write` and `edit` tools, and shell writes into the directory (`echo x > …`, `rm/mv/cp/tee/sed -i`), when the session's cwd is under this workspace **or** under `~/pi-master`; no-ops everywhere else, including for a worker session (`PI_WORKER=1`) |
 | Rollback helper | `bin/finish-rename.sh` | closes the old `pi-master` space on request and prints how to delete the old tree. Runs nothing by default |
 
@@ -27,9 +42,11 @@ Every script lives on its own tree: it resolves the workspace root from its own 
 works from any cwd and when sourced. `PI_BOSS_ROOT` overrides the root; `PI_MASTER_ROOT` is
 still accepted as a deprecated fallback.
 
-`bin/delegate`, `bin/publish`, `bin/jev`, `bin/local-run` and `bin/guard` are bash programs, so they
-resolve bash at runtime (`bin/shell-resolve.sh`) and re-exec themselves under it — a shebang is not a
-promise on Windows. `PI_GIT_BASH=/path/to/bash.exe` sets it explicitly, ahead of a `bash` on `PATH`;
+`bin/publish`, `bin/jev` and `bin/local-run` are bash programs, so they resolve bash at runtime
+(`bin/shell-resolve.sh`) and re-exec themselves under it — a shebang is not a promise on Windows.
+`bin/delegate`, `bin/guard` and `bin/space` are `/bin/sh` shims: they exec the same-named tool in
+`~/.pi/bin` and exit 127 with one line naming it when it is not installed, so a moved tool never
+looks like a broken one. `PI_GIT_BASH=/path/to/bash.exe` sets it explicitly, ahead of a `bash` on `PATH`;
 with none found they print `no bash found — set PI_GIT_BASH=/path/to/bash.exe` and exit 127.
 
 ## Routing: decide before you work
@@ -126,38 +143,34 @@ PR, and that is jev's answer being right**.
 
 ## Jev gates every delegation
 
-`delegate spawn` asks Jev once on every run — `jev plan` answers the count, the mode, the route
-and the thinking effort together, for the exact task text — and records them as the four
-decision lines it always did. A `--mode`, `--count` or `--thinking` from the caller is
-accepted only when it matches Jev's answer. A different one aborts the spawn and prints Jev's
-answer and its reason; overturning it needs `--override-jev --reason '<why>'`, and the
-override is recorded on that decision's own line — including `--count`, whose line then carries
-`overridden: true` with Jev's own number beside it. `--count N` takes 1 to 8, the live-space
-ceiling. A `local` route aborts the same way, pointing at `bin/local-run`. A field
-Jev answers only weakly takes the conservative default (count 1, mode sandboxed, route remote,
-thinking medium), the spawn says which field defaulted and the decision line records it; an
-unoffered answer or a dead model still stops the spawn unless `--override-jev` carries a reason.
+`delegate spawn` asks Jev once on every run — `jev plan` answers the route, the mode and the thinking
+effort together, for the exact task text — and records them as the decision lines it always did. The
+worker count is not one of Jev's decisions any more: one spawn starts one worker in one space, and a
+task that needs three is three spaces, started when the one before has merged. A `--mode` or
+`--thinking` from the caller is accepted only when it matches Jev's answer. A different one aborts the spawn and prints Jev's answer and its reason; overturning it needs
+`--override-jev --reason '<why>'`, and the override is recorded on that decision's own line. A `local`
+route aborts the same way, pointing at `bin/local-run`. A field Jev answers only weakly takes the
+conservative default (mode sandboxed, route remote, thinking medium), the spawn says which field
+defaulted and the decision line records it; an unoffered answer or a dead model still stops the spawn
+unless `--override-jev` carries a reason.
 
-Jev's count is started, not noted. A count of three is three spaces — `SLUG`, `SLUG-2`,
-`SLUG-3` — each with its own spec, its own report path and the same mode and thinking level;
-a count that would cross the live ceiling refuses instead of quietly starting one. Review still
-sets the pace: an unread report blocks a new spawn only when the paths its branch touched meet
-the paths the new task names, and `delegate stats` prints the unread queue and its oldest age.
+Review sets the pace. A new worker is refused while a pull request of this space is unmerged — the
+PR is named, with the merge that unblocks it — and while an unread report's branch diff meets a path
+the new task names. `delegate stats` prints the unread queue and the age of its oldest report.
 
-Thinking is split in two, because the two halves are different facts. Jev answers an *effort*
-— `low`, `medium` or `high` — which is a fact about the task. Which levels the worker's model
-supports is a fact about the model, so `bin/delegate` reads it from your pi config:
-`settings.json` names the model a fresh `pi` starts with, and `models.json` or the generated
-`models-store.json` carries that model's `reasoning` flag and `thinkingLevelMap` (`null` marks
-a level the model does not support). The effort goes to the nearest supported level, ties to
-the lower one, and the worker starts with `pi --thinking <level>`. A non-reasoning model gets
-`off`; if the catalogue cannot be read the effort name is passed through and pi clamps it.
-On this machine `deepseek/deepseek-flash` supports `off`, `low`, `high`, `max`, so
-`medium` lands on `low`. The spec header and `delegate list` both show the level.
+Thinking is split in two, because the two halves are different facts. Jev answers an *effort* —
+`low`, `medium` or `high` — which is a fact about the task. Which levels the worker's model supports
+is a fact about the model, so `~/.pi/bin/delegate` reads it from your pi config: `settings.json` names
+the model a fresh `pi` starts with, and `models.json` or the generated `models-store.json` carries that
+model's `reasoning` flag and `thinkingLevelMap` (`null` marks a level the model does not support). The
+effort goes to the nearest supported level, ties to the lower one, and the worker starts with `pi
+--thinking <level>`. A non-reasoning model gets `off`; if the catalogue cannot be read the effort name
+is passed through and pi clamps it. On this machine `deepseek/deepseek-flash` supports `off`, `low`,
+`high`, `max`, so `medium` lands on `low`. The spec header and `delegate list` both show the level.
 
-Each decision is one line in `state/decisions.jsonl`:
-`{"timestamp":…,"command":"mode"|"count"|"route"|"thinking"|"ask","task":…,"decision":…,"reason":…,"overridden":true|false,"slug":…}`.
-`delegate list` shows Jev's mode, route and thinking level for each worker.
+Each decision is one line in the space's `decisions.jsonl`:
+`{"timestamp":…,"command":"mode"|"route"|"thinking"|"ask","task":…,"decision":…,"reason":…,"overridden":true|false,"slug":…}`.
+`delegate list` shows Jev's mode, route and thinking level for each worker in this space.
 
 ## Ask Jev before you ask the user
 
@@ -172,60 +185,59 @@ Exit 0 or 1 is an answer: act on it and do not interrupt the user. Only exit 3 �
 the model unreachable — belongs to the user, and then it carries Jev's reason in one line:
 `jev is unsure — <reason>`. `AGENTS.md` states the rule; the command makes it checkable.
 
-## Worker spaces close themselves
+## One worker at a time
 
-`delegate spawn` guarantees the base before it creates the space. A sandboxed worker cannot `git
-fetch` (the sandbox refuses the ssh config's ownership), so its `origin/<trunk>` is whatever was
-last fetched on the host — a branch cut from that ships a PR against an old trunk. So the boss
-fetches the `--cwd` repo itself, takes the default branch from `origin/HEAD` (falling back to
-`trunk`, `main`, `master`), and fast-forwards the local trunk only when it is clean and strictly
-behind. A dirty tree, an ahead trunk or a diverged one refuses the spawn and prints the exact
-state and the command that fixes it; nothing is reset, rebased or forced. A `--cwd` that is not a
-git repo, or has no origin, is skipped with one line.
+A worker is a tab in this space, not a space of its own (`kind: "tab"` in the space's
+`delegations.json`). `delegate spawn` refuses a second live worker here: one report is the only
+context the boss can read. It also refuses on a git project while one of this space's pull requests
+is unmerged, naming the PR.
+
+`delegate spawn` guarantees the base before it starts the tab. A sandboxed worker cannot `git fetch`
+(the sandbox refuses the ssh config's ownership), so its `origin/<trunk>` is whatever was last
+fetched on the host — a branch cut from that ships a PR against an old trunk. So the boss fetches the
+`--cwd` repo itself, takes the default branch from `origin/HEAD` (falling back to `trunk`, `main`,
+`master`), and fast-forwards the local trunk only when it is clean and strictly behind. A dirty tree,
+an ahead trunk or a diverged one refuses the spawn and prints the exact state and the command that
+fixes it; nothing is reset, rebased or forced. A `--cwd` that is not a git repo, or has no origin, is
+skipped with one line.
 
 Every worker branch ends in a pull request, and the worker never publishes it: it commits on its
-branch and stops, with no push and no `gh pr create`, no fallback and no "try it and see". The
-report carries the branch name, the commit sha and the review tier. The boss uploads the branch
-and opens the PR against the repo's default branch — `git symbolic-ref --short
-refs/remotes/origin/HEAD`, `trunk` as the fallback, never a hardcoded `main`. Because publishing
-is the boss's job, a worker stays sandboxed: it needs neither an ssh agent nor `gh` auth. The
-report carries the PR URL once the boss has opened it, so the boss can relay it. A change with no
-PR is unfinished, however green it looks locally — merging stays the human's call.
+branch and stops, with no push and no `gh pr create`, no fallback and no "try it and see". The report
+carries the branch name, the commit sha and the review tier. The boss uploads the branch and opens the
+PR against the repo's default branch — `git symbolic-ref --short refs/remotes/origin/HEAD`, `trunk` as
+the fallback, never a hardcoded `main`. Because publishing is the boss's job, a worker stays
+sandboxed: it needs neither an ssh agent nor `gh` auth. The report carries the PR URL once the boss has
+opened it. A change with no PR is unfinished, however green it looks locally — merging stays the
+human's call.
 
-A worker cuts its own worktree inside the repo it works in (`git worktree add .worktrees/<slug>
--b <branch>`) and never switches the boss's live checkout: `delegate spawn` records that
-checkout's branch, and `delegate close` warns, names both branches and checks the original back
-out when it moved. Inside, because the sandbox binds the repo and not its parent: at
-`../<slug>-worktree` the directory is created in the sandbox's own filesystem, dies with it, and
-leaves a `prunable` entry behind.
+A worker cuts its own worktree inside the repo it works in (`git worktree add .worktrees/<slug> -b
+<branch>`) and never switches the boss's live checkout: `delegate spawn` records that checkout's
+branch, and `delegate close` warns, names both branches and checks the original back out when it
+moved. Inside, because the sandbox binds the repo and not its parent: at `../<slug>-worktree` the
+directory is created in the sandbox's own filesystem, dies with it, and leaves a `prunable` entry
+behind.
 
-A worker space is not kept around for browsing. The flow is: the worker writes
-`reports/<slug>.md` and stays idle, the agent relays the report to the user, and the space is
-closed right away — `delegate close <slug>` for one worker, `delegate sweep` for all of them.
+The tab is not kept for browsing. The flow is: the worker writes `reports/<slug>.md` and stays idle,
+the boss reads it with `delegate wait`, publishes it, and the tab is closed — `delegate finish <slug>`
+does preflight, publish, wipe and close in that order. `delegate sweep` closes every worker whose
+report is plain.
 
-One marker overrides that. A report whose first line is `DECISION NEEDED: <question>` means the
-worker cannot continue without the user, so the space stays open until the question is answered:
+One marker overrides that. A report whose first line is `DECISION NEEDED: <question>` means the worker
+cannot continue without the user, so the tab stays until the question is answered:
 
 ```
 DECISION NEEDED: drop the old table or keep it for the migration?
 ```
 
-The wipe step sits between the report and the close. `delegate wipe <slug>` prints five
-consolidation questions — what did this feature make unnecessary and is that code deleted, what
-is duplicated, could the next feature land in this area in 30 minutes, what did we learn, what
-would we rebuild from scratch — and records the run in `state/decisions.jsonl`.
-`delegate wipe <slug> --skip "<reason>"` records why the step does not apply, reason included.
-A slug nobody spawned is refused, nonzero, and named: a wipe that quietly does nothing is a wipe
-nobody can tell apart from a forgotten one.
-`delegate close` and `delegate sweep` refuse a worker with no wipe line for it, so a finished
-feature stops being a permanent addition by default. The answers belong in the worker's report
-under `## Thrown away`.
-
-`delegate sweep` walks every tracked worker and prints one line each: `closed <slug>` when the
-report is plain, `keep   <slug> (still working)` when there is no report yet, and
-`keep   <slug> (decision needed, ask the user)` for the marker. It ends with `N closed, M kept`.
-`delegate list` shows the same three states in its status column: `working`, `DECISION`,
-`reported`.
+The wipe step sits between the report and the close. `delegate wipe <slug>` prints five consolidation
+questions — what did this feature make unnecessary and is that code deleted, what is duplicated, could
+the next feature land in this area in 30 minutes, what did we learn, what would we rebuild from
+scratch — and records the run in the space's `decisions.jsonl`. `delegate wipe <slug> --skip "<reason>"`
+records why the step does not apply, reason included. A slug nobody spawned is refused, nonzero, and
+named: a wipe that quietly does nothing is a wipe nobody can tell apart from a forgotten one.
+`delegate close` and `delegate sweep` refuse a worker with no wipe line for it, so a finished feature
+stops being a permanent addition by default. The answers belong in the worker's report under
+`## Thrown away`.
 
 ## Publishing a finished worker
 
@@ -274,7 +286,7 @@ trailer check. Rerunning after a close refusal is clean: the existing PR is prin
 opened twice, and a wipe already recorded is kept rather than recorded again.
 
 `bin/publish <slug>` is the one command between a reported worker and a pull request. It reads
-`state/delegations.json` for the slug's tree and report, then builds the PR body out of the report
+the space's `delegations.json` for the slug's tree and report, then builds the PR body out of the report
 itself: the Mission line verbatim, the `Review tier:` line reduced to its bare word (`Review
 tier: **Medium**` and `Review tier: medium.` both reach the body as `Review tier: Medium`), the
 `## Evidence` block,
@@ -285,7 +297,7 @@ subject. That is why the tier cannot be forgotten — nothing is retyped.
 bin/publish <slug>
 ```
 
-`delegations.json` records the branch the boss checkout was on when the worker started, and a
+The space's `delegations.json` records the branch the boss checkout was on when the worker started, and a
 worker cuts its own branch — so for most workers it says `trunk` or `main`. A trunk branch is
 never published: `bin/publish` finds the worker's branch instead, by the commit carrying
 `Agent-Slug: <slug>` on that branch. One match is the branch; none or several are refused rather
@@ -363,75 +375,27 @@ run side by side, print in job order, that a failing one does not lose another's
 that `--fresh --jobs 2` reports the split and the wall clock in the same run.
 `ci-offline.sh` runs the first of those suites, so CI covers it too.
 
-## Why the space cannot be closed
+## Why a space cannot be lost
 
-Herdr has no per-space lock. `space.close` closes a space and ends its terminals, and
-`herdr-app` offers no hook to veto it. So the space is self-healing instead: the guard service
-checks every 5 seconds and rebuilds `big-boss-pi` (with a fresh agent) if it is gone. Closing
-it is possible for a few seconds, then it is back. That is the closest thing to "not closable"
-Herdr supports.
+Herdr has no per-space lock: `space.close` ends a space and its terminals, and `herdr-app` offers no
+hook to veto it. So the spaces are self-healing instead. `~/.pi/bin/guard` makes one pass every 20
+seconds over every recorded space and puts back only what the record says:
 
-The same guard puts the agents back after herdr-core restarts. The core keeps its terminals and
-starts them again as shells, so the space comes back with its tabs ("master", "Pi (bare)") and
-nothing running in them. A repair prefers the session that was there: every hc terminal that ran
-pi has a resume entry in `~/.pi/agent/herdr-resume/<terminal>.json`, and `~/.pi/scripts/herdr-resume.sh`
-(`herdr-resume.mjs`) types `exec <argv> --session <session-file>` back into the recovered shell,
-so the tab keeps its conversation.
+- a space missing from `herdr-app ls` is rebuilt with its own name, project folder and Boss tab name;
+- a Boss tab that is gone is started from its own resume entry (`~/.pi/agent/herdr-resume/<terminal>.json`,
+  `<entry argv> --session <path>`), so the tab keeps its conversation across a restart or a reboot;
+- a worker's tab is not the guard's business — `delegate wait --forever` restarts a dead worker, and a
+  finished worker's tab stays closed;
+- nothing is ever closed, renamed or moved, and a space whose project folder is gone is reported by
+  name with `bin/space forget <slug>` as the fix;
+- a forgotten space, and a space in Herdr with no record, are left alone: recreating what nobody
+  recorded is how a program starts making spaces for people.
 
-The guard finds that entry by the tab's terminal id **or** by the tab id the entry recorded. The
-tab id is the key that survives: after a host reboot `herdr-app ls` reports no terminal for a
-parked tab, and a terminal-only lookup sees nothing while the conversation is still on disk. A tab
-with several entries takes the newest `updated_at`, and an entry whose session file is gone is not
-usable. The guard then runs the resume script and believes `herdr-app ls`: pi running again means
-the tab is repaired with nothing opened or closed. When the script declines — the case that cost a
-conversation on 2026-11-15 was `busy (no program)` on a live terminal whose foreground had no
-`argv` yet — the guard does the same job itself, with `hc send` on the entry's own terminal, waits
-for pi to appear, and only then logs the resume. It never types twice in one boot: an entry whose
-`restored_boot_id` is this boot, or a terminal recorded in `state/resumed`, is left alone.
-
-Only a tab with no usable entry — a tab that never held pi — is reopened, in place, under its
-own name, with `sh -lc exec $PI_BOSS_ROOT/bin/pi-bare -a` — absolute, because the holder
-restarts it from a PATH without the pnpm bin dir. The same reopen is the fallback when a resume
-does not put pi back, with one log line saying so. A live pi tab is left alone, a tab is repaired
-at most once a minute (a pi that exits at once must not become a spawn loop), and every repair
-lands in `state/guard.log` with the path it took: `resumed terminal tN` (with `from <entry>` when
-the script did it, `with hc` when the guard did) or `opened a new pi` / `has no entry`.
-
-A tab with no pi is not automatically a tab to repair. herdr-core hands the parked tabs back as
-shells, so the guard needs to know whose tab it is looking at: a tab present in the first
-`herdr-app ls` snapshot after the guard started is a **parked** tab, a tab the guard opened itself
-is its own, and a tab that appears at any later poll belongs to the **person** — no pi is opened in
-it, nothing is closed, nothing is renamed. That classification is kept in `state/tab-classes`
-(with `state/tab-classes-seeded` marking the first snapshot), so a guard restart does not reread
-the person's terminals as parked, and a terminal `tab.new` answered with but `ls` has not shown yet
-waits in `state/guard-terminals` until the tab it landed in is read as the guard's own.
-the person's terminals as parked. A parked tab whose terminal now holds an interactive shell with
-no recovered-launch `argv` (`exec …/pi-bare`, or the `--session` line) is the person's too: it is
-left alone and `state/guard.log` says `left alone: it is the person's tab`.
-
-A resume is typed only into a terminal that shows a shell prompt, checked again in the last instant
-before the keystroke: a live terminal whose foreground has no `argv` yet is a pi that is still
-starting as often as it is a shell that has not attached, so the guard types nothing and leaves the
-tab for the next poll. A tab that already runs pi — `herdr-app ls` says so, or an `argv` that
-carries the entry's own session — is never typed into, and never closed or reopened for it either.
-`PI_BOSS_SPACE` points the guard at another space name, so a repair can be tried without touching
-the real one; `PI_BOSS_RESUME_SCRIPT` and `PI_BOSS_RESUME_DIR` do the same for the resume map, and
-`PI_BOSS_ONCE=1` runs exactly one poll and exits.
-
-`bash scripts/test-guard-resume.sh` drives twenty-four cases against a fake herdr-app, a fake
-resume
-map, a fake resume script and a fake `hc`: resume preferred, no entry → fresh tab, failed resume →
-fresh tab, rate limit intact, `pi-master` untouched, and the 2026-11-15 pair — terminal unknown but
-the entry found by tab id, and the resume script answering `busy (no program)` — both ended by a
-resume, not a fresh tab. It also covers newest-of-two entries, a vanished session file, an entry
-already restored in this boot, and a foreground with no `argv` for one look and then a shell. And
-the terminal it must not type into: a foreground with no `argv` on every look types nothing, a tab
-already running pi on this session or another is skipped, and a live pi with no entry is left where
-it is — while a real dead tab is still resumed exactly once. And the tabs that
-are not the guard's: a terminal opened while the guard runs is never turned into a pi and survives
-a guard restart, while a parked recovered shell is still repaired, the guard's own tab is still
-reopened at most once a minute, the person's tab that does carry a resume entry is resumed, and a
-`tab.new` that `ls` lagged is still counted as the guard's own.
+The service is `systemd/big-boss-pi-guard.service`; its `ExecStart` is the shim
+`%h/big-boss-pi/bin/guard`, which execs `~/.pi/bin/guard`. `--once` runs exactly one pass (`--dry-run`
+prints the plan and calls no `herdr-app` at all) and `--space <slug>` limits a pass to one space. The
+suite that drives it against a stub `herdr-app` is the pi repo's
+`scripts/tests/test-guard-supervisor.sh`.
 
 ## What the write guard does and does not cover
 
@@ -449,24 +413,28 @@ the boss and stays guarded exactly as before.
 ## Daily use
 
 ```
-herdr-app ls                                    # is the space there?
-systemctl --user status big-boss-pi-guard       # is the guard alive?
-delegate list                                   # workers, their spaces, the last jev decision
+~/.pi/bin/space list                            # every space, its project, the guard's last line
+~/.pi/bin/space show harness                    # one record: folder, tabs, the delegate command
+herdr-app ls                                    # is the space there, and its Boss tab?
+systemctl --user status big-boss-pi-guard       # is the supervisor alive?
+delegate list                                   # this space's workers and their last jev decision
 delegate stats                                  # is the local model used, and how often
 delegate sweep                                  # close the ones that reported, keep the rest
-tail -f ~/big-boss-pi/reports/*.md              # what workers reported
-tail -2 ~/big-boss-pi/state/decisions.jsonl     # what jev decided
-tail -2 ~/big-boss-pi/state/usage.jsonl         # what the models answered, and how fast
+tail -f reports/*.md                            # what workers reported
+tail -2 state/spaces/<slug>/decisions.jsonl     # what jev decided
+tail -2 state/usage.jsonl                       # what the models answered, and how fast
 ```
 
 ## Changing the rules
 
-Edit `AGENTS.md`. Every agent in this workspace picks it up on its next start (`/reload`
-re-reads it in a running session). Rules you add here do not leak into other workspaces —
-they are context files of this directory only.
+Edit `AGENTS.md`. Every agent in this space picks it up on its next start (`/reload` re-reads it in a
+running session), and `bin/space new` also writes this project's own block between two markers, so a
+re-run replaces it instead of growing a second copy. Rules you add here do not leak into other spaces
+— they are context files of this directory only.
 
-To change how delegation works, edit `bin/delegate`; to change what Jev weighs, edit the
-`POLICY` string in `bin/jev.mjs`. Both are plain shell/JS, no build step.
+To change how delegation works, edit `~/.pi/bin/delegate` — a fix behind the shim is a fix that
+disappears. To change what Jev weighs, edit the `POLICY` string in `bin/jev.mjs`. Both are plain
+shell/JS, no build step.
 
 ## Turning it off
 
