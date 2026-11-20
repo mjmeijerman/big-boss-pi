@@ -19,7 +19,11 @@
 #             branch's own touched paths also moved, and the rebase — it never rebases for you, and
 #             an unreachable origin is a named pass, because a gate that blocks on a flaky network
 #             gets bypassed
-#   syntax    bash -n on the changed shell files, node --check on the changed .mjs/.js
+#   syntax    bash -n on the changed shell files, node --check on the changed .mjs/.js, and the
+#             checkout's own `tsc --noEmit` on a changed .ts/.tsx — a project with no type checker
+#             gets one named skip line per file and a summary that counts it as skipped, never as
+#             passed, because node --check cannot parse types either and a green TS diff used to be
+#             un-publishable on a "line 60: syntax error near unexpected token `('" from bash -n
 #   suites    the repo's own tests, each exactly once: in a pi checkout the node suite and every
 #             scripts/tests/*.test.sh — the globs `make scripts-test` runs, run directly, so the
 #             node suite cannot run twice (it used to: `node --test` and then a target that begins
@@ -315,7 +319,7 @@ pf_collect() {
 		*.sh | bin/*)
 			case $f in *.mjs | *.js | *.md) ;; *) PF_CODE+=("$f") ;; esac
 			;;
-		*.mjs | *.js | *.ts | *.py) PF_CODE+=("$f") ;;
+		*.mjs | *.js | *.ts | *.tsx | *.py) PF_CODE+=("$f") ;;
 		esac
 		case $f in
 		scripts/tests/* | tests/* | *test-*.sh | *.test.mjs | *.test.js | *_test.py) PF_TESTS+=("$f") ;;
@@ -453,8 +457,28 @@ pf_check_behind() {
 
 # --- check: syntax -----------------------------------------------------------------------------
 
+# pf_ts_checker <cwd> — print the type-check command this checkout can answer, or nothing. A
+# project with a tsconfig.json and a local typescript answers `tsc --noEmit -p .`; one with neither
+# cannot be type-checked here, and that is a fact to print, never a pass to claim.
+pf_ts_checker() {
+	local cwd=$1
+	[ -f "$cwd/tsconfig.json" ] || return 1
+	if [ -x "$cwd/node_modules/.bin/tsc" ]; then
+		printf '%s' './node_modules/.bin/tsc --noEmit -p .'
+		return 0
+	fi
+	command -v npx >/dev/null 2>&1 || return 1
+	(cd "$cwd" && npx --no-install tsc --version >/dev/null 2>&1) || return 1
+	printf '%s' 'npx --no-install tsc --noEmit -p .'
+}
+
+# Three parsers, and every file goes to the one that can read it. A .ts/.tsx file fed to bash -n is
+# the bug this check carried: bash said "line 60: syntax error near unexpected token `('" about
+# valid TypeScript, so a green TS diff could never publish. node --check cannot read types either,
+# so the only honest verdict for a TS file is the checkout's own compiler, or a skip named per file.
 pf_check_syntax() {
-	local f rc=0 nb=0 nm=0 out
+	local f rc=0 nb=0 nm=0 nts=0 nts_skip=0 nunk=0 out tsc_cmd=""
+	local tsfiles=() unk=()
 	for f in "${PF_CODE[@]}"; do
 		[ -f "$PF_CWD/$f" ] || continue
 		case $f in
@@ -465,16 +489,47 @@ pf_check_syntax() {
 				printf '%s:\n%s\n' "$f" "$(printf '%s\n' "$out" | head -n 3 | sed 's/^/  /')"
 			fi
 			;;
-		*)
+		*.ts | *.tsx)
+			nts=$((nts + 1))
+			tsfiles+=("$f")
+			;;
+		*.sh | *.bash | bin/*)
 			nb=$((nb + 1))
 			if ! out=$(bash -n "$PF_CWD/$f" 2>&1); then
 				rc=1
 				printf '%s:\n%s\n' "$f" "$(printf '%s\n' "$out" | head -n 3 | sed 's/^/  /')"
 			fi
 			;;
+		*)
+			# Neither shell nor JavaScript nor TypeScript: there is no parser here for it, so it
+			# is named and counted as skipped — never fed to bash -n (a .py file is not shell), and
+			# never left to pass by saying nothing.
+			nunk=$((nunk + 1))
+			unk+=("$f")
+			;;
 		esac
 	done
-	printf 'bash -n: %d file(s), node --check: %d file(s)\n' "$nb" "$nm"
+	if [ "$nts" -gt 0 ]; then
+		if tsc_cmd=$(pf_ts_checker "$PF_CWD"); then
+			if ! out=$(cd "$PF_CWD" && bash -c "$tsc_cmd" 2>&1); then
+				rc=1
+				printf 'TypeScript: %s failed on %d changed TS file(s) in %s:\n%s\n' "$tsc_cmd" "$nts" "$PF_CWD" \
+					"$(printf '%s\n' "$out" | head -n 12 | sed 's/^/  /')"
+			fi
+		else
+			nts_skip=$nts
+			for f in "${tsfiles[@]}"; do
+				printf 'TypeScript in %s: no type check in this checkout — node --check cannot parse types; the suites check compiles it\n' "$f"
+			done
+		fi
+	fi
+	for f in "${unk[@]}"; do
+		printf 'syntax in %s: no parser for this extension here — skipped, not checked\n' "$f"
+	done
+	printf 'bash -n: %d file(s), node --check: %d file(s), TypeScript: %d file(s) type-checked, %d skipped (no type check in this checkout)' \
+		"$nb" "$nm" "$((nts - nts_skip))" "$nts_skip"
+	[ "$nunk" -eq 0 ] || printf ', %d unknown extension(s) skipped' "$nunk"
+	printf '\n'
 	# The linter, on the changed shell files, when it is installed. Absence is said out loud rather
 	# than read as clean — the same line scripts/ci-local.sh prints — but it is not a failure: the
 	# gate refuses work, and a missing linter is not the work's fault.
